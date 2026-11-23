@@ -5,7 +5,12 @@ from typing import Any, Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 MEDIA_ICONS = {
     "audio": "🎵",
@@ -44,6 +49,25 @@ DIVIDER = "──────────────────────"
 
 def esc(text: Optional[str]) -> str:
     return html.escape(text or "")
+
+
+def breadcrumb(*parts: str) -> str:
+    """Subtle top breadcrumb trail for nested screens (e.g. Vault › My Files)."""
+    return f"<i>{' › '.join(parts)}</i>"
+
+
+def toggle_label(enabled: bool, label: str) -> str:
+    """GramIO / Telegram standard toggle state directly inside button text."""
+    return f"{'✅' if enabled else '⬜'} {label}"
+
+
+def copy_btn(text: str, value: str, style: Optional[str] = None) -> InlineKeyboardButton:
+    """Native Telegram one-tap clipboard button (CopyTextButton)."""
+    return InlineKeyboardButton(
+        text=text,
+        copy_text=CopyTextButton(text=value),
+        style=style,
+    )
 
 
 def next_sort_key(current: str) -> str:
@@ -98,13 +122,17 @@ def progress_bar(ratio: float, width: int = 8) -> str:
 def cancel_kb(back_callback: str = "nav:home") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✕ Cancel", callback_data=f"fsm:cancel:{back_callback}")]
+            [InlineKeyboardButton(text="◀ Cancel", callback_data=f"fsm:cancel:{back_callback}")]
         ]
     )
 
 
-def home_btn(label: str = "‹ Home") -> InlineKeyboardButton:
+def home_btn(label: str = "🏠 Home") -> InlineKeyboardButton:
     return InlineKeyboardButton(text=label, callback_data="nav:home")
+
+
+def back_btn(callback_data: str, label: str = "◀ Back") -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=label, callback_data=callback_data)
 
 
 async def safe_edit_or_send(
@@ -175,14 +203,21 @@ def build_file_card_text(
     file_row: dict[str, Any],
     bot_username: str = "",
     header_badge: str = "",
+    edit_mode: bool = False,
 ) -> str:
     icon = MEDIA_ICONS.get(file_row["media_type"], "📦")
-    fav_badge = " ★" if file_row.get("is_favorite") else ""
+    fav_badge = " ⭐" if file_row.get("is_favorite") else ""
     lines: list[str] = []
 
     if header_badge:
         lines.append(header_badge)
-        lines.append("")
+    else:
+        trail = (
+            breadcrumb("Vault", "My Files", "Manage File")
+            if edit_mode
+            else breadcrumb("Vault", "My Files", "Details")
+        )
+        lines.append(trail)
 
     lines.append(f"{icon} <b>{esc(file_row['title'])}</b>{fav_badge}")
 
@@ -195,32 +230,33 @@ def build_file_card_text(
         meta_parts.append(format_size(file_row["file_size"]))
     if file_row.get("created_at"):
         meta_parts.append(format_date(file_row["created_at"]))
-    lines.append(f"<code>{' · '.join(meta_parts)}</code>")
-    lines.append(DIVIDER)
+    lines.append(f"<i>{' · '.join(meta_parts)}</i>")
 
-    group_name = file_row.get("group_name") or "Personal Vault (Unassigned)"
-    lines.append(f"📁 <b>Folder:</b> {esc(group_name)}")
+    info_lines: list[str] = []
+    group_name = file_row.get("group_name") or "Personal Vault"
+    info_lines.append(f"📁 <b>Folder:</b> {esc(group_name)}")
 
     if file_row.get("tags"):
-        lines.append(f"🏷️ <b>Tags:</b> <code>{esc(file_row['tags'])}</code>")
+        info_lines.append(f"🏷️ <b>Tags:</b> <code>{esc(file_row['tags'])}</code>")
 
     if file_row.get("caption"):
         cap_preview = file_row["caption"].strip()
         if len(cap_preview) > 90:
             cap_preview = cap_preview[:87] + "..."
-        lines.append(f"💬 <b>Caption:</b> <i>{esc(cap_preview)}</i>")
+        info_lines.append(f"💬 <b>Caption:</b> <i>{esc(cap_preview)}</i>")
 
     uses = file_row.get("use_count") or 0
     if uses > 0:
-        lines.append(f"📈 <b>Sent inline:</b> {uses}×")
+        info_lines.append(f"📈 <b>Sent inline:</b> {uses}×")
+
+    lines.append("<blockquote>" + "\n".join(info_lines) + "</blockquote>")
 
     if file_row.get("share_token") and bot_username:
         share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
-        lines.append(f"🔗 <b>Public Link:</b>\n<code>{share_url}</code>")
+        lines.append(f"🔗 <b>Public Link:</b> <code>{share_url}</code>")
 
-    if bot_username:
-        q_hint = (file_row.get("title") or "")[:24]
-        lines.append(f"\n💡 <i>Quick send:</i> <code>@{esc(bot_username)} {esc(q_hint)}</code>")
+    if edit_mode:
+        lines.append("<i>Select a property below to edit or organize this file:</i>")
 
     return "\n".join(lines)
 
@@ -228,56 +264,148 @@ def build_file_card_text(
 def build_file_keyboard(
     file_row: dict[str, Any],
     back_cb: Optional[str] = None,
+    bot_username: str = "",
 ) -> InlineKeyboardMarkup:
+    """
+    Clean primary File Detail keyboard using Progressive Disclosure:
+    Only primary actions (Get, Send, Favorite, Manage) are shown upfront (3 rows max).
+    Editing, moving, link sharing, and trashing live one tap inside '🛠️ Edit & More'.
+    """
     fid = file_row["id"]
     is_trashed = bool(file_row.get("is_trashed"))
 
     if is_trashed:
         rows = [
             [
-                InlineKeyboardButton(text="♻️ Restore File", callback_data=f"f:restore:{fid}"),
-                InlineKeyboardButton(text="🔥 Delete Forever", callback_data=f"f:purge:{fid}"),
+                InlineKeyboardButton(
+                    text="♻️ Restore File",
+                    callback_data=f"f:restore:{fid}",
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="💥 Delete Forever",
+                    callback_data=f"f:purge:{fid}",
+                    style="danger",
+                ),
             ],
             [
-                InlineKeyboardButton(text="‹ Back to Trash", callback_data="trash:0"),
+                back_btn("trash:0", "◀ Trash"),
                 home_btn(),
             ],
         ]
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    fav_label = "★ Favorited" if file_row.get("is_favorite") else "☆ Favorite"
-    share_label = "🔗 Revoke Link" if file_row.get("share_token") else "🔗 Share Link"
+    fav_label = "⭐ Starred" if file_row.get("is_favorite") else "☆ Star"
     inline_query = (file_row.get("title") or "")[:30]
+    manage_cb = f"fm:{fid}:{back_cb}" if back_cb else f"f:manage:{fid}"
 
-    rows = [
+    rows: list[list[InlineKeyboardButton]] = [
         [
-            InlineKeyboardButton(text="📥 Get File", callback_data=f"f:get:{fid}"),
+            InlineKeyboardButton(
+                text="📥 Get Here",
+                callback_data=f"f:get:{fid}",
+                style="primary",
+            ),
             InlineKeyboardButton(
                 text="📤 Send to Chat",
                 switch_inline_query=inline_query,
             ),
         ],
         [
-            InlineKeyboardButton(text="✏️ Rename", callback_data=f"f:rename:{fid}"),
-            InlineKeyboardButton(text="🏷️ Tags", callback_data=f"f:tags:{fid}"),
-            InlineKeyboardButton(text="💬 Caption", callback_data=f"f:cap:{fid}"),
-        ],
-        [
-            InlineKeyboardButton(text="📁 Move Folder", callback_data=f"f:move:{fid}"),
-            InlineKeyboardButton(text=fav_label, callback_data=f"f:fav:{fid}"),
-        ],
-        [
-            InlineKeyboardButton(text=share_label, callback_data=f"f:share:{fid}"),
-            InlineKeyboardButton(text="🗑️ Trash", callback_data=f"f:trash:{fid}"),
+            InlineKeyboardButton(
+                text=fav_label,
+                callback_data=f"ffav:{fid}:{back_cb}" if back_cb else f"f:fav:{fid}",
+            ),
+            InlineKeyboardButton(
+                text="🛠️ Edit & More",
+                callback_data=manage_cb,
+            ),
         ],
     ]
 
+    if file_row.get("share_token") and bot_username:
+        share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
+        rows.append([copy_btn("📋 Copy Public Link", share_url)])
+
     nav_row: list[InlineKeyboardButton] = []
     if back_cb:
-        nav_row.append(InlineKeyboardButton(text="‹ Back to List", callback_data=back_cb))
+        nav_row.append(back_btn(back_cb, "◀ Files"))
+        nav_row.append(home_btn())
     else:
-        nav_row.append(InlineKeyboardButton(text="📦 All Files", callback_data="br:all:new:0:0"))
-    nav_row.append(home_btn())
+        nav_row.append(InlineKeyboardButton(text="📦 All Files", callback_data="br:all:def:0:0"))
+        nav_row.append(home_btn())
     rows.append(nav_row)
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_file_manage_keyboard(
+    file_row: dict[str, Any],
+    back_cb: Optional[str] = None,
+    bot_username: str = "",
+) -> InlineKeyboardMarkup:
+    """
+    Secondary Management Drawer for a file (Progressive Disclosure level 2).
+    Clean 2-column grid for metadata editing, folder organization, public link, and trash.
+    """
+    fid = file_row["id"]
+    has_link = bool(file_row.get("share_token"))
+    share_label = "🔗 Revoke Link" if has_link else "🔗 Public Link"
+    return_to_card = f"fo:{fid}:{back_cb[3:]}" if (back_cb and back_cb.startswith("br:")) else f"f:open:{fid}"
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="✏️ Rename", callback_data=f"f:rename:{fid}"),
+            InlineKeyboardButton(text="📁 Move Folder", callback_data=f"f:move:{fid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🏷️ Edit Tags", callback_data=f"f:tags:{fid}"),
+            InlineKeyboardButton(text="💬 Caption", callback_data=f"f:cap:{fid}"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=share_label,
+                callback_data=f"fsh:{fid}:{back_cb}" if back_cb else f"f:share:{fid}",
+            ),
+            InlineKeyboardButton(
+                text="🗑️ Trash",
+                callback_data=f"f:trash:{fid}",
+                style="danger",
+            ),
+        ],
+    ]
+
+    if has_link and bot_username:
+        share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
+        rows.insert(2, [copy_btn("📋 Copy Public Link", share_url, style="primary")])
+
+    rows.append([back_btn(return_to_card, "◀ Back to File")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_upload_quick_keyboard(file_row: dict[str, Any]) -> InlineKeyboardMarkup:
+    """
+    Ultra-clean 2-row receipt keyboard shown right after uploading a file,
+    avoiding button walls in the chat history while keeping 1-tap Manage & Send.
+    """
+    fid = file_row["id"]
+    inline_query = (file_row.get("title") or "")[:30]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📤 Send to Chat",
+                    switch_inline_query=inline_query,
+                    style="primary",
+                ),
+                InlineKeyboardButton(
+                    text="🛠️ Edit & Organize",
+                    callback_data=f"f:manage:{fid}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="📁 Move Folder", callback_data=f"f:move:{fid}"),
+                InlineKeyboardButton(text="📦 My Files", callback_data="br:all:def:0:0"),
+            ],
+        ]
+    )

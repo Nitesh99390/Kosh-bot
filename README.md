@@ -1,25 +1,24 @@
 # KoshBox — Modern Telegram Cloud Vault & Inline Bot
 
-A fast, lightweight, Oracle Cloud–ready Telegram bot with a **clean, single-panel UI/UX** that archives your media & files into a private Dump Channel and lets you search and send them from **any chat** via Telegram's native **Inline Menu** (`@YourBot query`).
+A fast, lightweight, Oracle Cloud–ready Telegram bot with a **clean, Progressive-Disclosure UI/UX** that archives your media & files into a private Dump Channel and lets you search and send them from **any chat** via Telegram's native **Inline Menu** (`@YourBot query`).
 
-## Highlights & Upgraded UI/UX
-- **Single-Panel App Navigation**: Every menu (`/start`, My Files, Folders, Analytics, Settings, Synced Accounts, Guide) transitions smoothly in-place without cluttering your chat history.
-- **Universal Media Archiving + Smart Album Batching**:
-  - Supports **Audio, Voice, Video, Video Notes, Documents (PDF/APK/ZIP/etc.), Photos, GIFs, and Stickers**.
-  - Forwarding a multi-file **Media Album** produces one clean summary card instead of spamming multiple messages.
-- **Advanced File Browser (`/files`, `/search`)**:
-  - Instant media filter pills: `All`, `★ Fav`, `🎵 Audio`, `🎬 Video`, `📄 Docs`, `🖼️ Photos`.
-  - One-tap sorting: **Newest**, **Most Used**, **A–Z**, **Largest**, **Oldest**.
-  - Rich file card actions: **📥 Get File**, **📤 Send to Chat**, **✏️ Rename**, **🏷️ Tags**, **💬 Inline Caption**, **📁 Move Folder**, **★ Favorite**, **🔗 Public Share Link**, and **🗑️ Recycle Trash**.
+## Highlights & Professional UI/UX Architecture
+- **Progressive Disclosure & Zero Button Clutter**:
+  - **Hero Dashboard (`/start`)**: Focused 3-row layout (`🔍 Search Vault Inline`, `📦 My Files`, `📁 Folders`, `⭐ Favorites`, `⚙️ Settings & Tools`) with native HTML `<blockquote>` cards and breadcrumb navigation.
+  - **Clean Upload Receipts**: Uploading a file returns a minimal 2-row receipt (`📤 Send to Chat` + `🛠️ Edit & Organize`) instead of spamming 11 buttons under every message.
+  - **2-Tier File Detail & Management**: Primary File Card shows only essential actions (`📥 Get Here`, `📤 Send to Chat`, `⭐ Star`, `🛠️ Edit & More`), while Rename, Move Folder, Tags, Caption, Public Link, and Trash live neatly inside the `🛠️ Edit & More` drawer.
+  - **Native Telegram Bot API 9.4 Styling & One-Tap Copy**: Uses `style="primary"`, `style="success"`, `style="danger"` button accents plus native `CopyTextButton` (`📋 Copy Public Link`, `📋 Copy Group Invite Link`, `📋 Copy Sync Code`) and safe-left / destructive-right confirmations.
+- **Mobile-First File Browser (`/files`, `/search`)**:
+  - Clean 5-item pages with a dedicated `🌪️ Filter & Sort` drawer supporting **All, ⭐ Starred, 🎵 Audio, 🎬 Video, 📄 Docs, 🖼️ Photos, 🎙️ Voice, 🎞️ GIFs** and 5 sort modes (**Newest, Most Used, A–Z, Largest, Oldest**).
+- **2-Column Folders & Collaborative Shared Groups (`/groups`)**:
+  - Compact 2-column folder grid, `+ Create or Join` action menu, one-tap invite link copying, and `⚙️ Manage` sub-drawer for Rename, Reset Invite, and Leave/Delete.
 - **Safe Recycle Trash & Instant Undo (`/trash`)**:
-  - Deleting a file moves it to **Trash** with a one-tap **↩️ Undo (Restore)** button so you never lose files accidentally.
-- **Personal Folders & Collaborative Shared Groups (`/groups`)**:
-  - Browse files directly inside any folder, rename folders, set an **🎯 Auto-Upload Target**, or generate/reset **Shared Group Invite Links** (`t.me/YourBot?start=join_XXXX`).
+  - Deleting a file moves it to **Trash** with a green **↩️ Undo (Restore)** button and a 2-step confirmation before permanent deletion.
 - **Native Inline Search (`@YourBot query`)**:
   - Personal vault isolation (`is_personal=True`) with hybrid **SQLite FTS5** + substring matching and infinite scroll.
   - Inline modifiers: `type:audio`, `type:video`, `type:doc`, `type:photo`, `type:voice`, `type:gif`, `type:sticker`, `g:folder`, `#tag`, `fav`, `top`, `sort:az`, `sort:size`.
 - **Multi-Account Real-Time Sync (`/accounts`, `/link`, `/verify`)**:
-  - Connect secondary Telegram accounts via one-tap deep-link or 6-character code with **Approve / Reject** owner verification.
+  - Connect secondary Telegram accounts via one-tap copyable link or 6-character code with **Approve / Reject** owner verification.
 - **Visual Analytics (`/stats`) & Interactive Admin Console (`/admin`)**:
   - Progress-bar media breakdown, top sent inline files, 24h active user metrics, one-tap SQLite snapshot backup, and rich broadcast.
 

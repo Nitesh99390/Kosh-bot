@@ -16,7 +16,14 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
-from utils.formatters import DIVIDER, cancel_kb, format_size, home_btn, safe_edit_or_send
+from utils.formatters import (
+    back_btn,
+    breadcrumb,
+    cancel_kb,
+    format_size,
+    home_btn,
+    safe_edit_or_send,
+)
 from utils.states import AdminStates
 
 router = Router(name="admin")
@@ -29,24 +36,31 @@ def _is_admin(user_id: int, config: Config) -> bool:
 async def _render_admin_panel(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     stats = await db.get_global_stats()
     text = (
-        f"🛠️ <b>KoshBox Admin Console</b>\n"
-        f"{DIVIDER}\n"
-        f"👤 <b>Total Users:</b> {stats['users']}  <i>({stats['active_24h']} active in 24h)</i>\n"
-        f"🔐 <b>Unique Vaults:</b> {stats['vaults']}\n"
-        f"📦 <b>Active Files:</b> {stats['files']}  <i>({stats['trashed']} in trash)</i>\n"
-        f"📁 <b>Folders & Groups:</b> {stats['groups']}\n"
-        f"💾 <b>Total Archived:</b> {format_size(stats['total_size'])}\n"
-        f"{DIVIDER}\n"
+        f"{breadcrumb('System', 'Admin Console')}\n"
+        f"🛠️ <b>KoshBox Admin Console</b>\n\n"
+        f"<blockquote>"
+        f"👤 <b>Users:</b> {stats['users']}  <i>({stats['active_24h']} active 24h)</i>\n"
+        f"🔐 <b>Vaults:</b> {stats['vaults']}  ·  📁 <b>Groups:</b> {stats['groups']}\n"
+        f"📦 <b>Files:</b> {stats['files']}  <i>({stats['trashed']} in trash)</i>\n"
+        f"💾 <b>Archived:</b> {format_size(stats['total_size'])}"
+        f"</blockquote>\n\n"
         f"<i>Select an administrative action below:</i>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="💾 Backup Database", callback_data="adm:backup"),
-                InlineKeyboardButton(text="📣 Broadcast", callback_data="adm:broadcast"),
+                InlineKeyboardButton(
+                    text="💾 Backup DB",
+                    callback_data="adm:backup",
+                    style="primary",
+                ),
+                InlineKeyboardButton(
+                    text="📣 Broadcast",
+                    callback_data="adm:broadcast",
+                ),
             ],
             [
-                InlineKeyboardButton(text="🔄 Refresh Metrics", callback_data="adm:refresh"),
+                InlineKeyboardButton(text="🔄 Refresh", callback_data="adm:refresh"),
                 home_btn(),
             ],
         ]
@@ -124,8 +138,9 @@ async def cmd_broadcast(
         return
     await state.set_state(AdminStates.waiting_for_broadcast)
     await message.answer(
-        f"📣 <b>New Broadcast</b>\n{DIVIDER}\n"
-        f"Send the message (text, photo, video, or document) you want copied to all KoshBox users:",
+        f"{breadcrumb('Admin', 'Broadcast')}\n"
+        f"📣 <b>New Broadcast</b>\n\n"
+        f"<blockquote>Send the message (text, photo, video, or document) to copy to all KoshBox users:</blockquote>",
         reply_markup=cancel_kb("adm:refresh"),
     )
 
@@ -140,8 +155,9 @@ async def cb_admin_broadcast(
     await state.set_state(AdminStates.waiting_for_broadcast)
     await safe_edit_or_send(
         callback,
-        f"📣 <b>New Broadcast</b>\n{DIVIDER}\n"
-        f"Send the message (text, photo, video, or document) you want copied to all KoshBox users:",
+        f"{breadcrumb('Admin', 'Broadcast')}\n"
+        f"📣 <b>New Broadcast</b>\n\n"
+        f"<blockquote>Send the message (text, photo, video, or document) to copy to all KoshBox users:</blockquote>",
         cancel_kb("adm:refresh"),
     )
     await callback.answer()
@@ -156,7 +172,7 @@ async def fsm_broadcast(
     await state.clear()
     user_ids = await db.get_all_user_ids()
     sent, failed = 0, 0
-    status_msg = await message.answer(f"📣 Broadcasting to <b>{len(user_ids)}</b> users…")
+    status_msg = await message.answer(f"⏳ Broadcasting to <b>{len(user_ids)}</b> users…")
 
     for uid in user_ids:
         try:
@@ -171,12 +187,12 @@ async def fsm_broadcast(
         await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
-        f"✓ <b>Broadcast Complete</b>\n{DIVIDER}\n"
-        f"Delivered: <b>{sent}</b>  ·  Skipped/Blocked: <b>{failed}</b>",
+        f"✅ <b>Broadcast Complete</b>\n\n"
+        f"<blockquote>Delivered: <b>{sent}</b>  ·  Skipped/Blocked: <b>{failed}</b></blockquote>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="‹ Admin Console", callback_data="adm:refresh"),
+                    back_btn("adm:refresh", "◀ Admin"),
                     home_btn(),
                 ]
             ]

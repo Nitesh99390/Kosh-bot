@@ -8,10 +8,9 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from config import Config
 from database import Database
 from utils.formatters import (
-    DIVIDER,
     MEDIA_ICONS,
     build_file_card_text,
-    build_file_keyboard,
+    build_upload_quick_keyboard,
     esc,
     home_btn,
 )
@@ -192,24 +191,30 @@ async def _flush_album_summary(
     saved_items = [x for x in items if x["status"] == "saved"]
     dup_items = [x for x in items if x["status"] == "dup"]
 
-    lines = [
-        f"✓ <b>Album Archived</b> ({len(saved_items)} saved"
+    title_line = (
+        f"✅ <b>Album Archived</b> · <i>{len(saved_items)} saved"
         + (f", {len(dup_items)} duplicate" if dup_items else "")
-        + ")",
-        DIVIDER,
-    ]
+        + "</i>\n"
+    )
+    list_lines: list[str] = []
     for entry in items[:8]:
         f = entry["file"]
         ic = MEDIA_ICONS.get(f["media_type"], "📦")
         badge = "♻️ " if entry["status"] == "dup" else ""
-        lines.append(f"• {badge}{ic} <b>{esc(f['title'][:36])}</b>")
+        list_lines.append(f"• {badge}{ic} <b>{esc(f['title'][:34])}</b>")
     if len(items) > 8:
-        lines.append(f"<i>…and {len(items) - 8} more item(s)</i>")
+        list_lines.append(f"<i>…and {len(items) - 8} more item(s)</i>")
+
+    body = title_line + "\n<blockquote>" + "\n".join(list_lines) + "</blockquote>"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📦 Browse Files", callback_data="br:all:def:0:0"),
+                InlineKeyboardButton(
+                    text="📦 Browse Files",
+                    callback_data="br:all:def:0:0",
+                    style="primary",
+                ),
                 InlineKeyboardButton(
                     text="🔍 Open Inline",
                     switch_inline_query_current_chat="",
@@ -218,7 +223,7 @@ async def _flush_album_summary(
             [home_btn()],
         ]
     )
-    await anchor_message.reply("\n".join(lines), reply_markup=kb)
+    await anchor_message.reply(body, reply_markup=kb)
 
 
 @router.message(F.chat.type == "private", MEDIA_FILTER)
@@ -250,7 +255,7 @@ async def handle_media_upload(
                 me.username or "",
                 header_badge="♻️ <b>Restored from Trash</b>",
             ),
-            reply_markup=build_file_keyboard(restored),
+            reply_markup=build_upload_quick_keyboard(restored),
             disable_web_page_preview=True,
         )
         return
@@ -277,7 +282,7 @@ async def handle_media_upload(
                     me.username or "",
                     header_badge="♻️ <b>Already in Your Vault</b>",
                 ),
-                reply_markup=build_file_keyboard(existing_full),
+                reply_markup=build_upload_quick_keyboard(existing_full),
                 disable_web_page_preview=True,
             )
         return
@@ -291,8 +296,8 @@ async def handle_media_upload(
         )
     except Exception as exc:
         await message.reply(
-            f"⚠️ <b>Archive Channel Error</b>\n{DIVIDER}\n"
-            f"Ensure @{esc(me.username)} is an <b>Administrator</b> in your Dump Channel with Post Messages permission.\n\n"
+            f"⚠️ <b>Archive Channel Error</b>\n\n"
+            f"<blockquote>Ensure @{esc(me.username)} is an <b>Administrator</b> in your Dump Channel with Post Messages permission.</blockquote>\n\n"
             f"<code>{esc(str(exc))}</code>"
         )
         return
@@ -337,15 +342,15 @@ async def handle_media_upload(
 
     if user["bulk_mode"]:
         grp = f" · 📁 {esc(saved['group_name'])}" if saved.get("group_name") else ""
-        await message.reply(f"✓ <b>Archived:</b> {esc(saved['title'])}{grp}")
+        await message.reply(f"✅ <b>Archived:</b> {esc(saved['title'])}{grp}")
         return
 
     await message.reply(
         build_file_card_text(
             saved,
             me.username or "",
-            header_badge="✓ <b>Saved to Vault</b>",
+            header_badge="✅ <b>Saved to Vault</b>",
         ),
-        reply_markup=build_file_keyboard(saved),
+        reply_markup=build_upload_quick_keyboard(saved),
         disable_web_page_preview=True,
     )

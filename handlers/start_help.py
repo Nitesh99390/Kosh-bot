@@ -16,6 +16,10 @@ from utils.formatters import (
     MEDIA_ICONS,
     MEDIA_LABELS,
     SORT_LABELS,
+    back_btn,
+    breadcrumb,
+    build_file_card_text,
+    build_file_keyboard,
     esc,
     format_size,
     home_btn,
@@ -23,6 +27,7 @@ from utils.formatters import (
     progress_bar,
     safe_edit_or_send,
     send_stored_media,
+    toggle_label,
 )
 
 router = Router(name="start_help")
@@ -31,6 +36,12 @@ router = Router(name="start_help")
 async def render_home_dashboard(
     user_id: int, first_name: str, db: Database, bot: Bot
 ) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Professional Hero Dashboard following GramIO & Telegram Mobile UX guidelines:
+    - Clean 3-zone text hierarchy (Title -> Blockquote summary -> Subtle tip)
+    - Strict 3-row button grid (5 buttons total, never a wall of 10 buttons!)
+    - Secondary utilities live inside '⚙️ Settings & Tools' via progressive disclosure.
+    """
     user = await db.get_user(user_id)
     stats = await db.get_vault_stats(user["vault_id"])
     me = await bot.get_me()
@@ -42,94 +53,81 @@ async def render_home_dashboard(
         if grp:
             active_folder = f"{'👥' if grp['is_shared'] else '📁'} {grp['name']}"
 
-    bulk_badge = "⚡ ON" if user.get("bulk_mode") else "Off"
+    bulk_badge = "⚡ Bulk ON" if user.get("bulk_mode") else "Standard"
     total_files = stats["total_files"]
     total_size = format_size(stats["total_size"])
     groups_cnt = stats["groups_count"]
 
+    greeting = f" · {esc(first_name)}" if first_name else ""
     text = (
-        f"✨ <b>KoshBox Cloud Vault</b>\n"
-        f"Welcome back, <b>{esc(first_name or 'there')}</b>.\n"
-        f"{DIVIDER}\n"
+        f"✨ <b>KoshBox Cloud Vault</b>{greeting}\n\n"
+        f"<blockquote>"
         f"📦 <b>{total_files}</b> files  ·  💾 <b>{total_size}</b>  ·  📁 <b>{groups_cnt}</b> folders\n"
-        f"🎯 Upload Target: <b>{esc(active_folder)}</b>  ·  Bulk: <b>{bulk_badge}</b>\n"
-        f"{DIVIDER}\n"
-        f"Drop any file, audio, video, photo, voice, GIF, or sticker here to archive it instantly.\n\n"
-        f"💡 <i>Inline anywhere:</i> <code>@{uname} </code>"
+        f"🎯 Target: <b>{esc(active_folder)}</b>  ·  {bulk_badge}"
+        f"</blockquote>\n\n"
+        f"<i>Drop any media here to archive · Inline:</i> <code>@{uname} </code>"
     )
 
-    bulk_btn_text = "⚡ Bulk Mode: ON" if user.get("bulk_mode") else "⚡ Bulk Mode: OFF"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔍 Search Inline",
+                    text="🔍 Search Vault Inline",
                     switch_inline_query_current_chat="",
-                ),
-                InlineKeyboardButton(
-                    text="📤 Share to Chat",
-                    switch_inline_query="",
-                ),
+                    style="primary",
+                )
             ],
             [
                 InlineKeyboardButton(text="📦 My Files", callback_data="br:all:def:0:0"),
-                InlineKeyboardButton(text="📁 Folders & Groups", callback_data="nav:groups"),
+                InlineKeyboardButton(text="📁 Folders", callback_data="nav:groups"),
             ],
             [
-                InlineKeyboardButton(text="★ Favorites", callback_data="br:fav:def:0:0"),
-                InlineKeyboardButton(text="📊 Analytics", callback_data="nav:stats"),
-            ],
-            [
-                InlineKeyboardButton(text=bulk_btn_text, callback_data="home:bulk"),
-                InlineKeyboardButton(text="⚙️ Settings", callback_data="nav:settings"),
-            ],
-            [
-                InlineKeyboardButton(text="🔗 Sync Accounts", callback_data="nav:accounts"),
-                InlineKeyboardButton(text="📖 Quick Guide", callback_data="nav:help"),
+                InlineKeyboardButton(text="⭐ Favorites", callback_data="br:fav:def:0:0"),
+                InlineKeyboardButton(text="⚙️ Settings & Tools", callback_data="nav:settings"),
             ],
         ]
     )
     return text, kb
 
 
-def _render_help_panel(bot_username: str, help_tab: str = "inline") -> tuple[str, InlineKeyboardMarkup]:
+def _render_help_panel(
+    bot_username: str, help_tab: str = "inline"
+) -> tuple[str, InlineKeyboardMarkup]:
     uname = esc(bot_username or "KoshBox_Bot")
 
     if help_tab == "commands":
         text = (
-            f"📖 <b>KoshBox Guide · Commands</b>\n"
-            f"{DIVIDER}\n"
-            f"• /start — Open your Vault Dashboard\n"
-            f"• /files — Browse, filter & sort your files\n"
-            f"• /search — Search files inside this chat\n"
-            f"• /groups — Manage Personal Folders & Shared Groups\n"
-            f"• /bulk — Toggle silent Bulk Upload Mode\n"
-            f"• /trash — View or restore trashed files\n"
-            f"• /accounts — Manage synced Telegram accounts\n"
-            f"• /link — Generate a multi-account sync code\n"
-            f"• /verify <code>CODE</code> — Link a secondary account\n"
-            f"• /stats — View storage & usage analytics\n"
-            f"• /settings — Configure vault preferences\n"
-            f"• /cancel — Cancel any active prompt"
+            f"{breadcrumb('Vault', 'Settings', 'Guide')}\n"
+            f"📖 <b>Bot Commands</b>\n\n"
+            f"<blockquote>"
+            f"• /start — Vault Dashboard\n"
+            f"• /files — Browse & filter files\n"
+            f"• /search — Keyword or tag search\n"
+            f"• /groups — Folders & Shared Groups\n"
+            f"• /bulk — Toggle Bulk Upload Mode\n"
+            f"• /trash — Recycle Trash\n"
+            f"• /accounts — Synced accounts\n"
+            f"• /stats — Vault analytics\n"
+            f"• /settings — Preferences & tools"
+            f"</blockquote>"
         )
     else:
         text = (
-            f"📖 <b>KoshBox Guide · Inline Search</b>\n"
-            f"{DIVIDER}\n"
-            f"Type <code>@{uname}</code> in <b>any</b> Telegram chat to search and send files instantly:\n\n"
-            f"• <code>@{uname} </code> — Recent & favorite files\n"
-            f"• <code>@{uname} lofi</code> — Search title, artist, filename, caption, or tags\n"
-            f"• <code>@{uname} type:audio</code> — Filter by media (<code>audio</code>, <code>video</code>, <code>doc</code>, <code>photo</code>, <code>voice</code>, <code>gif</code>, <code>sticker</code>)\n"
-            f"• <code>@{uname} g:music</code> — Filter by folder or shared group\n"
-            f"• <code>@{uname} #chill</code> — Filter by hashtag\n"
-            f"• <code>@{uname} fav</code> — Only starred favorites\n"
-            f"• <code>@{uname} top</code> — Sort by most frequently sent\n\n"
-            f"💡 <b>Pro Tip:</b> Combine filters freely:\n"
-            f"<code>@{uname} g:music type:audio fav</code>"
+            f"{breadcrumb('Vault', 'Settings', 'Guide')}\n"
+            f"📖 <b>Inline Search Guide</b>\n\n"
+            f"<blockquote>"
+            f"Type <code>@{uname}</code> in <b>any</b> chat to find & send files:\n\n"
+            f"• <code>@{uname} lofi</code> — Title, artist, caption, tags\n"
+            f"• <code>@{uname} type:audio</code> — Media filter (<code>audio</code>, <code>video</code>, <code>doc</code>, <code>photo</code>, <code>voice</code>, <code>gif</code>)\n"
+            f"• <code>@{uname} g:music</code> — Inside a folder or group\n"
+            f"• <code>@{uname} #chill</code> — Hashtag filter\n"
+            f"• <code>@{uname} fav</code> · <code>top</code> — Starred or most used"
+            f"</blockquote>\n\n"
+            f"<i>Combine freely:</i> <code>@{uname} g:music type:audio fav</code>"
         )
 
-    tab_inline_lbl = "● Inline Filters" if help_tab == "inline" else "○ Inline Filters"
-    tab_cmd_lbl = "● Bot Commands" if help_tab == "commands" else "○ Bot Commands"
+    tab_inline_lbl = "● Inline Syntax" if help_tab == "inline" else "○ Inline Syntax"
+    tab_cmd_lbl = "● Commands" if help_tab == "commands" else "○ Commands"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -139,11 +137,15 @@ def _render_help_panel(bot_username: str, help_tab: str = "inline") -> tuple[str
             ],
             [
                 InlineKeyboardButton(
-                    text="🔍 Try Inline Search Now",
+                    text="🔍 Try Inline Search",
                     switch_inline_query_current_chat="",
+                    style="primary",
                 )
             ],
-            [home_btn()],
+            [
+                back_btn("nav:settings", "◀ Settings"),
+                home_btn(),
+            ],
         ]
     )
     return text, kb
@@ -167,19 +169,22 @@ async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKe
             b_lines.append(f"{icon} <code>{bar}</code> <b>{cnt}</b> {label} <i>({sz})</i>")
         breakdown = "\n".join(b_lines)
     else:
-        breakdown = "<i>No files archived yet — send any media to begin.</i>"
+        breakdown = "<i>No files archived yet — drop any media in chat to begin.</i>"
+
+    summary_block = (
+        f"📦 <b>{total_files}</b> files  ·  💾 <b>{format_size(stats['total_size'])}</b>\n"
+        f"⭐ <b>{stats['fav_count']}</b> starred  ·  📈 <b>{stats['total_uses']}×</b> inline sends\n"
+        f"📁 <b>{stats['groups_count']}</b> folders  ·  🔗 <b>{stats['linked_accounts']}</b> account(s)"
+    )
+    if stats["trash_count"] > 0:
+        summary_block += f"\n🗑️ <b>{stats['trash_count']}</b> item(s) in Trash"
 
     lines = [
-        "📊 <b>Vault Analytics & Storage</b>",
-        DIVIDER,
-        f"📦 <b>Active Files:</b> {total_files}   ·   💾 <b>Size:</b> {format_size(stats['total_size'])}",
-        f"★ <b>Favorites:</b> {stats['fav_count']}   ·   📈 <b>Inline Sends:</b> {stats['total_uses']}×",
-        f"📁 <b>Folders/Groups:</b> {stats['groups_count']}   ·   🔗 <b>Synced Accounts:</b> {stats['linked_accounts']}",
+        breadcrumb("Vault", "Settings", "Analytics"),
+        "📊 <b>Storage & Usage Analytics</b>\n",
+        f"<blockquote>{summary_block}</blockquote>\n",
+        f"<b>Media Breakdown</b>\n{breakdown}",
     ]
-    if stats["trash_count"] > 0:
-        lines.append(f"🗑️ <b>In Trash:</b> {stats['trash_count']} file(s)")
-
-    lines.append(f"{DIVIDER}\n<b>Media Distribution</b>\n{breakdown}")
 
     if stats["top_files"]:
         top_lines = []
@@ -188,7 +193,7 @@ async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKe
             top_lines.append(
                 f"{idx}. {ic} <b>{esc(tf['title'][:32])}</b> — <code>{tf['use_count']}×</code>"
             )
-        lines.append(f"\n<b>Most Used Inline</b>\n" + "\n".join(top_lines))
+        lines.append("\n<b>Top Sent Inline</b>\n" + "\n".join(top_lines))
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -197,10 +202,7 @@ async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKe
                 InlineKeyboardButton(text="🔄 Refresh", callback_data="nav:stats"),
             ],
             [
-                InlineKeyboardButton(
-                    text=f"🗑️ Trash ({stats['trash_count']})",
-                    callback_data="trash:0",
-                ),
+                back_btn("nav:settings", "◀ Settings"),
                 home_btn(),
             ],
         ]
@@ -209,33 +211,40 @@ async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKe
 
 
 async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Clean Settings & Tools Hub:
+    - Toggles strictly in Row 1 (never mixed with navigation buttons in the same row)
+    - Clear 2-column destination grid for Sync, Trash, Analytics, Guide
+    - Single Back to Home footer
+    """
     user = await db.get_user(user_id)
     trash_cnt = await db.count_trashed_files(user["vault_id"])
     sort_key = user.get("default_sort") or "new"
     sort_label = SORT_LABELS.get(sort_key, "Newest")
     bulk_on = bool(user.get("bulk_mode"))
 
-    active_folder = "None (Personal Vault Root)"
+    active_folder = "Personal Vault (Default)"
     if user.get("active_group_id"):
         grp = await db.get_group(user["active_group_id"])
         if grp:
             active_folder = f"{'👥' if grp['is_shared'] else '📁'} {grp['name']}"
 
     text = (
-        f"⚙️ <b>Vault Preferences</b>\n"
-        f"{DIVIDER}\n"
-        f"⚡ <b>Bulk Upload Mode:</b> {'Enabled (Compact replies)' if bulk_on else 'Disabled (Rich file cards)'}\n"
-        f"↕️ <b>Default File Sort:</b> {sort_label}\n"
-        f"🎯 <b>Auto-Upload Folder:</b> {esc(active_folder)}\n"
-        f"🗑️ <b>Recycle Trash:</b> {trash_cnt} item(s)\n"
-        f"{DIVIDER}\n"
-        f"<i>Tap any option below to customize your workflow:</i>"
+        f"{breadcrumb('Vault', 'Settings & Tools')}\n"
+        f"⚙️ <b>Settings & Vault Tools</b>\n\n"
+        f"<blockquote>"
+        f"⚡ <b>Bulk Mode:</b> {'On (Compact replies)' if bulk_on else 'Off (Rich cards)'}\n"
+        f"↕️ <b>Default Sort:</b> {sort_label}\n"
+        f"🎯 <b>Upload Target:</b> {esc(active_folder)}\n"
+        f"🗑️ <b>Recycle Trash:</b> {trash_cnt} item(s)"
+        f"</blockquote>\n\n"
+        f"<i>Tap a preference to toggle or open a tool below:</i>"
     )
 
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text=f"⚡ Bulk Mode: {'ON' if bulk_on else 'OFF'}",
+                text=toggle_label(bulk_on, "Bulk Mode"),
                 callback_data="set:bulk",
             ),
             InlineKeyboardButton(
@@ -244,25 +253,24 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
             ),
         ],
         [
-            InlineKeyboardButton(text="📁 Change Upload Folder", callback_data="nav:groups"),
-            InlineKeyboardButton(text=f"🗑️ Open Trash ({trash_cnt})", callback_data="trash:0"),
+            InlineKeyboardButton(text="📊 Analytics", callback_data="nav:stats"),
+            InlineKeyboardButton(text=f"🗑️ Trash ({trash_cnt})", callback_data="trash:0"),
+        ],
+        [
+            InlineKeyboardButton(text="🔗 Sync Accounts", callback_data="nav:accounts"),
+            InlineKeyboardButton(text="📖 Quick Guide", callback_data="nav:help"),
         ],
     ]
     if user.get("active_group_id"):
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="✕ Reset Auto-Upload Folder",
+                    text="🎯 Reset Upload Target",
                     callback_data="set:clear_grp",
                 )
             ]
         )
-    rows.append(
-        [
-            InlineKeyboardButton(text="🔗 Synced Accounts", callback_data="nav:accounts"),
-            home_btn(),
-        ]
-    )
+    rows.append([back_btn("nav:home", "◀ Back to Vault")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -291,7 +299,8 @@ async def cmd_start(
         file_row = await db.get_file_by_share_token(token)
         if not file_row:
             await message.answer(
-                "⚠️ <b>Link Unavailable</b>\nThis share link is invalid, revoked, or the file was removed."
+                "⚠️ <b>Link Unavailable</b>\n"
+                "<blockquote>This share link is invalid, revoked, or the file was removed.</blockquote>"
             )
             return
         ok = await send_stored_media(bot, message.chat.id, file_row)
@@ -304,25 +313,27 @@ async def cmd_start(
         invite = args[5:]
         group = await db.join_shared_group(user["vault_id"], invite)
         if not group:
-            await message.answer("⚠️ <b>Invalid Invite</b>\nThis shared group link has expired or been regenerated.")
+            await message.answer(
+                "⚠️ <b>Invalid Invite</b>\n"
+                "<blockquote>This shared group link has expired or been regenerated.</blockquote>"
+            )
             return
         me = await bot.get_me()
         await message.answer(
-            f"🎉 <b>Joined Shared Group!</b>\n"
-            f"{DIVIDER}\n"
-            f"👥 <b>{esc(group['name'])}</b> ({group.get('file_count', 0)} files)\n\n"
-            f"All files in this group are now live in your inline menu:\n"
-            f"<code>@{esc(me.username)} g:{esc(group['name'])}</code>",
+            f"🎉 <b>Joined Shared Group</b>\n\n"
+            f"<blockquote>👥 <b>{esc(group['name'])}</b> · {group.get('file_count', 0)} file(s)</blockquote>\n\n"
+            f"<i>Inline filter:</i> <code>@{esc(me.username)} g:{esc(group['name'])}</code>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="🔍 Search Group Inline",
-                            switch_inline_query_current_chat=f"g:{group['name']} ",
-                        ),
-                        InlineKeyboardButton(
                             text="📂 Open Group",
                             callback_data=f"grp:open:{group['id']}",
+                            style="primary",
+                        ),
+                        InlineKeyboardButton(
+                            text="🔍 Search Group",
+                            switch_inline_query_current_chat=f"g:{group['name']} ",
                         ),
                     ],
                     [home_btn()],
@@ -339,15 +350,14 @@ async def cmd_start(
 
     if args == "upload":
         await message.answer(
-            f"📤 <b>Ready to Archive</b>\n"
-            f"{DIVIDER}\n"
-            f"Send or forward any <b>audio, video, document, photo, voice note, GIF, or sticker</b> right here.\n\n"
-            f"<i>Tip: Include hashtags like <code>#music #work</code> in captions to auto-tag!</i>",
+            f"📤 <b>Ready to Archive</b>\n\n"
+            f"<blockquote>Send or forward any <b>audio, video, document, photo, voice note, GIF, or sticker</b> right here.</blockquote>\n\n"
+            f"<i>Tip: Include hashtags like <code>#music #work</code> in captions to auto-tag.</i>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(text="📁 Choose Target Folder", callback_data="nav:groups"),
-                        home_btn("🏠 Dashboard"),
+                        InlineKeyboardButton(text="📁 Target Folder", callback_data="nav:groups"),
+                        home_btn("🏠 Vault"),
                     ]
                 ]
             ),
@@ -394,7 +404,7 @@ async def cb_home_bulk(callback: CallbackQuery, db: Database, bot: Bot) -> None:
     )
     await safe_edit_or_send(callback, text, kb)
     await callback.answer(
-        "⚡ Bulk Upload Mode ON — forward files freely!" if enabled else "Bulk Upload Mode OFF"
+        "⚡ Bulk Upload Mode ON" if enabled else "Bulk Upload Mode OFF"
     )
 
 
@@ -428,13 +438,13 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     if current is None:
         await message.answer(
             "ℹ️ No active prompt right now.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Open Dashboard")]]),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Open Vault")]]),
         )
         return
     await state.clear()
     await message.answer(
         "✕ <b>Action cancelled.</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Open Dashboard")]]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Open Vault")]]),
     )
 
 
@@ -455,17 +465,40 @@ async def cb_fsm_cancel(
     elif target == "nav:accounts":
         text, kb = await render_accounts_panel(callback.from_user.id, db)
         await safe_edit_or_send(callback, text, kb)
+    elif target == "adm:refresh":
+        from handlers.admin import _render_admin_panel
+
+        text, kb = await _render_admin_panel(db)
+        await safe_edit_or_send(callback, text, kb)
+    elif target.startswith("br:"):
+        from handlers.file_actions import render_browse_page
+
+        _, flt, sort_key, gid_s, page_s = target.split(":")
+        text, kb = await render_browse_page(
+            callback.from_user.id, flt, sort_key, int(gid_s), int(page_s), db
+        )
+        await safe_edit_or_send(callback, text, kb)
+    elif target.startswith("f:manage:"):
+        fid = int(target.split(":")[2])
+        f = await db.get_file(fid)
+        if f:
+            me = await bot.get_me()
+            from utils.formatters import build_file_manage_keyboard
+
+            await safe_edit_or_send(
+                callback,
+                build_file_card_text(f, me.username or "", edit_mode=True),
+                build_file_manage_keyboard(f, bot_username=me.username or ""),
+            )
     elif target.startswith("f:open:"):
         fid = int(target.split(":")[2])
         f = await db.get_file(fid)
         if f:
             me = await bot.get_me()
-            from utils.formatters import build_file_card_text, build_file_keyboard
-
             await safe_edit_or_send(
                 callback,
                 build_file_card_text(f, me.username or ""),
-                build_file_keyboard(f),
+                build_file_keyboard(f, bot_username=me.username or ""),
             )
         else:
             text, kb = await render_home_dashboard(
@@ -499,14 +532,12 @@ async def cmd_bulk(message: Message, db: Database) -> None:
     enabled = await db.toggle_bulk_mode(message.from_user.id)
     if enabled:
         await message.answer(
-            f"⚡ <b>Bulk Upload Mode: ON</b>\n"
-            f"{DIVIDER}\n"
-            f"Forward or drop multiple files — I will archive them cleanly with compact confirmations.\n"
-            f"Tap below or send /bulk when finished.",
+            "⚡ <b>Bulk Upload Mode: ON</b>\n\n"
+            "<blockquote>Forward or drop multiple files — I will archive them silently with compact one-line confirmations.</blockquote>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(text="✓ Turn Off Bulk Mode", callback_data="set:bulk"),
+                        InlineKeyboardButton(text="⬜ Turn Off Bulk", callback_data="set:bulk"),
                         home_btn(),
                     ]
                 ]
@@ -514,7 +545,7 @@ async def cmd_bulk(message: Message, db: Database) -> None:
         )
     else:
         await message.answer(
-            "✓ <b>Bulk Upload Mode: OFF</b>\nDetailed interactive file cards are restored.",
+            "✅ <b>Bulk Upload Mode: OFF</b>\n<i>Interactive upload cards are restored.</i>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
         )
 
@@ -602,4 +633,4 @@ async def cb_settings_clear_grp(callback: CallbackQuery, db: Database) -> None:
     await db.set_active_group(callback.from_user.id, None)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
     await safe_edit_or_send(callback, text, kb)
-    await callback.answer("Auto-upload folder reset")
+    await callback.answer("Upload target reset")

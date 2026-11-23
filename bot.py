@@ -21,15 +21,10 @@ logger = logging.getLogger("koshbox")
 async def _set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Open your Vault Dashboard"),
-            BotCommand(command="files", description="Browse, filter & sort files"),
-            BotCommand(command="search", description="Search files by keyword or tag"),
+            BotCommand(command="start", description="Open Vault Dashboard"),
+            BotCommand(command="files", description="Browse & filter files"),
             BotCommand(command="groups", description="Folders & Shared Groups"),
-            BotCommand(command="bulk", description="Toggle Bulk Upload Mode"),
-            BotCommand(command="trash", description="Recycle Trash & restore files"),
-            BotCommand(command="accounts", description="Synced Telegram accounts"),
-            BotCommand(command="stats", description="Storage & usage analytics"),
-            BotCommand(command="settings", description="Vault preferences"),
+            BotCommand(command="settings", description="Preferences, Sync & Trash"),
             BotCommand(command="help", description="Inline search & command guide"),
         ]
     )
