@@ -233,45 +233,68 @@ async def safe_edit_or_send(
     callback: CallbackQuery,
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
+    *,
+    answer_text: Optional[str] = None,
+    answer_alert: bool = False,
+    also_ack: bool = False,
 ) -> None:
     """
     Smoothly edit the existing panel message in-place:
     - Photo banner card -> edits caption seamlessly if <= 1024 chars
     - Text card -> edits text in-place
+    - When `also_ack=True`, executes `callback.answer(...)` concurrently via `asyncio.gather`
+      so button spinner clears immediately and saves 1 full RTT (~145ms).
     """
     if not callback.message:
+        if also_ack:
+            try:
+                await callback.answer(answer_text, show_alert=answer_alert)
+            except Exception:
+                pass
         return
-    if getattr(callback.message, "photo", None) and len(text) <= 1024:
-        try:
-            await callback.message.edit_caption(
-                caption=text,
-                reply_markup=reply_markup,
-            )
-            return
-        except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
+
+    async def _do_edit() -> None:
+        assert callback.message is not None
+        if getattr(callback.message, "photo", None) and len(text) <= 1024:
+            try:
+                await callback.message.edit_caption(
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
                 return
-    if callback.message.text:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-            return
-        except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+        if callback.message.text:
+            try:
+                await callback.message.edit_text(
+                    text,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
                 return
-    sent = await callback.message.answer(
-        text,
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
-    )
-    if sent and getattr(callback.message, "photo", None):
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+        sent = await callback.message.answer(
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        if sent and getattr(callback.message, "photo", None):
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+
+    if also_ack:
+        await asyncio.gather(
+            callback.answer(answer_text, show_alert=answer_alert),
+            _do_edit(),
+            return_exceptions=True,
+        )
+    else:
+        await _do_edit()
 
 
 async def send_stored_media(

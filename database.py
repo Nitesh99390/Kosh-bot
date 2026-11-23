@@ -8,6 +8,8 @@ from typing import Any, Optional
 
 import aiosqlite
 
+from utils.cache import TTLCache
+
 
 def _gen_token(length: int = 8) -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -41,10 +43,23 @@ SORT_CLAUSES = {
 }
 
 
+LAST_SEEN_WRITE_THROTTLE_SECONDS = 90.0
+
+
 class Database:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.conn: Optional[aiosqlite.Connection] = None
+        # Bounded user cache (maxsize=2000, ttl=120s) + last_seen write throttle + UI asset cache
+        self._user_cache: TTLCache[int, dict[str, Any]] = TTLCache(maxsize=2000, ttl=120.0)
+        self._last_seen_written: TTLCache[int, float] = TTLCache(maxsize=5000, ttl=600.0)
+        self._ui_asset_cache: dict[str, dict[str, Any]] = {}
+
+    def _invalidate_user(self, user_id: int) -> None:
+        self._user_cache.invalidate(user_id)
+
+    def _invalidate_vault_users(self, vault_id: int) -> None:
+        self._user_cache.invalidate_where(lambda _uid, row: row.get("vault_id") == vault_id)
 
     async def connect(self) -> None:
         parent = os.path.dirname(self.db_path)
@@ -54,11 +69,19 @@ class Database:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.execute("PRAGMA journal_mode=WAL;")
         await self.conn.execute("PRAGMA synchronous=NORMAL;")
+        await self.conn.execute("PRAGMA temp_store=MEMORY;")
+        await self.conn.execute("PRAGMA cache_size=-16000;")
+        await self.conn.execute("PRAGMA mmap_size=67108864;")
+        await self.conn.execute("PRAGMA wal_autocheckpoint=1000;")
+        await self.conn.execute("PRAGMA busy_timeout=5000;")
         await self.conn.execute("PRAGMA foreign_keys=ON;")
         await self._init_schema()
         await self._run_migrations()
 
     async def close(self) -> None:
+        self._user_cache.clear()
+        self._last_seen_written.clear()
+        self._ui_asset_cache.clear()
         if self.conn:
             await self.conn.close()
             self.conn = None
@@ -143,12 +166,26 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_files_vault_created
                 ON files(vault_id, is_trashed, is_favorite DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_vault_top
+                ON files(vault_id, is_trashed, use_count DESC, is_favorite DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_vault_size
+                ON files(vault_id, is_trashed, file_size DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_vault_trashed_at
+                ON files(vault_id, is_trashed, trashed_at DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_vault_media
+                ON files(vault_id, is_trashed, media_type, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_files_group
                 ON files(group_id, is_trashed, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_files_unique_vault
                 ON files(vault_id, file_unique_id);
             CREATE INDEX IF NOT EXISTS idx_files_share_token
                 ON files(share_token);
+            CREATE INDEX IF NOT EXISTS idx_users_vault
+                ON users(vault_id);
+            CREATE INDEX IF NOT EXISTS idx_users_last_seen
+                ON users(last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_group_members_vault
+                ON group_members(vault_id, group_id);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
                 file_id UNINDEXED,
@@ -284,6 +321,25 @@ class Database:
                 "ALTER TABLE packs ADD COLUMN is_paused INTEGER DEFAULT 0;"
             )
 
+        await self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_files_vault_top
+                ON files(vault_id, is_trashed, use_count DESC, is_favorite DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_vault_size
+                ON files(vault_id, is_trashed, file_size DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_vault_trashed_at
+                ON files(vault_id, is_trashed, trashed_at DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_vault_media
+                ON files(vault_id, is_trashed, media_type, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_users_vault
+                ON users(vault_id);
+            CREATE INDEX IF NOT EXISTS idx_users_last_seen
+                ON users(last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_group_members_vault
+                ON group_members(vault_id, group_id);
+            """
+        )
+
         await self.conn.commit()
 
     # -------------------- USERS & VAULTS --------------------
@@ -292,21 +348,67 @@ class Database:
         self, user_id: int, username: str = "", full_name: str = ""
     ) -> dict[str, Any]:
         assert self.conn is not None
+        uname = username or ""
+        fname = full_name or ""
+        mono_now = time.monotonic()
+
+        cached = self._user_cache.get(user_id)
+        if cached is not None:
+            profile_changed = (
+                cached.get("username", "") != uname
+                or cached.get("full_name", "") != fname
+            )
+            last_write = self._last_seen_written.get(user_id)
+            due_write = (
+                last_write is None
+                or (mono_now - last_write) >= LAST_SEEN_WRITE_THROTTLE_SECONDS
+            )
+            if not profile_changed and not due_write:
+                return dict(cached)
+
+            now = int(time.time())
+            await self.conn.execute(
+                "UPDATE users SET username = ?, full_name = ?, last_seen = ? WHERE user_id = ?",
+                (uname, fname, now, user_id),
+            )
+            await self.conn.commit()
+            updated = dict(cached)
+            updated["username"] = uname
+            updated["full_name"] = fname
+            updated["last_seen"] = now
+            self._user_cache.set(user_id, updated)
+            self._last_seen_written.set(user_id, mono_now)
+            return dict(updated)
+
         now = int(time.time())
         cur = await self.conn.execute(
             "SELECT * FROM users WHERE user_id = ?", (user_id,)
         )
         row = await cur.fetchone()
         if row:
-            await self.conn.execute(
-                "UPDATE users SET username = ?, full_name = ?, last_seen = ? WHERE user_id = ?",
-                (username or "", full_name or "", now, user_id),
-            )
-            await self.conn.commit()
             user = dict(row)
-            user["username"] = username or ""
-            user["full_name"] = full_name or ""
-            return user
+            profile_changed = (
+                user.get("username", "") != uname
+                or user.get("full_name", "") != fname
+            )
+            last_write = self._last_seen_written.get(user_id)
+            due_write = (
+                last_write is None
+                or (mono_now - last_write) >= LAST_SEEN_WRITE_THROTTLE_SECONDS
+                or (now - int(user.get("last_seen") or 0)) >= LAST_SEEN_WRITE_THROTTLE_SECONDS
+            )
+            if profile_changed or due_write:
+                await self.conn.execute(
+                    "UPDATE users SET username = ?, full_name = ?, last_seen = ? WHERE user_id = ?",
+                    (uname, fname, now, user_id),
+                )
+                await self.conn.commit()
+                user["username"] = uname
+                user["full_name"] = fname
+                user["last_seen"] = now
+                self._last_seen_written.set(user_id, mono_now)
+            self._user_cache.set(user_id, user)
+            return dict(user)
 
         v_cur = await self.conn.execute(
             "INSERT INTO vaults (created_at) VALUES (?)", (now,)
@@ -317,21 +419,31 @@ class Database:
             INSERT INTO users (user_id, username, full_name, vault_id, created_at, last_seen)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (user_id, username or "", full_name or "", vault_id, now, now),
+            (user_id, uname, fname, vault_id, now, now),
         )
         await self.conn.commit()
         cur = await self.conn.execute(
             "SELECT * FROM users WHERE user_id = ?", (user_id,)
         )
-        return dict(await cur.fetchone())
+        created = dict(await cur.fetchone())
+        self._user_cache.set(user_id, created)
+        self._last_seen_written.set(user_id, mono_now)
+        return dict(created)
 
     async def get_user(self, user_id: int) -> Optional[dict[str, Any]]:
         assert self.conn is not None
+        cached = self._user_cache.get(user_id)
+        if cached is not None:
+            return dict(cached)
         cur = await self.conn.execute(
             "SELECT * FROM users WHERE user_id = ?", (user_id,)
         )
         row = await cur.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        user = dict(row)
+        self._user_cache.set(user_id, user)
+        return dict(user)
 
     async def set_active_group(self, user_id: int, group_id: Optional[int]) -> None:
         assert self.conn is not None
@@ -340,6 +452,7 @@ class Database:
             (group_id, user_id),
         )
         await self.conn.commit()
+        self._invalidate_user(user_id)
 
     async def toggle_bulk_mode(self, user_id: int) -> bool:
         assert self.conn is not None
@@ -349,6 +462,7 @@ class Database:
             "UPDATE users SET bulk_mode = ? WHERE user_id = ?", (new_val, user_id)
         )
         await self.conn.commit()
+        self._invalidate_user(user_id)
         return bool(new_val)
 
     async def toggle_protect_content(self, user_id: int) -> bool:
@@ -359,6 +473,7 @@ class Database:
             "UPDATE users SET protect_content = ? WHERE user_id = ?", (new_val, user_id)
         )
         await self.conn.commit()
+        self._invalidate_user(user_id)
         return bool(new_val)
 
     async def cycle_auto_delete_ttl(self, user_id: int) -> int:
@@ -373,6 +488,7 @@ class Database:
             "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?", (nxt, user_id)
         )
         await self.conn.commit()
+        self._invalidate_user(user_id)
         return nxt
 
     async def set_auto_delete_ttl(self, user_id: int, ttl_seconds: int) -> int:
@@ -382,6 +498,7 @@ class Database:
             "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?", (val, user_id)
         )
         await self.conn.commit()
+        self._invalidate_user(user_id)
         return val
 
     async def set_user_banned(self, user_id: int, banned: bool) -> bool:
@@ -391,15 +508,16 @@ class Database:
             (1 if banned else 0, user_id),
         )
         await self.conn.commit()
+        self._invalidate_user(user_id)
         return cur.rowcount > 0
 
     async def is_user_banned(self, user_id: int) -> bool:
         assert self.conn is not None
-        cur = await self.conn.execute(
-            "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
-        )
-        row = await cur.fetchone()
-        return bool(row and row["is_banned"])
+        cached = self._user_cache.get(user_id)
+        if cached is not None:
+            return bool(cached.get("is_banned"))
+        user = await self.get_user(user_id)
+        return bool(user and user.get("is_banned"))
 
     async def set_default_sort(self, user_id: int, sort_key: str) -> str:
         assert self.conn is not None
@@ -408,6 +526,7 @@ class Database:
             "UPDATE users SET default_sort = ? WHERE user_id = ?", (key, user_id)
         )
         await self.conn.commit()
+        self._invalidate_user(user_id)
         return key
 
     async def get_linked_accounts(self, vault_id: int) -> list[dict[str, Any]]:
@@ -529,12 +648,16 @@ class Database:
                 "UPDATE users SET vault_id = ? WHERE vault_id = ?",
                 (target_vault_id, old_vault_id),
             )
+            self._invalidate_vault_users(old_vault_id)
+            self._invalidate_vault_users(target_vault_id)
 
         await self.conn.execute(
             "UPDATE link_requests SET status = 'approved' WHERE code = ?",
             (code.upper(),),
         )
         await self.conn.commit()
+        self._invalidate_user(requester_id)
+        self._invalidate_user(approver_user_id)
         return req
 
     async def reject_link_request(
@@ -568,6 +691,7 @@ class Database:
             (new_vault_id, target_user_id),
         )
         await self.conn.commit()
+        self._invalidate_user(target_user_id)
         return True
 
     # -------------------- GROUPS & FOLDERS --------------------
@@ -699,6 +823,9 @@ class Database:
             )
             await self.conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
             await self.conn.commit()
+            self._user_cache.invalidate_where(
+                lambda _uid, row: row.get("active_group_id") == group_id
+            )
             return "deleted"
         cur = await self.conn.execute(
             "DELETE FROM group_members WHERE group_id = ? AND vault_id = ?",
@@ -709,6 +836,7 @@ class Database:
             (vault_id, group_id),
         )
         await self.conn.commit()
+        self._invalidate_vault_users(vault_id)
         return "left" if cur.rowcount > 0 else "not_member"
 
     # -------------------- FILES & FTS5 INDEXING --------------------
@@ -1395,7 +1523,7 @@ class Database:
     ) -> int:
         assert self.conn is not None
         conditions = [
-            "COALESCE(f.is_trashed, 0) = 0",
+            "f.is_trashed = 0",
             "(f.vault_id = ? OR f.group_id IN (SELECT group_id FROM group_members WHERE vault_id = ?))",
         ]
         params: list[Any] = [vault_id, vault_id]
@@ -1428,81 +1556,115 @@ class Database:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         assert self.conn is not None
-        conditions = [
-            "COALESCE(f.is_trashed, 0) = 0",
+        base_conditions = [
+            "f.is_trashed = 0",
             "(f.vault_id = ? OR f.group_id IN (SELECT group_id FROM group_members WHERE vault_id = ?))",
         ]
-        params: list[Any] = [vault_id, vault_id]
+        base_params: list[Any] = [vault_id, vault_id]
 
         if media_type:
-            conditions.append("f.media_type = ?")
-            params.append(media_type)
+            base_conditions.append("f.media_type = ?")
+            base_params.append(media_type)
 
         if only_favorites:
-            conditions.append("f.is_favorite = 1")
+            base_conditions.append("f.is_favorite = 1")
 
         if group_id_filter is not None:
-            conditions.append("f.group_id = ?")
-            params.append(group_id_filter)
+            base_conditions.append("f.group_id = ?")
+            base_params.append(group_id_filter)
 
         if group_name_filter:
-            conditions.append("LOWER(COALESCE(g.name, '')) LIKE ?")
-            params.append(f"%{group_name_filter.lower()}%")
+            base_conditions.append("LOWER(COALESCE(g.name, '')) LIKE ?")
+            base_params.append(f"%{group_name_filter.lower()}%")
 
         if tag_filter:
-            conditions.append("LOWER(f.tags) LIKE ?")
-            params.append(f"%{tag_filter.lower()}%")
-
-        cleaned_text = text_query.strip()
-        if cleaned_text:
-            fts_terms = [
-                f'"{tok.replace(chr(34), "")}"*'
-                for tok in cleaned_text.split()
-                if tok.strip()
-            ]
-            like_pattern = f"%{cleaned_text.lower()}%"
-            if fts_terms:
-                fts_query = " AND ".join(fts_terms)
-                conditions.append(
-                    """(
-                        f.id IN (SELECT file_id FROM files_fts WHERE files_fts MATCH ?)
-                        OR LOWER(f.title) LIKE ?
-                        OR LOWER(f.performer) LIKE ?
-                        OR LOWER(f.file_name) LIKE ?
-                        OR LOWER(f.tags) LIKE ?
-                        OR LOWER(COALESCE(g.name, '')) LIKE ?
-                    )"""
-                )
-                params.extend(
-                    [
-                        fts_query,
-                        like_pattern,
-                        like_pattern,
-                        like_pattern,
-                        like_pattern,
-                        like_pattern,
-                    ]
-                )
-            else:
-                conditions.append(
-                    "(LOWER(f.title) LIKE ? OR LOWER(f.file_name) LIKE ? OR LOWER(f.tags) LIKE ?)"
-                )
-                params.extend([like_pattern, like_pattern, like_pattern])
+            base_conditions.append("LOWER(f.tags) LIKE ?")
+            base_params.append(f"%{tag_filter.lower()}%")
 
         order_clause = SORT_CLAUSES.get(sort_by, SORT_CLAUSES["new"])
-        where_sql = " AND ".join(conditions)
-        sql = f"""
+        cleaned_text = text_query.strip()
+
+        # Fast path 1: No free-text query -> pure composite-indexed query
+        if not cleaned_text:
+            where_sql = " AND ".join(base_conditions)
+            sql = f"""
+                SELECT f.*, COALESCE(g.name, '') AS group_name
+                FROM files f
+                LEFT JOIN groups g ON g.id = f.group_id
+                WHERE {where_sql}
+                ORDER BY {order_clause}
+                LIMIT ? OFFSET ?
+            """
+            cur = await self.conn.execute(sql, [*base_params, limit, offset])
+            return [dict(r) for r in await cur.fetchall()]
+
+        # Fast path 2: FTS5 index-first search! Only fall back to substring LIKE if FTS5 returns < limit rows.
+        sanitized_tokens = [
+            "".join(ch for ch in tok if ch not in ('"', "'", "\x00")).strip()
+            for tok in cleaned_text.split()
+        ]
+        fts_terms = [f'"{tok}"*' for tok in sanitized_tokens if tok]
+        fts_rows: list[dict[str, Any]] = []
+
+        if fts_terms:
+            fts_query = " AND ".join(fts_terms)
+            fts_conditions = [
+                *base_conditions,
+                "f.id IN (SELECT file_id FROM files_fts WHERE files_fts MATCH ?)",
+            ]
+            fts_sql = f"""
+                SELECT f.*, COALESCE(g.name, '') AS group_name
+                FROM files f
+                LEFT JOIN groups g ON g.id = f.group_id
+                WHERE {' AND '.join(fts_conditions)}
+                ORDER BY {order_clause}
+                LIMIT ? OFFSET ?
+            """
+            try:
+                cur = await self.conn.execute(
+                    fts_sql, [*base_params, fts_query, limit, offset]
+                )
+                fts_rows = [dict(r) for r in await cur.fetchall()]
+            except aiosqlite.OperationalError:
+                fts_rows = []
+
+            if len(fts_rows) >= limit:
+                return fts_rows
+
+        # Fallback: Substring LIKE scan only when FTS5 returned fewer than `limit` rows (e.g. infix substring)
+        remaining = limit - len(fts_rows)
+        like_pattern = f"%{cleaned_text.lower()}%"
+        like_conditions = list(base_conditions)
+        like_params = list(base_params)
+
+        if fts_rows:
+            placeholders = ",".join("?" for _ in fts_rows)
+            like_conditions.append(f"f.id NOT IN ({placeholders})")
+            like_params.extend(r["id"] for r in fts_rows)
+
+        like_conditions.append(
+            """(
+                LOWER(f.title) LIKE ?
+                OR LOWER(f.performer) LIKE ?
+                OR LOWER(f.file_name) LIKE ?
+                OR LOWER(f.tags) LIKE ?
+                OR LOWER(COALESCE(g.name, '')) LIKE ?
+            )"""
+        )
+        like_params.extend([like_pattern] * 5)
+        like_offset = 0 if fts_rows else offset
+
+        like_sql = f"""
             SELECT f.*, COALESCE(g.name, '') AS group_name
             FROM files f
             LEFT JOIN groups g ON g.id = f.group_id
-            WHERE {where_sql}
+            WHERE {' AND '.join(like_conditions)}
             ORDER BY {order_clause}
             LIMIT ? OFFSET ?
         """
-        params.extend([limit, offset])
-        cur = await self.conn.execute(sql, params)
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+        cur = await self.conn.execute(like_sql, [*like_params, remaining, like_offset])
+        extra_rows = [dict(r) for r in await cur.fetchall()]
+        return fts_rows + extra_rows
 
     # -------------------- STATS & ADMIN --------------------
 
@@ -1634,11 +1796,18 @@ class Database:
 
     async def get_ui_asset(self, asset_key: str) -> Optional[dict[str, Any]]:
         assert self.conn is not None
+        cached = self._ui_asset_cache.get(asset_key)
+        if cached is not None:
+            return dict(cached)
         cur = await self.conn.execute(
             "SELECT * FROM ui_assets WHERE asset_key = ?", (asset_key,)
         )
         row = await cur.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        data = dict(row)
+        self._ui_asset_cache[asset_key] = data
+        return dict(data)
 
     async def upsert_ui_asset(
         self,
@@ -1665,6 +1834,7 @@ class Database:
             (asset_key, file_id, file_unique_id, dump_message_id, sha256, now),
         )
         await self.conn.commit()
+        self._ui_asset_cache.pop(asset_key, None)
         res = await self.get_ui_asset(asset_key)
         assert res is not None
         return res
@@ -1678,6 +1848,7 @@ class Database:
 
     async def clear_ui_assets(self) -> int:
         assert self.conn is not None
+        self._ui_asset_cache.clear()
         cur = await self.conn.execute("DELETE FROM ui_assets")
         await self.conn.commit()
         return cur.rowcount

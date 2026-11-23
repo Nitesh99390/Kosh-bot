@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 from database import Database, hash_pin, verify_pin
 from handlers import accounts, admin, file_actions, groups, inline, packs, start_help, upload
+from utils.cache import TTLCache
 from utils.states import PackStates
 from utils.banners import (
     BANNER_FILES,
@@ -33,11 +34,16 @@ from utils.formatters import (
     format_ttl_short,
     next_sort_key,
     progress_bar,
+    safe_edit_or_send,
     send_stored_media,
     share_url_btn,
     toggle_label,
 )
-from utils.middleware import GuardAndThrottleMiddleware
+from utils.middleware import (
+    GuardAndThrottleMiddleware,
+    check_force_sub,
+    invalidate_force_sub_cache,
+)
 
 
 class _DummyBot:
@@ -721,8 +727,197 @@ async def run_tests() -> None:
         start_help._clear_pin_failures(9090, "p:TESTTOK")
         assert start_help._check_pin_lockout(9090, "p:TESTTOK") == 0
 
+        # 21. Bounded TTLCache LRU eviction & TTL expiry
+        fake_now = [1000.0]
+        tcache: TTLCache[str, int] = TTLCache(
+            maxsize=3, ttl=10.0, clock=lambda: fake_now[0]
+        )
+        tcache.set("a", 1)
+        tcache.set("b", 2)
+        tcache.set("c", 3)
+        # Touch 'a' so 'b' becomes LRU
+        assert tcache.get("a") == 1
+        tcache.set("d", 4)
+        assert "b" not in tcache and len(tcache) == 3
+        assert tcache.get("a") == 1 and tcache.get("c") == 3 and tcache.get("d") == 4
+        # Advance clock past TTL -> all entries expire cleanly
+        fake_now[0] += 11.0
+        assert tcache.get("a") is None
+        assert len(tcache) == 0
+
+        # 22. ensure_user() cache invalidation + 90s last_seen write throttling (zero-write read path)
+        u_perf = await db.ensure_user(77777, "perf_user", "Perf User")
+        assert u_perf["user_id"] == 77777
+        await db.conn.commit()
+        changes_before = db.conn.total_changes
+        for _ in range(25):
+            cached_u = await db.ensure_user(77777, "perf_user", "Perf User")
+            assert cached_u["vault_id"] == u_perf["vault_id"]
+        assert (
+            db.conn.total_changes == changes_before
+        ), "Repeated ensure_user() within 90s must perform ZERO SQLite writes!"
+
+        # Mutations must immediately invalidate user cache
+        assert await db.toggle_bulk_mode(77777) is True
+        assert (await db.get_user(77777))["bulk_mode"] == 1
+        assert await db.set_default_sort(77777, "size") == "size"
+        assert (await db.get_user(77777))["default_sort"] == "size"
+        assert await db.set_user_banned(77777, True) is True
+        assert await db.is_user_banned(77777) is True
+        assert await db.set_user_banned(77777, False) is True
+        assert await db.is_user_banned(77777) is False
+
+        # Simulate >90s elapsed -> next ensure_user() persists updated last_seen once
+        db._last_seen_written.set(77777, time.monotonic() - 95.0)
+        changes_mid = db.conn.total_changes
+        await db.ensure_user(77777, "perf_user", "Perf User")
+        assert db.conn.total_changes == changes_mid + 1
+
+        # 23. Force-Subscribe TTLCache + immediate invalidation on Recheck
+        fsub_calls = 0
+
+        class _FSubBot:
+            async def get_chat_member(self, chat_id, user_id):
+                nonlocal fsub_calls
+                fsub_calls += 1
+                from aiogram.enums import ChatMemberStatus
+
+                return SimpleNamespace(
+                    status=(
+                        ChatMemberStatus.LEFT
+                        if fsub_calls == 1
+                        else ChatMemberStatus.MEMBER
+                    )
+                )
+
+        fsub_bot = _FSubBot()
+        invalidate_force_sub_cache("@kosh_updates", 88888)
+        assert await check_force_sub(fsub_bot, "@kosh_updates", 88888) is False  # type: ignore[arg-type]
+        assert await check_force_sub(fsub_bot, "@kosh_updates", 88888) is False  # cached!
+        assert fsub_calls == 1
+        invalidate_force_sub_cache("@kosh_updates", 88888)
+        assert await check_force_sub(fsub_bot, "@kosh_updates", 88888) is True  # type: ignore[arg-type]
+        assert fsub_calls == 2
+
+        # 24. FTS5-First Search + Substring Fallback Correctness
+        u_fts = await db.ensure_user(88889, "searcher", "Searcher")
+        await db.add_file(
+            vault_id=u_fts["vault_id"],
+            uploader_user_id=88889,
+            group_id=None,
+            media_type="document",
+            file_id="FTS_DOC_1",
+            file_unique_id="FTS_U_1",
+            dump_message_id=901,
+            title="Quantum_Cryptography_2026_Handbook.pdf",
+            file_name="Quantum_Cryptography_2026_Handbook.pdf",
+            tags="#crypto #quantum",
+        )
+        await db.add_file(
+            vault_id=u_fts["vault_id"],
+            uploader_user_id=88889,
+            group_id=None,
+            media_type="document",
+            file_id="FTS_DOC_2",
+            file_unique_id="FTS_U_2",
+            dump_message_id=902,
+            title="SuperSecretInfixToken99X.zip",
+            file_name="SuperSecretInfixToken99X.zip",
+        )
+        # Prefix / token match via FTS5 fast path
+        fts_hits = await db.search_files(u_fts["vault_id"], text_query="Quantum Hand", limit=5)
+        assert len(fts_hits) == 1 and "Quantum" in fts_hits[0]["title"]
+        # Mid-word substring match via automatic LIKE fallback when FTS5 returns < limit
+        infix_hits = await db.search_files(u_fts["vault_id"], text_query="InfixToken99", limit=5)
+        assert len(infix_hits) == 1 and "SuperSecretInfixToken99X" in infix_hits[0]["title"]
+
+        # 25. Smart Banner Editing (edit_caption when same banner vs edit_media when switching)
+        #     & Parallel callback.answer() + UI Edit verification
+        banner_events: list[str] = []
+        welcome_asset = await db.get_ui_asset("welcome")
+        assert welcome_asset is not None
+
+        async def _cb_answer(text=None, show_alert=False):
+            banner_events.append(f"ans:{text or ''}")
+
+        async def _msg_edit_caption(caption="", reply_markup=None):
+            banner_events.append("edit_caption")
+
+        async def _msg_edit_media(media=None, reply_markup=None):
+            banner_events.append("edit_media")
+
+        same_banner_cb = SimpleNamespace(
+            answer=_cb_answer,
+            message=SimpleNamespace(
+                photo=[
+                    SimpleNamespace(
+                        file_id=welcome_asset["file_id"],
+                        file_unique_id=welcome_asset["file_unique_id"],
+                    )
+                ],
+                text=None,
+                edit_caption=_msg_edit_caption,
+                edit_media=_msg_edit_media,
+            ),
+        )
+        await edit_or_send_banner(
+            same_banner_cb,  # type: ignore[arg-type]
+            "welcome",
+            "Updated dashboard caption",
+            None,
+            dummy_bot,  # type: ignore[arg-type]
+            db,
+            dummy_cfg,
+            answer_text="Fast!",
+            also_ack=True,
+        )
+        assert "edit_caption" in banner_events and "edit_media" not in banner_events
+        assert "ans:Fast!" in banner_events
+
+        banner_events.clear()
+        await edit_or_send_banner(
+            same_banner_cb,  # type: ignore[arg-type]
+            "guide",
+            "Switched to guide banner",
+            None,
+            dummy_bot,  # type: ignore[arg-type]
+            db,
+            dummy_cfg,
+            also_ack=True,
+        )
+        assert "edit_media" in banner_events and "ans:" in banner_events
+
+        # 26. SQLite PRAGMA verification & IPv4-only session check
+        import socket
+        from bot import IPv4AiohttpSession
+
+        ipv4_sess = IPv4AiohttpSession(limit=64)
+        assert ipv4_sess._connector_init["family"] == socket.AF_INET
+        assert ipv4_sess._connector_init["ttl_dns_cache"] == 300
+        assert ipv4_sess._connector_init["keepalive_timeout"] == 60.0
+        assert ipv4_sess._connector_init["limit"] == 64
+
+        pragma_journal = (await (await db.conn.execute("PRAGMA journal_mode;")).fetchone())[0]
+        pragma_cache = (await (await db.conn.execute("PRAGMA cache_size;")).fetchone())[0]
+        assert str(pragma_journal).lower() == "wal"
+        assert int(pragma_cache) == -16000
+
+        # 27. Static AST / source verification: ZERO `bot.get_me()` calls inside handlers/ or utils/
+        base_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for folder in ("handlers", "utils"):
+            folder_path = os.path.join(base_root, folder)
+            for fname in os.listdir(folder_path):
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(folder_path, fname)
+                with open(fpath, "r", encoding="utf-8") as src_f:
+                    src = src_f.read()
+                assert "get_me(" not in src, (
+                    f"Forbidden per-request get_me() call found in {folder}/{fname}!"
+                )
+
         await db.close()
-        print("ALL PRO FEATURES, SECURITY, PACKS & CRISP UI/UX TESTS PASSED!")
+        print("ALL PRO FEATURES, SECURITY, PACKS, LOW-LATENCY & ZERO-LEAK TESTS PASSED!")
 
 
 if __name__ == "__main__":

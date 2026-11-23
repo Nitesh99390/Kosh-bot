@@ -13,19 +13,32 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
+from utils.cache import TTLCache
+
+# Bounded FORCE_SUB_CHANNEL membership cache (maxsize=5000, ttl=300s)
+_FORCE_SUB_CACHE: TTLCache[tuple[str, int], bool] = TTLCache(maxsize=5000, ttl=300.0)
+
+
+def invalidate_force_sub_cache(channel_id_or_username: str, user_id: int) -> None:
+    """Immediately invalidates cached force-sub membership when user taps Recheck."""
+    key_str = channel_id_or_username.strip()
+    _FORCE_SUB_CACHE.invalidate((key_str, user_id))
 
 
 class GuardAndThrottleMiddleware(BaseMiddleware):
     """
     Production outer middleware inspired by top GitHub Aiogram v3 & FileStore bots:
     1. Anti-Flood / Throttling: prevents rapid button-mashing & spam (skips media albums).
-    2. User Ban Guard: blocks banned users cleanly.
-    3. Optional Force-Subscribe Gate: verifies membership in `FORCE_SUB_CHANNEL` when configured.
+    2. User Ban Guard: blocks banned users cleanly (uses cached user row).
+    3. Optional Force-Subscribe Gate: verifies membership in `FORCE_SUB_CHANNEL` with bounded TTLCache.
     """
 
-    def __init__(self, rate_limit: float = 0.35) -> None:
+    def __init__(self, rate_limit: float = 0.35, max_tracked_users: int = 4096) -> None:
         self.rate_limit = rate_limit
-        self._last_hit: dict[int, float] = {}
+        self._hits: TTLCache[int, float] = TTLCache(
+            maxsize=max_tracked_users,
+            ttl=max(rate_limit * 4.0, 30.0),
+        )
 
     async def __call__(
         self,
@@ -57,20 +70,15 @@ class GuardAndThrottleMiddleware(BaseMiddleware):
         )
         if self.rate_limit > 0 and not is_admin and not is_media_upload:
             now = time.monotonic()
-            prev = self._last_hit.get(user.id, 0.0)
-            if now - prev < self.rate_limit:
+            prev = self._hits.get(user.id)
+            if prev is not None and (now - prev) < self.rate_limit:
                 if isinstance(event, CallbackQuery):
                     try:
                         await event.answer("⏳ Slow down a bit…")
                     except Exception:
                         pass
                 return None
-            self._last_hit[user.id] = now
-            if len(self._last_hit) > 5000:
-                cutoff = now - 60.0
-                self._last_hit = {
-                    uid: ts for uid, ts in self._last_hit.items() if ts >= cutoff
-                }
+            self._hits.set(user.id, now)
 
         # 2. Banned user check
         if db and not is_admin and await db.is_user_banned(user.id):
@@ -89,6 +97,7 @@ class GuardAndThrottleMiddleware(BaseMiddleware):
             and isinstance(event, (Message, CallbackQuery))
         ):
             if isinstance(event, CallbackQuery) and event.data == "fsub:check":
+                invalidate_force_sub_cache(config.force_sub_channel, user.id)
                 return await handler(event, data)
 
             joined = await check_force_sub(bot, config.force_sub_channel, user.id)
@@ -129,18 +138,35 @@ class GuardAndThrottleMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-async def check_force_sub(bot: Bot, channel_id_or_username: str, user_id: int) -> bool:
-    target: int | str = channel_id_or_username
-    if channel_id_or_username.lstrip("-").isdigit():
-        target = int(channel_id_or_username)
+async def check_force_sub(
+    bot: Bot,
+    channel_id_or_username: str,
+    user_id: int,
+    *,
+    bypass_cache: bool = False,
+) -> bool:
+    cache_key = (channel_id_or_username.strip(), user_id)
+    if bypass_cache:
+        _FORCE_SUB_CACHE.invalidate(cache_key)
+    else:
+        cached = _FORCE_SUB_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    target: int | str = channel_id_or_username.strip()
+    if isinstance(target, str) and target.lstrip("-").isdigit():
+        target = int(target)
     try:
         member = await bot.get_chat_member(chat_id=target, user_id=user_id)
-        return member.status in {
+        is_member = member.status in {
             ChatMemberStatus.CREATOR,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.RESTRICTED,
         }
+        # Cache positive membership for full TTL (300s), negative briefly (15s) to absorb spam clicks
+        _FORCE_SUB_CACHE.set(cache_key, is_member, ttl=300.0 if is_member else 15.0)
+        return is_member
     except Exception:
         # Fail-open if misconfigured so the bot never bricks itself
         return True

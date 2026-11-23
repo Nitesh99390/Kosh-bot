@@ -275,7 +275,11 @@ async def render_packs_list(
 
 
 async def render_pack_detail(
-    user_id: int, pack_id: int, db: Database, bot: Bot
+    user_id: int,
+    pack_id: int,
+    db: Database,
+    bot: Optional[Bot] = None,
+    bot_username: str = "KoshBox_Bot",
 ) -> Optional[tuple[str, InlineKeyboardMarkup]]:
     """
     Advanced Bug-Proof Pack Detail & Share Link Console:
@@ -289,8 +293,8 @@ async def render_pack_detail(
         return None
 
     items = await db.get_pack_files(pack_id)
-    me = await bot.get_me()
-    share_url = f"https://t.me/{me.username}?start=pack_{pack['share_token']}"
+    uname = bot_username or "KoshBox_Bot"
+    share_url = f"https://t.me/{uname}?start=pack_{pack['share_token']}"
 
     max_v = int(pack.get("max_views") or 0)
     cur_v = int(pack.get("views") or 0)
@@ -502,8 +506,7 @@ async def cb_packs_list(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.full_name or "",
     )
     text, kb = await render_packs_list(callback.from_user.id, db, page)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data == "nav:packs")
@@ -516,15 +519,13 @@ async def cb_nav_packs(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.full_name or "",
     )
     text, kb = await render_packs_list(callback.from_user.id, db, 0)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data == "pk:new")
 async def cb_pack_new(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PackStates.collecting_items)
     text, kb = _render_batch_collector(0)
-    await safe_edit_or_send(callback, text, kb)
     msg_id = (
         callback.message.message_id
         if (callback.message and not getattr(callback.message, "photo", None))
@@ -537,7 +538,9 @@ async def cb_pack_new(callback: CallbackQuery, state: FSMContext) -> None:
         pack_status_msg_id=msg_id,
         append_pack_id=None,
     )
-    await callback.answer("Drop files to bundle!")
+    await safe_edit_or_send(
+        callback, text, kb, answer_text="Drop files to bundle!", also_ack=True
+    )
 
 
 @router.callback_query(F.data.startswith("pk:add:"))
@@ -556,7 +559,6 @@ async def cb_pack_add_more_files(
 
     await state.set_state(PackStates.collecting_items)
     text, kb = _render_batch_collector(0, append_pack_id=pid)
-    await safe_edit_or_send(callback, text, kb)
     msg_id = (
         callback.message.message_id
         if (callback.message and not getattr(callback.message, "photo", None))
@@ -569,12 +571,21 @@ async def cb_pack_add_more_files(
         pack_status_msg_id=msg_id,
         append_pack_id=pid,
     )
-    await callback.answer("Drop files to add to this pack!")
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text="Drop files to add to this pack!",
+        also_ack=True,
+    )
 
 
 @router.callback_query(F.data.startswith("pk:from_grp:"))
 async def cb_pack_from_group(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     """1-Tap: Bundle an entire Folder/Group into a shareable Pack link!"""
     if not callback.from_user:
@@ -598,15 +609,27 @@ async def cb_pack_from_group(
         file_ids=[f["id"] for f in files],
         protect_content=bool(user.get("protect_content")),
     )
-    rendered = await render_pack_detail(callback.from_user.id, pack["id"], db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pack["id"], db, bot, bot_username=bot_username
+    )
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer(f"🎒 Packed {len(files)} files!")
+        await safe_edit_or_send(
+            callback,
+            rendered[0],
+            rendered[1],
+            answer_text=f"🎒 Packed {len(files)} files!",
+            also_ack=True,
+        )
+    else:
+        await callback.answer(f"🎒 Packed {len(files)} files!")
 
 
 @router.callback_query(F.data.startswith("pk:quick_album:"))
 async def cb_pack_quick_album(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     """Legacy 1-Tap Pack creation callback handler kept for backwards compatibility."""
     if not callback.from_user:
@@ -630,15 +653,28 @@ async def cb_pack_quick_album(
         file_ids=fids,
         protect_content=bool(user.get("protect_content")),
     )
-    rendered = await render_pack_detail(callback.from_user.id, pack["id"], db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pack["id"], db, bot, bot_username=bot_username
+    )
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer("🎒 Pack Link Ready!")
+        await safe_edit_or_send(
+            callback,
+            rendered[0],
+            rendered[1],
+            answer_text="🎒 Pack Link Ready!",
+            also_ack=True,
+        )
+    else:
+        await callback.answer("🎒 Pack Link Ready!")
 
 
 @router.message(PackStates.collecting_items, Command("done"))
 async def cmd_batch_done(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user:
         return
@@ -652,7 +688,9 @@ async def cmd_batch_done(
     if append_pid:
         await state.clear()
         await db.append_files_to_pack(append_pid, fids)
-        rendered = await render_pack_detail(message.from_user.id, append_pid, db, bot)
+        rendered = await render_pack_detail(
+            message.from_user.id, append_pid, db, bot, bot_username=bot_username
+        )
         if rendered:
             await message.answer(
                 f"✅ <b>Added {len(fids)} file(s)</b>\n{rendered[0]}",
@@ -682,7 +720,11 @@ async def cmd_batch_done(
 
 @router.callback_query(F.data == "pk:finish")
 async def cb_batch_finish(
-    callback: CallbackQuery, state: FSMContext, db: Database, bot: Bot
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -696,10 +738,19 @@ async def cb_batch_finish(
     if append_pid:
         await state.clear()
         await db.append_files_to_pack(append_pid, fids)
-        rendered = await render_pack_detail(callback.from_user.id, append_pid, db, bot)
+        rendered = await render_pack_detail(
+            callback.from_user.id, append_pid, db, bot, bot_username=bot_username
+        )
         if rendered:
-            await safe_edit_or_send(callback, rendered[0], rendered[1])
-        await callback.answer(f"✓ Added {len(fids)} file(s)!")
+            await safe_edit_or_send(
+                callback,
+                rendered[0],
+                rendered[1],
+                answer_text=f"✓ Added {len(fids)} file(s)!",
+                also_ack=True,
+            )
+        else:
+            await callback.answer(f"✓ Added {len(fids)} file(s)!")
         return
 
     await state.set_state(PackStates.waiting_for_title)
@@ -719,13 +770,17 @@ async def cb_batch_finish(
                 [InlineKeyboardButton(text="◀ Cancel", callback_data="fsm:cancel:pk:list:0")],
             ]
         ),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "pk:autotitle")
 async def cb_pack_auto_title(
-    callback: CallbackQuery, state: FSMContext, db: Database, bot: Bot
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -753,15 +808,28 @@ async def cb_pack_auto_title(
         file_ids=fids,
         protect_content=bool(user.get("protect_content")),
     )
-    rendered = await render_pack_detail(callback.from_user.id, pack["id"], db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pack["id"], db, bot, bot_username=bot_username
+    )
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer("🎒 Pack Ready!")
+        await safe_edit_or_send(
+            callback,
+            rendered[0],
+            rendered[1],
+            answer_text="🎒 Pack Ready!",
+            also_ack=True,
+        )
+    else:
+        await callback.answer("🎒 Pack Ready!")
 
 
 @router.message(PackStates.waiting_for_title)
 async def fsm_pack_save_title(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user or not message.text:
         return
@@ -784,7 +852,9 @@ async def fsm_pack_save_title(
         file_ids=fids,
         protect_content=bool(user.get("protect_content")),
     )
-    rendered = await render_pack_detail(message.from_user.id, pack["id"], db, bot)
+    rendered = await render_pack_detail(
+        message.from_user.id, pack["id"], db, bot, bot_username=bot_username
+    )
     if rendered:
         await message.answer(
             rendered[0], reply_markup=rendered[1], disable_web_page_preview=True
@@ -792,16 +862,22 @@ async def fsm_pack_save_title(
 
 
 @router.callback_query(F.data.startswith("pk:open:"))
-async def cb_pack_open(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_pack_open(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
     if not rendered:
         await callback.answer("Pack not found.", show_alert=True)
         return
-    await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer()
+    await safe_edit_or_send(callback, rendered[0], rendered[1], also_ack=True)
 
 
 @router.callback_query(F.data.startswith("pk:edit:"))
@@ -813,8 +889,7 @@ async def cb_pack_edit_drawer(callback: CallbackQuery, db: Database) -> None:
     if not rendered:
         await callback.answer("Pack not found.", show_alert=True)
         return
-    await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer()
+    await safe_edit_or_send(callback, rendered[0], rendered[1], also_ack=True)
 
 
 @router.callback_query(F.data.startswith("pk:editp:"))
@@ -828,8 +903,7 @@ async def cb_pack_edit_page(callback: CallbackQuery, db: Database) -> None:
     if not rendered:
         await callback.answer("Pack not found.", show_alert=True)
         return
-    await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer()
+    await safe_edit_or_send(callback, rendered[0], rendered[1], also_ack=True)
 
 
 @router.callback_query(F.data.startswith("pk:rmf:"))
@@ -856,8 +930,15 @@ async def cb_pack_remove_file(
     await db.remove_file_from_pack(pid, fid)
     rendered = await render_pack_edit_drawer(callback.from_user.id, pid, db, page=page)
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer("Removed from pack")
+        await safe_edit_or_send(
+            callback,
+            rendered[0],
+            rendered[1],
+            answer_text="Removed from pack",
+            also_ack=True,
+        )
+    else:
+        await callback.answer("Removed from pack")
 
 
 @router.callback_query(F.data.startswith("pk:ren:"))
@@ -879,13 +960,17 @@ async def cb_pack_rename_prompt(
         f"✏️ <b>Rename Pack</b> · <code>{esc(pack['title'])}</code>\n"
         f"<blockquote>Send new pack title (max 60 chars):</blockquote>",
         cancel_kb(f"pk:edit:{pid}"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(PackStates.waiting_for_rename)
 async def fsm_pack_rename_save(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user or not message.text:
         return
@@ -899,7 +984,9 @@ async def fsm_pack_rename_save(
     if not pack or not user or pack["vault_id"] != user["vault_id"]:
         return
     await db.rename_pack(pid, message.text.strip()[:60])
-    rendered = await render_pack_detail(message.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        message.from_user.id, pid, db, bot, bot_username=bot_username
+    )
     if rendered:
         await message.answer(
             rendered[0], reply_markup=rendered[1], disable_web_page_preview=True
@@ -926,13 +1013,17 @@ async def cb_pack_desc_prompt(
         f"💬 <b>Pack Welcome Note</b> · <i>{cur_note}</i>\n"
         f"<blockquote>Send a note shown when someone opens your link (or <code>-</code> to clear):</blockquote>",
         cancel_kb(f"pk:edit:{pid}"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(PackStates.waiting_for_description)
 async def fsm_pack_desc_save(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user or not message.text:
         return
@@ -948,7 +1039,9 @@ async def fsm_pack_desc_save(
     raw = message.text.strip()
     note = "" if raw == "-" else raw[:300]
     await db.set_pack_description(pid, note)
-    rendered = await render_pack_detail(message.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        message.from_user.id, pid, db, bot, bot_username=bot_username
+    )
     if rendered:
         await message.answer(
             rendered[0], reply_markup=rendered[1], disable_web_page_preview=True
@@ -996,13 +1089,17 @@ async def cb_pack_pin_prompt(
         f"🔑 <b>Pack PIN Lock</b> · <i>{status}</i>\n"
         f"<blockquote>Send a PIN/password (up to 24 chars), or <code>-</code> to remove PIN:</blockquote>",
         cancel_kb(f"pk:open:{pid}"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(PackStates.waiting_for_pin)
 async def fsm_pack_set_pin(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user or not message.text:
         return
@@ -1022,7 +1119,9 @@ async def fsm_pack_set_pin(
         await message.delete()
     except Exception:
         pass
-    rendered = await render_pack_detail(message.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        message.from_user.id, pid, db, bot, bot_username=bot_username
+    )
     if rendered:
         await message.answer(
             rendered[0], reply_markup=rendered[1], disable_web_page_preview=True
@@ -1030,7 +1129,12 @@ async def fsm_pack_set_pin(
 
 
 @router.callback_query(F.data.startswith("pk:prot:"))
-async def cb_pack_toggle_prot(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_pack_toggle_prot(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
@@ -1040,14 +1144,25 @@ async def cb_pack_toggle_prot(callback: CallbackQuery, db: Database, bot: Bot) -
         await callback.answer("Pack not found.", show_alert=True)
         return
     on = await db.toggle_pack_protect(pid)
-    rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
+    ans = "🛡️ Content Protection ON" if on else "Content Protection OFF"
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer("🛡️ Content Protection ON" if on else "Content Protection OFF")
+        await safe_edit_or_send(
+            callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
+        )
+    else:
+        await callback.answer(ans)
 
 
 @router.callback_query(F.data.startswith("pk:exp:"))
-async def cb_pack_cycle_exp(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_pack_cycle_exp(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
@@ -1057,15 +1172,24 @@ async def cb_pack_cycle_exp(callback: CallbackQuery, db: Database, bot: Bot) -> 
         await callback.answer("Pack not found.", show_alert=True)
         return
     new_exp = await db.cycle_pack_expiry(pid)
-    rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
+    ans = f"⏳ Expiry: {format_expiry_badge(new_exp)}"
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer(f"⏳ Expiry: {format_expiry_badge(new_exp)}")
+        await safe_edit_or_send(
+            callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
+        )
+    else:
+        await callback.answer(ans)
 
 
 @router.callback_query(F.data.startswith("pk:maxv:"))
 async def cb_pack_cycle_max_views(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -1076,16 +1200,25 @@ async def cb_pack_cycle_max_views(
         await callback.answer("Pack not found.", show_alert=True)
         return
     lim = await db.cycle_pack_max_views(pid)
-    rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
-    if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
     lbl = f"{lim} opens max" if lim > 0 else "Unlimited opens"
-    await callback.answer(f"👁 Access Limit: {lbl}")
+    ans = f"👁 Access Limit: {lbl}"
+    if rendered:
+        await safe_edit_or_send(
+            callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
+        )
+    else:
+        await callback.answer(ans)
 
 
 @router.callback_query(F.data.startswith("pk:pause:"))
 async def cb_pack_toggle_pause(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -1096,14 +1229,25 @@ async def cb_pack_toggle_pause(
         await callback.answer("Pack not found.", show_alert=True)
         return
     paused = await db.toggle_pack_paused(pid)
-    rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
+    ans = "⏸ Link Paused" if paused else "▶️ Link Active"
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer("⏸ Link Paused" if paused else "▶️ Link Active")
+        await safe_edit_or_send(
+            callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
+        )
+    else:
+        await callback.answer(ans)
 
 
 @router.callback_query(F.data.startswith("pk:regen:"))
-async def cb_pack_regen(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_pack_regen(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
@@ -1113,10 +1257,16 @@ async def cb_pack_regen(callback: CallbackQuery, db: Database, bot: Bot) -> None
         await callback.answer("Pack not found.", show_alert=True)
         return
     await db.regenerate_pack_token(pid)
-    rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
+    ans = "🔄 New pack link generated (views reset)"
     if rendered:
-        await safe_edit_or_send(callback, rendered[0], rendered[1])
-    await callback.answer("🔄 New pack link generated (views reset)")
+        await safe_edit_or_send(
+            callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
+        )
+    else:
+        await callback.answer(ans)
 
 
 @router.callback_query(F.data.startswith("pk:del_ask:"))
@@ -1146,8 +1296,8 @@ async def cb_pack_del_ask(callback: CallbackQuery, db: Database) -> None:
         f"⚠️ <b>Delete Pack '{esc(pack['title'])}'?</b>\n"
         f"<blockquote>The share link stops working. Your underlying vault files stay untouched.</blockquote>",
         kb,
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("pk:del:"))
@@ -1158,5 +1308,6 @@ async def cb_pack_del(callback: CallbackQuery, db: Database) -> None:
     user = await db.get_user(callback.from_user.id)
     await db.delete_pack(pid, user["vault_id"])
     text, kb = await render_packs_list(callback.from_user.id, db, 0)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer("Pack deleted")
+    await safe_edit_or_send(
+        callback, text, kb, answer_text="Pack deleted", also_ack=True
+    )

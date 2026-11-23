@@ -246,7 +246,10 @@ def _to_inline_result(
 
 @router.inline_query()
 async def handle_inline_query(
-    inline_query: InlineQuery, db: Database, config: Config, bot: Bot
+    inline_query: InlineQuery,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     user = await db.ensure_user(
         inline_query.from_user.id,
@@ -262,8 +265,7 @@ async def handle_inline_query(
     default_sort = user.get("default_sort") or "new"
     parsed = _parse_inline_query(inline_query.query or "", default_sort=default_sort)
     page_size = config.inline_page_size
-    me = await bot.get_me()
-    uname = me.username or "KoshBox_Bot"
+    uname = bot_username or "KoshBox_Bot"
 
     results: list[InlineQueryResult] = []
     next_offset = ""

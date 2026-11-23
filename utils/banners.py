@@ -35,8 +35,9 @@ BANNER_LABELS: dict[str, str] = {
     "guide": "🔍 KoshBox Inline Search & Sync Guide Banner",
 }
 
-# Per-key asyncio locks so concurrent users never trigger duplicate uploads
+# Per-key asyncio locks + process-lifetime SHA-256 cache so banners never re-hash disk files per click
 _ASSET_LOCKS: dict[str, asyncio.Lock] = {}
+_LOCAL_SHA_CACHE: dict[str, tuple[float, str]] = {}
 
 
 def _get_lock(asset_key: str) -> asyncio.Lock:
@@ -48,11 +49,21 @@ def _get_lock(asset_key: str) -> asyncio.Lock:
 
 
 def compute_file_sha256(path: str) -> str:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = -1.0
+    cached = _LOCAL_SHA_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
-    return h.hexdigest()
+    digest = h.hexdigest()
+    if mtime >= 0:
+        _LOCAL_SHA_CACHE[path] = (mtime, digest)
+    return digest
 
 
 async def get_or_upload_banner_file_id(
@@ -211,54 +222,84 @@ async def edit_or_send_banner(
     bot: Bot,
     db: Database,
     config: Config,
+    *,
+    answer_text: Optional[str] = None,
+    answer_alert: bool = False,
+    also_ack: bool = False,
 ) -> None:
     """
     Smoothly transitions an existing callback panel to a PostBot-style banner card:
-    - If the current message is already a photo message: edits media/caption in-place with cached `file_id`!
-    - If the current message is text-only: sends the rich photo card and cleanly removes the old text panel.
+    - If the current message already displays the SAME banner image (matched by `file_id` or `file_unique_id`),
+      calls `edit_caption` instead of `edit_media` to avoid Telegram server-side media re-processing!
+    - When `also_ack=True`, dispatches `callback.answer()` concurrently via `asyncio.gather` to save 1 full RTT.
     """
     if not callback.message:
+        if also_ack:
+            try:
+                await callback.answer(answer_text, show_alert=answer_alert)
+            except Exception:
+                pass
         return
 
     file_id = await get_or_upload_banner_file_id(asset_key, bot, db, config)
     if not file_id:
         from utils.formatters import safe_edit_or_send
 
-        await safe_edit_or_send(callback, caption, reply_markup)
+        await safe_edit_or_send(
+            callback,
+            caption,
+            reply_markup,
+            answer_text=answer_text,
+            answer_alert=answer_alert,
+            also_ack=also_ack,
+        )
         return
 
-    if getattr(callback.message, "photo", None):
-        current_unique = callback.message.photo[-1].file_unique_id
-        cached_row = await db.get_ui_asset(asset_key)
-        same_photo = bool(
-            cached_row
-            and cached_row.get("file_unique_id")
-            and cached_row["file_unique_id"] == current_unique
-        )
-        try:
-            if same_photo:
-                await callback.message.edit_caption(
-                    caption=caption,
-                    reply_markup=reply_markup,
-                )
-            else:
-                await callback.message.edit_media(
-                    media=InputMediaPhoto(media=file_id, caption=caption),
-                    reply_markup=reply_markup,
-                )
-            return
-        except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
+    async def _do_ui_update() -> None:
+        assert callback.message is not None
+        photos = getattr(callback.message, "photo", None)
+        if photos:
+            cached_row = await db.get_ui_asset(asset_key)
+            cached_fid = (cached_row or {}).get("file_id") or file_id
+            cached_uniq = (cached_row or {}).get("file_unique_id") or ""
+            same_photo = any(
+                getattr(p, "file_id", None) == cached_fid
+                or (cached_uniq and getattr(p, "file_unique_id", None) == cached_uniq)
+                for p in photos
+            )
+            try:
+                if same_photo and len(caption) <= 1024:
+                    await callback.message.edit_caption(
+                        caption=caption,
+                        reply_markup=reply_markup,
+                    )
+                else:
+                    await callback.message.edit_media(
+                        media=InputMediaPhoto(media=file_id, caption=caption),
+                        reply_markup=reply_markup,
+                    )
                 return
-        except Exception as exc:
-            logger.debug("edit_media/edit_caption fallback: %s", exc)
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+            except Exception as exc:
+                logger.debug("edit_media/edit_caption fallback: %s", exc)
 
-    # Transitioning from a text-only view back to a hero banner card
-    sent = await send_banner_message(
-        callback.message, asset_key, caption, reply_markup, bot, db, config
-    )
-    if sent and getattr(callback.message, "text", None):
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
+        # Transitioning from a text-only view back to a hero banner card
+        sent = await send_banner_message(
+            callback.message, asset_key, caption, reply_markup, bot, db, config
+        )
+        if sent and getattr(callback.message, "text", None):
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+
+    if also_ack:
+        await asyncio.gather(
+            callback.answer(answer_text, show_alert=answer_alert),
+            _do_ui_update(),
+            return_exceptions=True,
+        )
+    else:
+        await _do_ui_update()

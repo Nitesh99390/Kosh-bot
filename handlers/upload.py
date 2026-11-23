@@ -33,6 +33,7 @@ PACK_STATUS_DEBOUNCE_SECONDS: float = float(
 )
 
 # Per-user burst buffers for automatic Multi-File Pack creation (>1 file dropped together)
+_MAX_LOCK_POOL = 1024
 _USER_DROP_BUFFER: dict[int, list[dict[str, Any]]] = {}
 _USER_DROP_TASKS: dict[int, asyncio.Task] = {}
 _USER_DROP_LOCKS: dict[int, asyncio.Lock] = {}
@@ -42,9 +43,28 @@ _PACK_BUILDER_TASKS: dict[int, asyncio.Task] = {}
 _PACK_BUILDER_LOCKS: dict[int, asyncio.Lock] = {}
 
 
+def _prune_idle_locks(
+    lock_map: dict[int, asyncio.Lock],
+    active_tasks: dict[int, asyncio.Task],
+    active_buffers: Optional[dict[int, Any]] = None,
+) -> None:
+    if len(lock_map) <= _MAX_LOCK_POOL:
+        return
+    idle_uids = [
+        uid
+        for uid, lk in lock_map.items()
+        if not lk.locked()
+        and uid not in active_tasks
+        and (active_buffers is None or uid not in active_buffers)
+    ]
+    for uid in idle_uids:
+        lock_map.pop(uid, None)
+
+
 def _get_drop_lock(user_id: int) -> asyncio.Lock:
     lock = _USER_DROP_LOCKS.get(user_id)
     if lock is None:
+        _prune_idle_locks(_USER_DROP_LOCKS, _USER_DROP_TASKS, _USER_DROP_BUFFER)
         lock = asyncio.Lock()
         _USER_DROP_LOCKS[user_id] = lock
     return lock
@@ -53,6 +73,7 @@ def _get_drop_lock(user_id: int) -> asyncio.Lock:
 def _get_builder_lock(user_id: int) -> asyncio.Lock:
     lock = _PACK_BUILDER_LOCKS.get(user_id)
     if lock is None:
+        _prune_idle_locks(_PACK_BUILDER_LOCKS, _PACK_BUILDER_TASKS)
         lock = asyncio.Lock()
         _PACK_BUILDER_LOCKS[user_id] = lock
     return lock
@@ -236,6 +257,7 @@ async def _queue_user_drop(
     anchor_message: Message,
     bot: Bot,
     db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     """
     Sliding-window coalescer for all incoming user drops outside Pack Builder:
@@ -244,12 +266,14 @@ async def _queue_user_drop(
       saves all of them into ONE Pack and sends ONE clean Pack Share Link card!
     """
     async with _get_drop_lock(user_id):
-        _USER_DROP_BUFFER.setdefault(user_id, []).append(entry)
+        buf = _USER_DROP_BUFFER.setdefault(user_id, [])
+        if len(buf) < 500:
+            buf.append(entry)
         prev_task = _USER_DROP_TASKS.get(user_id)
         if prev_task and not prev_task.done():
             prev_task.cancel()
         _USER_DROP_TASKS[user_id] = asyncio.create_task(
-            _flush_user_drop(user_id, anchor_message, bot, db)
+            _flush_user_drop(user_id, anchor_message, bot, db, bot_username)
         )
 
 
@@ -258,6 +282,7 @@ async def _flush_user_drop(
     anchor_message: Message,
     bot: Bot,
     db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     try:
         await asyncio.sleep(DROP_WINDOW_SECONDS)
@@ -267,6 +292,8 @@ async def _flush_user_drop(
     async with _get_drop_lock(user_id):
         items = _USER_DROP_BUFFER.pop(user_id, [])
         _USER_DROP_TASKS.pop(user_id, None)
+    if not _USER_DROP_BUFFER.get(user_id) and user_id not in _USER_DROP_TASKS:
+        _USER_DROP_LOCKS.pop(user_id, None)
 
     if not items:
         return
@@ -274,7 +301,7 @@ async def _flush_user_drop(
     user = await db.get_user(user_id)
     if not user:
         return
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
 
     # Case 1: Exactly ONE file sent -> keep crisp single-file behavior
     if len(items) == 1:
@@ -305,7 +332,7 @@ async def _flush_user_drop(
 
         await tg_retry_call(
             anchor_message.reply,
-            build_file_card_text(f, me.username or "", header_badge=badge),
+            build_file_card_text(f, uname, header_badge=badge),
             reply_markup=build_upload_quick_keyboard(f),
             disable_web_page_preview=True,
         )
@@ -332,7 +359,7 @@ async def _flush_user_drop(
         await tg_retry_call(
             anchor_message.reply,
             build_file_card_text(
-                f, me.username or "", header_badge="♻️ <b>Already Saved</b>"
+                f, uname, header_badge="♻️ <b>Already Saved</b>"
             ),
             reply_markup=build_upload_quick_keyboard(f),
             disable_web_page_preview=True,
@@ -348,7 +375,9 @@ async def _flush_user_drop(
         protect_content=bool(user.get("protect_content")),
     )
 
-    rendered = await render_pack_detail(user_id, pack["id"], db, bot)
+    rendered = await render_pack_detail(
+        user_id, pack["id"], db, bot, bot_username=uname
+    )
     if rendered:
         stat_note = f"✅ <b>Auto-Packed {len(unique_files)} files</b>"
         if dup_cnt:
@@ -363,7 +392,12 @@ async def _flush_user_drop(
 
 @router.message(F.chat.type == "private", MEDIA_FILTER)
 async def handle_media_upload(
-    message: Message, state: FSMContext, bot: Bot, db: Database, config: Config
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user:
         return
@@ -379,6 +413,7 @@ async def handle_media_upload(
 
     cur_state = await state.get_state()
     in_pack_builder = cur_state == PackStates.collecting_items.state
+    uname = bot_username or "KoshBox_Bot"
 
     existing = await db.find_duplicate(user["vault_id"], meta["file_unique_id"])
 
@@ -399,6 +434,7 @@ async def handle_media_upload(
             message,
             bot,
             db,
+            uname,
         )
         return
 
@@ -411,11 +447,10 @@ async def handle_media_upload(
             message_id=message.message_id,
         )
     except Exception as exc:
-        me = await bot.get_me()
         await tg_retry_call(
             message.reply,
             f"⚠️ <b>Dump Channel Error</b>\n"
-            f"<blockquote>Make @{esc(me.username)} Admin with Post Messages permission.</blockquote>\n"
+            f"<blockquote>Make @{esc(uname)} Admin with Post Messages permission.</blockquote>\n"
             f"<code>{esc(str(exc))}</code>",
         )
         return
@@ -461,6 +496,7 @@ async def handle_media_upload(
         message,
         bot,
         db,
+        uname,
     )
 
 
@@ -559,48 +595,52 @@ async def _flush_pack_builder_status(
     except asyncio.CancelledError:
         return
 
-    async with _get_builder_lock(user_id):
-        _PACK_BUILDER_TASKS.pop(user_id, None)
-        cur_state = await state.get_state()
-        if cur_state != PackStates.collecting_items.state:
-            return
-
-        data = await state.get_data()
-        fids: list[int] = list(data.get("pack_file_ids") or [])
-        if not fids:
-            return
-        total_sz = int(data.get("pack_total_size") or 0)
-        recent: list[str] = list(data.get("pack_recent_titles") or [])
-        status_msg_id: Optional[int] = data.get("pack_status_msg_id")
-        append_pack_id: Optional[int] = data.get("append_pack_id")
-
-        text, kb = _build_live_pack_status_card(
-            len(fids), total_sz, recent, append_pack_id=append_pack_id
-        )
-
-        # Edit existing collector/status card in-place so chat stays 100% clean
-        if status_msg_id:
-            try:
-                await tg_retry_call(
-                    bot.edit_message_text,
-                    chat_id=chat_id,
-                    message_id=status_msg_id,
-                    text=text,
-                    reply_markup=kb,
-                    disable_web_page_preview=True,
-                )
+    try:
+        async with _get_builder_lock(user_id):
+            _PACK_BUILDER_TASKS.pop(user_id, None)
+            cur_state = await state.get_state()
+            if cur_state != PackStates.collecting_items.state:
                 return
-            except TelegramBadRequest as exc:
-                if "message is not modified" in str(exc).lower():
-                    return
-            except Exception:
-                pass
 
-        sent = await tg_retry_call(
-            bot.send_message,
-            chat_id=chat_id,
-            text=text,
-            reply_markup=kb,
-        )
-        if sent and getattr(sent, "message_id", None):
-            await state.update_data(pack_status_msg_id=sent.message_id)
+            data = await state.get_data()
+            fids: list[int] = list(data.get("pack_file_ids") or [])
+            if not fids:
+                return
+            total_sz = int(data.get("pack_total_size") or 0)
+            recent: list[str] = list(data.get("pack_recent_titles") or [])
+            status_msg_id: Optional[int] = data.get("pack_status_msg_id")
+            append_pack_id: Optional[int] = data.get("append_pack_id")
+
+            text, kb = _build_live_pack_status_card(
+                len(fids), total_sz, recent, append_pack_id=append_pack_id
+            )
+
+            # Edit existing collector/status card in-place so chat stays 100% clean
+            if status_msg_id:
+                try:
+                    await tg_retry_call(
+                        bot.edit_message_text,
+                        chat_id=chat_id,
+                        message_id=status_msg_id,
+                        text=text,
+                        reply_markup=kb,
+                        disable_web_page_preview=True,
+                    )
+                    return
+                except TelegramBadRequest as exc:
+                    if "message is not modified" in str(exc).lower():
+                        return
+                except Exception:
+                    pass
+
+            sent = await tg_retry_call(
+                bot.send_message,
+                chat_id=chat_id,
+                text=text,
+                reply_markup=kb,
+            )
+            if sent and getattr(sent, "message_id", None):
+                await state.update_data(pack_status_msg_id=sent.message_id)
+    finally:
+        if user_id not in _PACK_BUILDER_TASKS:
+            _PACK_BUILDER_LOCKS.pop(user_id, None)

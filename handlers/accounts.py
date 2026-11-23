@@ -95,7 +95,12 @@ async def render_accounts_panel(
 
 
 async def _build_link_code_panel(
-    user_id: int, username: str, full_name: str, db: Database, bot: Bot, config: Config
+    user_id: int,
+    username: str,
+    full_name: str,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> tuple[str, InlineKeyboardMarkup]:
     user = await db.ensure_user(user_id, username, full_name)
     req = await db.create_link_request(
@@ -103,8 +108,8 @@ async def _build_link_code_panel(
         owner_vault_id=user["vault_id"],
         ttl_seconds=config.link_code_ttl_seconds,
     )
-    me = await bot.get_me()
-    deep_link = f"https://t.me/{me.username}?start=link_{req['code']}"
+    uname = bot_username or "KoshBox_Bot"
+    deep_link = f"https://t.me/{uname}?start=link_{req['code']}"
     mins = max(1, config.link_code_ttl_seconds // 60)
 
     text = (
@@ -129,7 +134,12 @@ async def _build_link_code_panel(
 
 
 @router.message(Command("link"))
-async def cmd_link(message: Message, db: Database, bot: Bot, config: Config) -> None:
+async def cmd_link(
+    message: Message,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not message.from_user:
         return
     text, kb = await _build_link_code_panel(
@@ -137,15 +147,18 @@ async def cmd_link(message: Message, db: Database, bot: Bot, config: Config) -> 
         message.from_user.username or "",
         message.from_user.full_name or "",
         db,
-        bot,
         config,
+        bot_username,
     )
     await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "nav:link")
 async def cb_nav_link(
-    callback: CallbackQuery, db: Database, bot: Bot, config: Config
+    callback: CallbackQuery,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -154,11 +167,10 @@ async def cb_nav_link(
         callback.from_user.username or "",
         callback.from_user.full_name or "",
         db,
-        bot,
         config,
+        bot_username,
     )
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data == "acc:manage")
@@ -166,8 +178,7 @@ async def cb_acc_manage(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
     text, kb = await render_accounts_panel(callback.from_user.id, db, manage_unlink=True)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data == "acc:enter_code")
@@ -177,8 +188,8 @@ async def cb_enter_code_prompt(callback: CallbackQuery, state: FSMContext) -> No
         callback,
         f"🔑 <b>Enter Sync Code</b>\n<blockquote>Send the 6-character code from your primary account:</blockquote>",
         cancel_kb("nav:accounts"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(AccountStates.waiting_for_verify_code)
@@ -297,14 +308,18 @@ async def cmd_verify(
 
 
 @router.callback_query(F.data.startswith("acc:approve:"))
-async def cb_approve_link(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_approve_link(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user or not callback.message:
         return
     code = callback.data.split(":")[2]
     req = await db.approve_link_request(code, callback.from_user.id)
     if not req:
-        await safe_edit_or_send(callback, "⚠️ Expired or already handled.")
-        await callback.answer()
+        await safe_edit_or_send(callback, "⚠️ Expired or already handled.", also_ack=True)
         return
 
     await safe_edit_or_send(
@@ -318,14 +333,16 @@ async def cb_approve_link(callback: CallbackQuery, db: Database, bot: Bot) -> No
                 ]
             ]
         ),
+        answer_text="Synced!",
+        also_ack=True,
     )
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     try:
         await bot.send_message(
             chat_id=req["requester_user_id"],
             text=(
                 f"🎉 <b>Vault Synced</b>\n"
-                f"<blockquote>Inline anywhere: <code>@{esc(me.username)} </code></blockquote>"
+                f"<blockquote>Inline anywhere: <code>@{esc(uname)} </code></blockquote>"
             ),
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -342,7 +359,6 @@ async def cb_approve_link(callback: CallbackQuery, db: Database, bot: Bot) -> No
         )
     except Exception:
         pass
-    await callback.answer("Synced!")
 
 
 @router.callback_query(F.data.startswith("acc:reject:"))
@@ -352,14 +368,15 @@ async def cb_reject_link(callback: CallbackQuery, db: Database, bot: Bot) -> Non
     code = callback.data.split(":")[2]
     req = await db.reject_link_request(code, callback.from_user.id)
     if not req:
-        await safe_edit_or_send(callback, "⚠️ Already handled.")
-        await callback.answer()
+        await safe_edit_or_send(callback, "⚠️ Already handled.", also_ack=True)
         return
 
     await safe_edit_or_send(
         callback,
         "✕ <b>Declined</b>",
         InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
+        answer_text="Declined",
+        also_ack=True,
     )
     if req.get("requester_user_id"):
         try:
@@ -369,7 +386,6 @@ async def cb_reject_link(callback: CallbackQuery, db: Database, bot: Bot) -> Non
             )
         except Exception:
             pass
-    await callback.answer("Declined")
 
 
 @router.message(Command("accounts"))
@@ -399,8 +415,7 @@ async def cb_nav_accounts(
         callback.from_user.full_name or "",
     )
     text, kb = await render_accounts_panel(callback.from_user.id, db)
-    await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
-    await callback.answer()
+    await edit_or_send_banner(callback, "guide", text, kb, bot, db, config, also_ack=True)
 
 
 @router.callback_query(F.data.startswith("acc:unlink_ask:"))
@@ -426,8 +441,8 @@ async def cb_unlink_ask(callback: CallbackQuery, db: Database) -> None:
         callback,
         f"⚠️ <b>Unlink {t_name}?</b>\n<blockquote>Moves <code>{target_id}</code> to a separate vault.</blockquote>",
         kb,
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("acc:unlink:"))
@@ -441,5 +456,4 @@ async def cb_unlink(callback: CallbackQuery, db: Database) -> None:
         await callback.answer("Cannot unlink last account.", show_alert=True)
         return
     text, kb = await render_accounts_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer("Unlinked")
+    await safe_edit_or_send(callback, text, kb, answer_text="Unlinked", also_ack=True)

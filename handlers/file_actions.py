@@ -375,8 +375,7 @@ async def cmd_files(message: Message, db: Database) -> None:
 async def cb_open_filter_drawer(callback: CallbackQuery) -> None:
     _, flt, sort_key, gid_s, page_s = callback.data.split(":")
     text, kb = render_filter_sort_drawer(flt, sort_key, int(gid_s), int(page_s))
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data.startswith("bfs:"))
@@ -392,8 +391,13 @@ async def cb_select_filter_and_apply(callback: CallbackQuery, db: Database) -> N
     text, kb = await render_browse_page(
         callback.from_user.id, flt, sort_key, int(gid_s), 0, db
     )
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer(f"Filter: {FILTER_LABELS.get(flt, 'All')}")
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text=f"Filter: {FILTER_LABELS.get(flt, 'All')}",
+        also_ack=True,
+    )
 
 
 @router.message(Command("search"))
@@ -433,8 +437,8 @@ async def cb_search_prompt(callback: CallbackQuery, state: FSMContext) -> None:
         f"🔎 <b>Search Vault</b>\n"
         f"<blockquote>Send keyword, artist, filename, or <code>#tag</code>:</blockquote>",
         cancel_kb("br:all:def:0:0"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("f:sp:"))
@@ -447,8 +451,8 @@ async def cb_search_prompt_ctx(callback: CallbackQuery, state: FSMContext) -> No
         f"🔎 <b>Search Vault</b>\n"
         f"<blockquote>Send keyword, artist, filename, or <code>#tag</code>:</blockquote>",
         cancel_kb(back_target),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(SearchStates.waiting_for_query)
@@ -505,8 +509,8 @@ async def cb_trash_empty_confirm(callback: CallbackQuery, db: Database) -> None:
         callback,
         f"⚠️ <b>Empty Trash ({cnt})?</b>\n<blockquote>Permanently deletes all trashed files.</blockquote>",
         kb,
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "trash:empty_do")
@@ -516,8 +520,13 @@ async def cb_trash_empty_do(callback: CallbackQuery, db: Database) -> None:
     user = await db.get_user(callback.from_user.id)
     removed = await db.empty_trash(user["vault_id"])
     text, kb = await render_trash_page(callback.from_user.id, 0, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer(f"Purged {removed} file(s).")
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text=f"Purged {removed} file(s).",
+        also_ack=True,
+    )
 
 
 @router.callback_query(F.data.startswith("trash:"))
@@ -533,8 +542,7 @@ async def cb_trash_list(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.full_name or "",
     )
     text, kb = await render_trash_page(callback.from_user.id, int(part), db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data.startswith("browse:"))
@@ -548,8 +556,7 @@ async def cb_legacy_browse(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.full_name or "",
     )
     text, kb = await render_browse_page(callback.from_user.id, "all", "def", 0, page, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data.startswith("br:"))
@@ -565,13 +572,14 @@ async def cb_browse_modern(callback: CallbackQuery, db: Database) -> None:
     text, kb = await render_browse_page(
         callback.from_user.id, flt, sort_key, int(gid_s), int(page_s), db
     )
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data.startswith("fo:"))
 async def cb_open_file_with_context(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -582,18 +590,22 @@ async def cb_open_file_with_context(
     if not f or not await db.can_vault_access_file(user["vault_id"], f):
         await callback.answer("File not found.", show_alert=True)
         return
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     back_cb = f"br:{flt}:{sort_key}:{gid_s}:{page_s}"
     await safe_edit_or_send(
         callback,
-        build_file_card_text(f, me.username or ""),
-        build_file_keyboard(f, back_cb=back_cb, bot_username=me.username or ""),
+        build_file_card_text(f, uname),
+        build_file_keyboard(f, back_cb=back_cb, bot_username=uname),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("f:open:"))
-async def cb_open_file(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_open_file(
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     fid = int(callback.data.split(":")[2])
@@ -602,18 +614,20 @@ async def cb_open_file(callback: CallbackQuery, db: Database, bot: Bot) -> None:
     if not f or not await db.can_vault_access_file(user["vault_id"], f):
         await callback.answer("File not found.", show_alert=True)
         return
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        build_file_card_text(f, me.username or ""),
-        build_file_keyboard(f, bot_username=me.username or ""),
+        build_file_card_text(f, uname),
+        build_file_keyboard(f, bot_username=uname),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("fm:") | F.data.startswith("f:manage:"))
 async def cb_open_file_manage(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -630,18 +644,20 @@ async def cb_open_file_manage(
     if not f or not await db.can_vault_access_file(user["vault_id"], f):
         await callback.answer("File not found.", show_alert=True)
         return
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        build_file_card_text(f, me.username or "", edit_mode=True),
-        build_file_manage_keyboard(f, back_cb=back_cb, bot_username=me.username or ""),
+        build_file_card_text(f, uname, edit_mode=True),
+        build_file_manage_keyboard(f, back_cb=back_cb, bot_username=uname),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("fsl:") | F.data.startswith("f:link:"))
 async def cb_open_file_link_panel(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     """Opens the dedicated Share Link & Security panel (PIN, No-Fwd, Expiry)."""
     if not callback.from_user:
@@ -659,13 +675,13 @@ async def cb_open_file_link_panel(
     if not f or not await db.can_vault_access_file(user["vault_id"], f):
         await callback.answer("File not found.", show_alert=True)
         return
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(f, me.username or ""),
-        build_file_link_keyboard(f, back_cb=back_cb, bot_username=me.username or ""),
+        _render_file_link_card(f, uname),
+        build_file_link_keyboard(f, back_cb=back_cb, bot_username=uname),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("f:get:"))
@@ -692,7 +708,11 @@ async def cb_get_file_here(callback: CallbackQuery, db: Database, bot: Bot) -> N
 
 
 @router.callback_query(F.data.startswith("ffav:") | F.data.startswith("f:fav:"))
-async def cb_toggle_fav(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_toggle_fav(
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     if callback.data.startswith("ffav:"):
@@ -710,17 +730,22 @@ async def cb_toggle_fav(callback: CallbackQuery, db: Database, bot: Bot) -> None
         return
     is_fav = await db.toggle_favorite(fid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        build_file_card_text(updated, me.username or ""),
-        build_file_keyboard(updated, back_cb=back_cb, bot_username=me.username or ""),
+        build_file_card_text(updated, uname),
+        build_file_keyboard(updated, back_cb=back_cb, bot_username=uname),
+        answer_text="⭐ Starred" if is_fav else "Unstarred",
+        also_ack=True,
     )
-    await callback.answer("⭐ Starred" if is_fav else "Unstarred")
 
 
 @router.callback_query(F.data.startswith("fsh:") | F.data.startswith("f:share:"))
-async def cb_toggle_share(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_toggle_share(
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     if callback.data.startswith("fsh:"):
@@ -738,18 +763,21 @@ async def cb_toggle_share(callback: CallbackQuery, db: Database, bot: Bot) -> No
         return
     token = await db.toggle_share_token(fid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, me.username or ""),
-        build_file_link_keyboard(updated, back_cb=back_cb, bot_username=me.username or ""),
+        _render_file_link_card(updated, uname),
+        build_file_link_keyboard(updated, back_cb=back_cb, bot_username=uname),
+        answer_text="🔗 Link ready!" if token else "Link revoked",
+        also_ack=True,
     )
-    await callback.answer("🔗 Link ready!" if token else "Link revoked")
 
 
 @router.callback_query(F.data.startswith("f:prot:"))
 async def cb_file_toggle_protect(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -761,18 +789,21 @@ async def cb_file_toggle_protect(
         return
     on = await db.toggle_file_protect_share(fid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, me.username or ""),
-        build_file_link_keyboard(updated, bot_username=me.username or ""),
+        _render_file_link_card(updated, uname),
+        build_file_link_keyboard(updated, bot_username=uname),
+        answer_text="🛡️ No-Forward ON" if on else "No-Forward OFF",
+        also_ack=True,
     )
-    await callback.answer("🛡️ No-Forward ON" if on else "No-Forward OFF")
 
 
 @router.callback_query(F.data.startswith("f:exp:"))
 async def cb_file_cycle_expiry(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -784,18 +815,21 @@ async def cb_file_cycle_expiry(
         return
     new_exp = await db.cycle_file_share_expiry(fid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, me.username or ""),
-        build_file_link_keyboard(updated, bot_username=me.username or ""),
+        _render_file_link_card(updated, uname),
+        build_file_link_keyboard(updated, bot_username=uname),
+        answer_text=f"⏳ Expiry: {format_expiry_badge(new_exp)}",
+        also_ack=True,
     )
-    await callback.answer(f"⏳ Expiry: {format_expiry_badge(new_exp)}")
 
 
 @router.callback_query(F.data.startswith("f:maxv:"))
 async def cb_file_cycle_max_views(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -807,19 +841,22 @@ async def cb_file_cycle_max_views(
         return
     lim = await db.cycle_file_share_max_views(fid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
+    lbl = f"{lim} opens max" if lim > 0 else "Unlimited opens"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, me.username or ""),
-        build_file_link_keyboard(updated, bot_username=me.username or ""),
+        _render_file_link_card(updated, uname),
+        build_file_link_keyboard(updated, bot_username=uname),
+        answer_text=f"👁 Access Limit: {lbl}",
+        also_ack=True,
     )
-    lbl = f"{lim} opens max" if lim > 0 else "Unlimited opens"
-    await callback.answer(f"👁 Access Limit: {lbl}")
 
 
 @router.callback_query(F.data.startswith("f:pause:"))
 async def cb_file_toggle_pause(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -831,18 +868,21 @@ async def cb_file_toggle_pause(
         return
     paused = await db.toggle_file_share_paused(fid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, me.username or ""),
-        build_file_link_keyboard(updated, bot_username=me.username or ""),
+        _render_file_link_card(updated, uname),
+        build_file_link_keyboard(updated, bot_username=uname),
+        answer_text="⏸ Link Paused" if paused else "▶️ Link Active",
+        also_ack=True,
     )
-    await callback.answer("⏸ Link Paused" if paused else "▶️ Link Active")
 
 
 @router.callback_query(F.data.startswith("f:regen:"))
 async def cb_file_regen_token(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -854,13 +894,14 @@ async def cb_file_regen_token(
         return
     await db.regenerate_file_share_token(fid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, me.username or ""),
-        build_file_link_keyboard(updated, bot_username=me.username or ""),
+        _render_file_link_card(updated, uname),
+        build_file_link_keyboard(updated, bot_username=uname),
+        answer_text="🔄 New file link generated (views reset)",
+        also_ack=True,
     )
-    await callback.answer("🔄 New file link generated (views reset)")
 
 
 @router.callback_query(F.data.startswith("f:pin:"))
@@ -883,13 +924,16 @@ async def cb_file_pin_prompt(
         f"🔑 <b>Link PIN Lock</b> · <i>{status}</i>\n"
         f"<blockquote>Send a PIN/password (up to 24 chars), or <code>-</code> to clear:</blockquote>",
         cancel_kb(f"f:link:{fid}"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(FileEditStates.waiting_for_share_pin)
 async def fsm_save_file_pin(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.text:
         return
@@ -906,10 +950,10 @@ async def fsm_save_file_pin(
     except Exception:
         pass
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await message.answer(
-        _render_file_link_card(updated, me.username or ""),
-        reply_markup=build_file_link_keyboard(updated, bot_username=me.username or ""),
+        _render_file_link_card(updated, uname),
+        reply_markup=build_file_link_keyboard(updated, bot_username=uname),
         disable_web_page_preview=True,
     )
 
@@ -946,12 +990,17 @@ async def cb_trash_file(callback: CallbackQuery, db: Database) -> None:
         callback,
         f"🗑️ <b>Moved to Trash</b>\n<blockquote><b>{esc(f['title'])}</b> — tap Undo to restore.</blockquote>",
         kb,
+        answer_text="Trashed",
+        also_ack=True,
     )
-    await callback.answer("Trashed")
 
 
 @router.callback_query(F.data.startswith("f:restore:"))
-async def cb_restore_file(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_restore_file(
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     fid = int(callback.data.split(":")[2])
@@ -962,15 +1011,16 @@ async def cb_restore_file(callback: CallbackQuery, db: Database, bot: Bot) -> No
         return
     await db.restore_file(fid)
     restored = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
         build_file_card_text(
-            restored, me.username or "", header_badge="♻️ <b>Restored</b>"
+            restored, uname, header_badge="♻️ <b>Restored</b>"
         ),
-        build_file_keyboard(restored, bot_username=me.username or ""),
+        build_file_keyboard(restored, bot_username=uname),
+        answer_text="Restored!",
+        also_ack=True,
     )
-    await callback.answer("Restored!")
 
 
 @router.callback_query(F.data.startswith("f:purge:"))
@@ -998,8 +1048,8 @@ async def cb_purge_file(callback: CallbackQuery, db: Database) -> None:
                 ]
             ]
         ),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("f:purge_do:"))
@@ -1017,8 +1067,9 @@ async def cb_purge_file_do(callback: CallbackQuery, db: Database) -> None:
         callback,
         f"💥 <b>Deleted</b> · <i>{esc(f['title'])}</i>",
         InlineKeyboardMarkup(inline_keyboard=[[back_btn("trash:0", "◀ Trash"), home_btn()]]),
+        answer_text="Deleted",
+        also_ack=True,
     )
-    await callback.answer("Deleted")
 
 
 @router.callback_query(F.data.startswith("f:rename:"))
@@ -1037,13 +1088,16 @@ async def cb_rename_prompt(callback: CallbackQuery, state: FSMContext, db: Datab
         callback,
         f"✏️ <b>Rename File</b>\n<blockquote><code>{esc(f['title'])}</code></blockquote>\n<i>Send new title:</i>",
         cancel_kb(f"f:manage:{fid}"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(FileEditStates.waiting_for_title)
 async def fsm_save_title(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.text:
         return
@@ -1057,12 +1111,12 @@ async def fsm_save_title(
         return
     await db.update_file_title(fid, new_title)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await message.answer(
         build_file_card_text(
-            updated, me.username or "", header_badge="✅ <b>Renamed</b>"
+            updated, uname, header_badge="✅ <b>Renamed</b>"
         ),
-        reply_markup=build_file_keyboard(updated, bot_username=me.username or ""),
+        reply_markup=build_file_keyboard(updated, bot_username=uname),
         disable_web_page_preview=True,
     )
 
@@ -1084,13 +1138,16 @@ async def cb_tags_prompt(callback: CallbackQuery, state: FSMContext, db: Databas
         callback,
         f"🏷️ <b>Edit Tags</b> · {cur_tags}\n<blockquote>Send hashtags (e.g. <code>#lofi #work</code>) or <code>-</code> to clear:</blockquote>",
         cancel_kb(f"f:manage:{fid}"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(FileEditStates.waiting_for_tags)
 async def fsm_save_tags(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.text:
         return
@@ -1108,12 +1165,12 @@ async def fsm_save_tags(
         )[:150]
     await db.update_file_tags(fid, tags)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await message.answer(
         build_file_card_text(
-            updated, me.username or "", header_badge="✅ <b>Tags Saved</b>"
+            updated, uname, header_badge="✅ <b>Tags Saved</b>"
         ),
-        reply_markup=build_file_keyboard(updated, bot_username=me.username or ""),
+        reply_markup=build_file_keyboard(updated, bot_username=uname),
         disable_web_page_preview=True,
     )
 
@@ -1135,13 +1192,16 @@ async def cb_caption_prompt(callback: CallbackQuery, state: FSMContext, db: Data
         callback,
         f"💬 <b>Caption</b> · {cur_cap}\n<blockquote>Send caption text or <code>-</code> to clear:</blockquote>",
         cancel_kb(f"f:manage:{fid}"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(FileEditStates.waiting_for_caption)
 async def fsm_save_caption(
-    message: Message, state: FSMContext, db: Database, bot: Bot
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.text:
         return
@@ -1154,12 +1214,12 @@ async def fsm_save_caption(
     caption = "" if raw == "-" else raw[:900]
     await db.update_file_caption(fid, caption)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await message.answer(
         build_file_card_text(
-            updated, me.username or "", header_badge="✅ <b>Caption Saved</b>"
+            updated, uname, header_badge="✅ <b>Caption Saved</b>"
         ),
-        reply_markup=build_file_keyboard(updated, bot_username=me.username or ""),
+        reply_markup=build_file_keyboard(updated, bot_username=uname),
         disable_web_page_preview=True,
     )
 
@@ -1213,12 +1273,16 @@ async def cb_move_menu(callback: CallbackQuery, db: Database) -> None:
         callback,
         f"📁 <b>Move File</b>\n<blockquote><b>{esc(f['title'][:36])}</b></blockquote>",
         InlineKeyboardMarkup(inline_keyboard=buttons),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("f:setgrp:"))
-async def cb_set_file_group(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_set_file_group(
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
     if not callback.from_user:
         return
     _, _, fid_s, gid_s = callback.data.split(":")
@@ -1230,10 +1294,11 @@ async def cb_set_file_group(callback: CallbackQuery, db: Database, bot: Bot) -> 
         return
     await db.move_file_to_group(fid, gid)
     updated = await db.get_file(fid)
-    me = await bot.get_me()
+    uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        build_file_card_text(updated, me.username or ""),
-        build_file_keyboard(updated, bot_username=me.username or ""),
+        build_file_card_text(updated, uname),
+        build_file_keyboard(updated, bot_username=uname),
+        answer_text="📁 Moved!",
+        also_ack=True,
     )
-    await callback.answer("📁 Moved!")

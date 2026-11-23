@@ -96,8 +96,7 @@ async def cb_admin_refresh(
         await callback.answer("Admin only.", show_alert=True)
         return
     text, kb = await _render_admin_panel(db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer("Updated")
+    await safe_edit_or_send(callback, text, kb, answer_text="Updated", also_ack=True)
 
 
 @router.callback_query(F.data == "adm:ban_prompt")
@@ -112,8 +111,8 @@ async def cb_admin_ban_prompt(
         callback,
         "🚫 <b>Ban / Unban User</b>\n<blockquote>Send numeric <code>User ID</code> to toggle ban status:</blockquote>",
         cancel_kb("adm:refresh"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(AdminStates.waiting_for_ban_uid)
@@ -158,8 +157,13 @@ async def cb_admin_sync_banners(
     status = await warmup_banners_in_dump_channel(bot, db, config, force_reupload=False)
     ok_cnt = sum(1 for v in status.values() if v)
     text, kb = await _render_admin_panel(db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer(f"🖼️ {ok_cnt}/{len(status)} banners cached!")
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text=f"🖼️ {ok_cnt}/{len(status)} banners cached!",
+        also_ack=True,
+    )
 
 
 async def _send_db_backup(chat_id: int, bot: Bot, db: Database) -> bool:
@@ -229,8 +233,8 @@ async def cb_admin_broadcast(
         callback,
         "📣 <b>Broadcast</b>\n<blockquote>Send text or media to copy to all users:</blockquote>",
         cancel_kb("adm:refresh"),
+        also_ack=True,
     )
-    await callback.answer()
 
 
 @router.message(AdminStates.waiting_for_broadcast)

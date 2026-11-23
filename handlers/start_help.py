@@ -10,11 +10,14 @@ from aiogram.types import (
     Message,
 )
 
+from typing import Optional
+
 from config import Config
 from database import Database, verify_pin
 from handlers.accounts import handle_verify_code, render_accounts_panel
 from handlers.packs import deliver_pack_to_chat, render_packs_list
 from utils.banners import edit_or_send_banner, send_banner_message
+from utils.cache import TTLCache
 from utils.formatters import (
     MEDIA_ICONS,
     MEDIA_LABELS,
@@ -36,26 +39,29 @@ from utils.formatters import (
     send_stored_media,
     toggle_label,
 )
-from utils.middleware import check_force_sub
+from utils.middleware import check_force_sub, invalidate_force_sub_cache
 from utils.states import ShareUnlockStates
 
 router = Router(name="start_help")
 
-# Anti-brute-force PIN limiter: (user_id, token) -> {"fails": int, "locked_until": float}
+# Bounded anti-brute-force PIN limiter: (user_id, token) -> {"fails": int, "locked_until": float}
 PIN_MAX_ATTEMPTS = 5
 PIN_LOCKOUT_SECONDS = 300
-_PIN_FAIL_TRACKER: dict[tuple[int, str], dict[str, float]] = {}
+_PIN_FAIL_TRACKER: TTLCache[tuple[int, str], dict[str, float]] = TTLCache(
+    maxsize=4096, ttl=float(PIN_LOCKOUT_SECONDS * 2)
+)
 
 
 def _check_pin_lockout(user_id: int, token: str) -> int:
     """Returns remaining lockout seconds (>0 if locked out, 0 if allowed)."""
-    entry = _PIN_FAIL_TRACKER.get((user_id, token))
+    key = (user_id, token)
+    entry = _PIN_FAIL_TRACKER.get(key)
     if not entry:
         return 0
     rem = int(entry.get("locked_until", 0) - time.time())
     if rem <= 0:
         if entry.get("locked_until", 0) > 0:
-            _PIN_FAIL_TRACKER.pop((user_id, token), None)
+            _PIN_FAIL_TRACKER.invalidate(key)
         return 0
     return rem
 
@@ -63,17 +69,19 @@ def _check_pin_lockout(user_id: int, token: str) -> int:
 def _record_pin_failure(user_id: int, token: str) -> tuple[int, int]:
     """Records a failed PIN attempt; returns (attempts_left, lockout_seconds_if_triggered)."""
     key = (user_id, token)
-    entry = _PIN_FAIL_TRACKER.setdefault(key, {"fails": 0, "locked_until": 0.0})
+    entry = dict(_PIN_FAIL_TRACKER.get(key) or {"fails": 0, "locked_until": 0.0})
     entry["fails"] = int(entry.get("fails", 0)) + 1
     if entry["fails"] >= PIN_MAX_ATTEMPTS:
         entry["locked_until"] = time.time() + PIN_LOCKOUT_SECONDS
         entry["fails"] = 0
+        _PIN_FAIL_TRACKER.set(key, entry, ttl=float(PIN_LOCKOUT_SECONDS + 30))
         return 0, PIN_LOCKOUT_SECONDS
+    _PIN_FAIL_TRACKER.set(key, entry, ttl=float(PIN_LOCKOUT_SECONDS * 2))
     return PIN_MAX_ATTEMPTS - int(entry["fails"]), 0
 
 
 def _clear_pin_failures(user_id: int, token: str) -> None:
-    _PIN_FAIL_TRACKER.pop((user_id, token), None)
+    _PIN_FAIL_TRACKER.invalidate((user_id, token))
 
 
 def _diagnose_file_unavailable(raw_file: dict | None) -> tuple[str, str]:
@@ -139,7 +147,11 @@ def _diagnose_pack_unavailable(raw_pack: dict | None) -> tuple[str, str]:
 
 
 async def render_home_dashboard(
-    user_id: int, first_name: str, db: Database, bot: Bot
+    user_id: int,
+    first_name: str,
+    db: Database,
+    bot: Optional[Bot] = None,
+    bot_username: str = "KoshBox_Bot",
 ) -> tuple[str, InlineKeyboardMarkup]:
     """
     Ultra-crisp Hero Dashboard (Linear / Raycast / PostBot Pro UX):
@@ -148,8 +160,7 @@ async def render_home_dashboard(
     """
     user = await db.get_user(user_id)
     stats = await db.get_vault_stats(user["vault_id"])
-    me = await bot.get_me()
-    uname = esc(me.username or "KoshBox_Bot")
+    uname = esc(bot_username or "KoshBox_Bot")
 
     active_folder = "Personal"
     if user.get("active_group_id"):
@@ -378,12 +389,19 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
 
 @router.callback_query(F.data == "fsub:check")
 async def cb_force_sub_verify(
-    callback: CallbackQuery, db: Database, bot: Bot, config: Config
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
     if config.force_sub_channel:
-        ok = await check_force_sub(bot, config.force_sub_channel, callback.from_user.id)
+        invalidate_force_sub_cache(config.force_sub_channel, callback.from_user.id)
+        ok = await check_force_sub(
+            bot, config.force_sub_channel, callback.from_user.id, bypass_cache=True
+        )
         if not ok:
             await callback.answer("Still not joined — join first!", show_alert=True)
             return
@@ -393,10 +411,23 @@ async def cb_force_sub_verify(
         callback.from_user.full_name or "",
     )
     text, kb = await render_home_dashboard(
-        callback.from_user.id, callback.from_user.first_name or "", db, bot
+        callback.from_user.id,
+        callback.from_user.first_name or "",
+        db,
+        bot,
+        bot_username=bot_username,
     )
-    await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
-    await callback.answer("✓ Verified!")
+    await edit_or_send_banner(
+        callback,
+        "welcome",
+        text,
+        kb,
+        bot,
+        db,
+        config,
+        answer_text="✓ Verified!",
+        also_ack=True,
+    )
 
 
 @router.message(CommandStart())
@@ -407,6 +438,7 @@ async def cmd_start(
     db: Database,
     bot: Bot,
     config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user:
         return
@@ -514,10 +546,10 @@ async def cmd_start(
                 "⚠️ <b>Invalid Invite</b>\n<blockquote>Link expired or reset.</blockquote>"
             )
             return
-        me = await bot.get_me()
+        uname = bot_username or "KoshBox_Bot"
         await message.answer(
             f"🎉 <b>Joined {esc(group['name'])}</b> · <i>{group.get('file_count', 0)} files</i>\n"
-            f"<blockquote>Inline: <code>@{esc(me.username)} g:{esc(group['name'])}</code></blockquote>",
+            f"<blockquote>Inline: <code>@{esc(uname)} g:{esc(group['name'])}</code></blockquote>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -568,7 +600,11 @@ async def cmd_start(
         return
 
     text, kb = await render_home_dashboard(
-        message.from_user.id, message.from_user.first_name or "", db, bot
+        message.from_user.id,
+        message.from_user.first_name or "",
+        db,
+        bot,
+        bot_username=bot_username,
     )
     await send_banner_message(message, "welcome", text, kb, bot, db, config)
 
@@ -700,7 +736,12 @@ async def fsm_unlock_shared_pack(
 
 @router.callback_query(F.data == "nav:home")
 async def cb_nav_home(
-    callback: CallbackQuery, state: FSMContext, db: Database, bot: Bot, config: Config
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -711,15 +752,24 @@ async def cb_nav_home(
         callback.from_user.full_name or "",
     )
     text, kb = await render_home_dashboard(
-        callback.from_user.id, callback.from_user.first_name or "", db, bot
+        callback.from_user.id,
+        callback.from_user.first_name or "",
+        db,
+        bot,
+        bot_username=bot_username,
     )
-    await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
-    await callback.answer()
+    await edit_or_send_banner(
+        callback, "welcome", text, kb, bot, db, config, also_ack=True
+    )
 
 
 @router.callback_query(F.data == "home:bulk")
 async def cb_home_bulk(
-    callback: CallbackQuery, db: Database, bot: Bot, config: Config
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
@@ -730,38 +780,64 @@ async def cb_home_bulk(
     )
     enabled = await db.toggle_bulk_mode(callback.from_user.id)
     text, kb = await render_home_dashboard(
-        callback.from_user.id, callback.from_user.first_name or "", db, bot
+        callback.from_user.id,
+        callback.from_user.first_name or "",
+        db,
+        bot,
+        bot_username=bot_username,
     )
-    await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
-    await callback.answer("⚡ Bulk ON" if enabled else "Bulk OFF")
+    await edit_or_send_banner(
+        callback,
+        "welcome",
+        text,
+        kb,
+        bot,
+        db,
+        config,
+        answer_text="⚡ Bulk ON" if enabled else "Bulk OFF",
+        also_ack=True,
+    )
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message, bot: Bot, db: Database, config: Config) -> None:
-    me = await bot.get_me()
-    text, kb = _render_help_panel(me.username or "", "inline")
+async def cmd_help(
+    message: Message,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    text, kb = _render_help_panel(bot_username, "inline")
     await send_banner_message(message, "guide", text, kb, bot, db, config)
 
 
 @router.callback_query(F.data == "nav:help")
 async def cb_nav_help(
-    callback: CallbackQuery, bot: Bot, db: Database, config: Config
+    callback: CallbackQuery,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
-    me = await bot.get_me()
-    text, kb = _render_help_panel(me.username or "", "inline")
-    await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
-    await callback.answer()
+    text, kb = _render_help_panel(bot_username, "inline")
+    await edit_or_send_banner(
+        callback, "guide", text, kb, bot, db, config, also_ack=True
+    )
 
 
 @router.callback_query(F.data.startswith("help:"))
 async def cb_switch_help_tab(
-    callback: CallbackQuery, bot: Bot, db: Database, config: Config
+    callback: CallbackQuery,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     tab = callback.data.split(":", 1)[1]
-    me = await bot.get_me()
-    text, kb = _render_help_panel(me.username or "", tab)
-    await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
-    await callback.answer()
+    text, kb = _render_help_panel(bot_username, tab)
+    await edit_or_send_banner(
+        callback, "guide", text, kb, bot, db, config, also_ack=True
+    )
 
 
 @router.message(Command("cancel"))
@@ -787,43 +863,81 @@ async def cb_fsm_cancel(
     db: Database,
     bot: Bot,
     config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
     await state.clear()
     target = callback.data.split(":", 2)[2]
+    uname = bot_username or "KoshBox_Bot"
 
     if target == "nav:groups":
         from handlers.groups import render_groups_panel
 
         text, kb = await render_groups_panel(callback.from_user.id, db)
-        await safe_edit_or_send(callback, text, kb)
-    elif target == "nav:accounts":
+        await safe_edit_or_send(
+            callback, text, kb, answer_text="Cancelled", also_ack=True
+        )
+        return
+    if target == "nav:accounts":
         text, kb = await render_accounts_panel(callback.from_user.id, db)
-        await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
-    elif target == "adm:refresh":
+        await edit_or_send_banner(
+            callback,
+            "guide",
+            text,
+            kb,
+            bot,
+            db,
+            config,
+            answer_text="Cancelled",
+            also_ack=True,
+        )
+        return
+    if target == "adm:refresh":
         from handlers.admin import _render_admin_panel
 
         text, kb = await _render_admin_panel(db)
-        await safe_edit_or_send(callback, text, kb)
-    elif target.startswith("pk:list:"):
+        await safe_edit_or_send(
+            callback, text, kb, answer_text="Cancelled", also_ack=True
+        )
+        return
+    if target.startswith("pk:list:"):
         pg = int(target.split(":")[2])
         text, kb = await render_packs_list(callback.from_user.id, db, pg)
-        await safe_edit_or_send(callback, text, kb)
-    elif target.startswith("pk:open:"):
+        await safe_edit_or_send(
+            callback, text, kb, answer_text="Cancelled", also_ack=True
+        )
+        return
+    if target.startswith("pk:open:"):
         pid = int(target.split(":")[2])
         from handlers.packs import render_pack_detail
 
-        rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
+        rendered = await render_pack_detail(
+            callback.from_user.id, pid, db, bot, bot_username=uname
+        )
         if rendered:
-            await safe_edit_or_send(callback, rendered[0], rendered[1])
+            await safe_edit_or_send(
+                callback,
+                rendered[0],
+                rendered[1],
+                answer_text="Cancelled",
+                also_ack=True,
+            )
+            return
     elif target.startswith("pk:edit:"):
         pid = int(target.split(":")[2])
         from handlers.packs import render_pack_edit_drawer
 
         rendered = await render_pack_edit_drawer(callback.from_user.id, pid, db, page=0)
         if rendered:
-            await safe_edit_or_send(callback, rendered[0], rendered[1])
+            await safe_edit_or_send(
+                callback,
+                rendered[0],
+                rendered[1],
+                answer_text="Cancelled",
+                also_ack=True,
+            )
+            return
     elif target.startswith("br:"):
         from handlers.file_actions import render_browse_page
 
@@ -831,57 +945,83 @@ async def cb_fsm_cancel(
         text, kb = await render_browse_page(
             callback.from_user.id, flt, sort_key, int(gid_s), int(page_s), db
         )
-        await safe_edit_or_send(callback, text, kb)
+        await safe_edit_or_send(
+            callback, text, kb, answer_text="Cancelled", also_ack=True
+        )
+        return
     elif target.startswith("f:link:"):
         fid = int(target.split(":")[2])
         f = await db.get_file(fid)
         if f:
-            me = await bot.get_me()
             from handlers.file_actions import _render_file_link_card
 
             await safe_edit_or_send(
                 callback,
-                _render_file_link_card(f, me.username or ""),
-                build_file_link_keyboard(f, bot_username=me.username or ""),
+                _render_file_link_card(f, uname),
+                build_file_link_keyboard(f, bot_username=uname),
+                answer_text="Cancelled",
+                also_ack=True,
             )
+            return
     elif target.startswith("f:manage:"):
         fid = int(target.split(":")[2])
         f = await db.get_file(fid)
         if f:
-            me = await bot.get_me()
             await safe_edit_or_send(
                 callback,
-                build_file_card_text(f, me.username or "", edit_mode=True),
-                build_file_manage_keyboard(f, bot_username=me.username or ""),
+                build_file_card_text(f, uname, edit_mode=True),
+                build_file_manage_keyboard(f, bot_username=uname),
+                answer_text="Cancelled",
+                also_ack=True,
             )
+            return
     elif target.startswith("f:open:"):
         fid = int(target.split(":")[2])
         f = await db.get_file(fid)
         if f:
-            me = await bot.get_me()
             await safe_edit_or_send(
                 callback,
-                build_file_card_text(f, me.username or ""),
-                build_file_keyboard(f, bot_username=me.username or ""),
+                build_file_card_text(f, uname),
+                build_file_keyboard(f, bot_username=uname),
+                answer_text="Cancelled",
+                also_ack=True,
             )
-        else:
-            text, kb = await render_home_dashboard(
-                callback.from_user.id, callback.from_user.first_name or "", db, bot
-            )
-            await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
+            return
     elif target.startswith("grp:open:"):
         gid = int(target.split(":")[2])
         from handlers.groups import render_single_group
 
-        rendered = await render_single_group(callback.from_user.id, gid, db, bot)
-        if rendered:
-            await safe_edit_or_send(callback, rendered[0], rendered[1])
-    else:
-        text, kb = await render_home_dashboard(
-            callback.from_user.id, callback.from_user.first_name or "", db, bot
+        rendered = await render_single_group(
+            callback.from_user.id, gid, db, bot, bot_username=uname
         )
-        await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
-    await callback.answer("Cancelled")
+        if rendered:
+            await safe_edit_or_send(
+                callback,
+                rendered[0],
+                rendered[1],
+                answer_text="Cancelled",
+                also_ack=True,
+            )
+            return
+
+    text, kb = await render_home_dashboard(
+        callback.from_user.id,
+        callback.from_user.first_name or "",
+        db,
+        bot,
+        bot_username=uname,
+    )
+    await edit_or_send_banner(
+        callback,
+        "welcome",
+        text,
+        kb,
+        bot,
+        db,
+        config,
+        answer_text="Cancelled",
+        also_ack=True,
+    )
 
 
 @router.message(Command("bulk"))
@@ -936,8 +1076,7 @@ async def cb_nav_stats(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.full_name or "",
     )
     text, kb = await _render_stats_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.message(Command("settings"))
@@ -963,8 +1102,7 @@ async def cb_nav_settings(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.full_name or "",
     )
     text, kb = await _render_settings_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer()
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data == "set:bulk")
@@ -973,8 +1111,13 @@ async def cb_settings_bulk(callback: CallbackQuery, db: Database) -> None:
         return
     enabled = await db.toggle_bulk_mode(callback.from_user.id)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer("⚡ Bulk ON" if enabled else "Bulk OFF")
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text="⚡ Bulk ON" if enabled else "Bulk OFF",
+        also_ack=True,
+    )
 
 
 @router.callback_query(F.data == "set:prot")
@@ -983,11 +1126,16 @@ async def cb_settings_protect(callback: CallbackQuery, db: Database) -> None:
         return
     enabled = await db.toggle_protect_content(callback.from_user.id)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer(
-        "🛡️ Content Protection ON (No Forward/Save)"
-        if enabled
-        else "Content Protection OFF"
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text=(
+            "🛡️ Content Protection ON (No Forward/Save)"
+            if enabled
+            else "Content Protection OFF"
+        ),
+        also_ack=True,
     )
 
 
@@ -997,8 +1145,13 @@ async def cb_settings_ttl(callback: CallbackQuery, db: Database) -> None:
         return
     new_ttl = await db.cycle_auto_delete_ttl(callback.from_user.id)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer(f"⏱ Auto-Delete: {format_ttl_short(new_ttl)}")
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text=f"⏱ Auto-Delete: {format_ttl_short(new_ttl)}",
+        also_ack=True,
+    )
 
 
 @router.callback_query(F.data == "set:sort")
@@ -1009,8 +1162,13 @@ async def cb_settings_sort(callback: CallbackQuery, db: Database) -> None:
     nxt = next_sort_key(user.get("default_sort") or "new")
     await db.set_default_sort(callback.from_user.id, nxt)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer(f"Sort: {SORT_LABELS[nxt]}")
+    await safe_edit_or_send(
+        callback,
+        text,
+        kb,
+        answer_text=f"Sort: {SORT_LABELS[nxt]}",
+        also_ack=True,
+    )
 
 
 @router.callback_query(F.data == "set:clear_grp")
@@ -1019,5 +1177,6 @@ async def cb_settings_clear_grp(callback: CallbackQuery, db: Database) -> None:
         return
     await db.set_active_group(callback.from_user.id, None)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
-    await callback.answer("Target reset")
+    await safe_edit_or_send(
+        callback, text, kb, answer_text="Target reset", also_ack=True
+    )
