@@ -1,6 +1,7 @@
 import asyncio
 import html
 import time
+from collections.abc import Awaitable
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -58,6 +59,21 @@ TTL_LABELS = {
 DIVIDER = "──────────────────────"
 
 _AUTO_DELETE_TASKS: set[asyncio.Task] = set()
+
+
+async def _await(awaitable: Awaitable[Any]) -> Any:
+    """Wraps any awaitable (including unhashable aiogram 3 TelegramMethod objects) into a real coroutine."""
+    return await awaitable
+
+
+async def safe_gather(*tasks: Awaitable[Any]) -> list[Any]:
+    """
+    Runs awaitables concurrently via `asyncio.gather(..., return_exceptions=True)`,
+    wrapping each item in a true coroutine so unhashable aiogram 3 Pydantic
+    `TelegramMethod` instances (`AnswerCallbackQuery`, `EditMessageText`, etc.)
+    never trigger `TypeError: unhashable type` inside `asyncio.gather()`.
+    """
+    return await asyncio.gather(*(_await(c) for c in tasks), return_exceptions=True)
 
 
 def esc(text: Optional[str]) -> str:
@@ -288,10 +304,9 @@ async def safe_edit_or_send(
                 pass
 
     if also_ack:
-        await asyncio.gather(
+        await safe_gather(
             callback.answer(answer_text, show_alert=answer_alert),
             _do_edit(),
-            return_exceptions=True,
         )
     else:
         await _do_edit()

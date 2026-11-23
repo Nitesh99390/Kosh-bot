@@ -35,6 +35,7 @@ from utils.formatters import (
     next_sort_key,
     progress_bar,
     safe_edit_or_send,
+    safe_gather,
     send_stored_media,
     share_url_btn,
     toggle_label,
@@ -915,6 +916,100 @@ async def run_tests() -> None:
                 assert "get_me(" not in src, (
                     f"Forbidden per-request get_me() call found in {folder}/{fname}!"
                 )
+                if not (folder == "utils" and fname == "formatters.py"):
+                    assert "asyncio.gather(" not in src, (
+                        f"Raw asyncio.gather() found in {folder}/{fname} — use safe_gather() so unhashable TelegramMethod objects never crash!"
+                    )
+
+        # 28. Regression Test: Unhashable aiogram 3 TelegramMethod / Pydantic awaitables in gather
+        unhashable_events: list[str] = []
+
+        class _UnhashableTelegramMethod:
+            """Simulates aiogram 3.x Pydantic TelegramMethod (e.g. AnswerCallbackQuery) where __hash__ is None."""
+
+            __hash__ = None  # type: ignore[assignment]
+
+            def __init__(self, tag: str) -> None:
+                self.tag = tag
+
+            def __await__(self):
+                async def _coro() -> str:
+                    unhashable_events.append(self.tag)
+                    return self.tag
+
+                return _coro().__await__()
+
+        # Confirm raw object is genuinely unhashable (reproduces Python 3.10+ asyncio.gather crash)
+        unhashable_probe = _UnhashableTelegramMethod("probe")
+        try:
+            hash(unhashable_probe)
+            raise AssertionError("Expected _UnhashableTelegramMethod to be unhashable")
+        except TypeError:
+            pass
+
+        gather_res = await safe_gather(
+            _UnhashableTelegramMethod("direct_method_1"),
+            _UnhashableTelegramMethod("direct_method_2"),
+        )
+        assert gather_res == ["direct_method_1", "direct_method_2"]
+
+        unhashable_events.clear()
+        unhashable_text_cb = SimpleNamespace(
+            answer=lambda text=None, show_alert=False: _UnhashableTelegramMethod(
+                f"ack:{text or ''}"
+            ),
+            message=SimpleNamespace(
+                photo=None,
+                text="Old text panel",
+                edit_text=lambda text, reply_markup=None, disable_web_page_preview=False: _UnhashableTelegramMethod(
+                    f"edit_text:{text}"
+                ),
+            ),
+        )
+        await safe_edit_or_send(
+            unhashable_text_cb,  # type: ignore[arg-type]
+            "New text panel",
+            None,
+            answer_text="Loaded",
+            also_ack=True,
+        )
+        assert "ack:Loaded" in unhashable_events
+        assert "edit_text:New text panel" in unhashable_events
+
+        unhashable_events.clear()
+        unhashable_banner_cb = SimpleNamespace(
+            answer=lambda text=None, show_alert=False: _UnhashableTelegramMethod(
+                f"banner_ack:{text or ''}"
+            ),
+            message=SimpleNamespace(
+                photo=[
+                    SimpleNamespace(
+                        file_id=welcome_asset["file_id"],
+                        file_unique_id=welcome_asset["file_unique_id"],
+                    )
+                ],
+                text=None,
+                edit_caption=lambda caption="", reply_markup=None: _UnhashableTelegramMethod(
+                    f"edit_caption:{caption}"
+                ),
+                edit_media=lambda media=None, reply_markup=None: _UnhashableTelegramMethod(
+                    "edit_media"
+                ),
+            ),
+        )
+        await edit_or_send_banner(
+            unhashable_banner_cb,  # type: ignore[arg-type]
+            "welcome",
+            "Hero caption",
+            None,
+            dummy_bot,  # type: ignore[arg-type]
+            db,
+            dummy_cfg,
+            answer_text="Home",
+            also_ack=True,
+        )
+        assert "banner_ack:Home" in unhashable_events
+        assert "edit_caption:Hero caption" in unhashable_events
 
         await db.close()
         print("ALL PRO FEATURES, SECURITY, PACKS, LOW-LATENCY & ZERO-LEAK TESTS PASSED!")

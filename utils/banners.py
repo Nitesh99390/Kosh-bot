@@ -16,6 +16,7 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
+from utils.formatters import safe_edit_or_send, safe_gather
 
 logger = logging.getLogger("koshbox.banners")
 
@@ -243,8 +244,6 @@ async def edit_or_send_banner(
 
     file_id = await get_or_upload_banner_file_id(asset_key, bot, db, config)
     if not file_id:
-        from utils.formatters import safe_edit_or_send
-
         await safe_edit_or_send(
             callback,
             caption,
@@ -296,10 +295,9 @@ async def edit_or_send_banner(
                 pass
 
     if also_ack:
-        await asyncio.gather(
+        await safe_gather(
             callback.answer(answer_text, show_alert=answer_alert),
             _do_ui_update(),
-            return_exceptions=True,
         )
     else:
         await _do_ui_update()
