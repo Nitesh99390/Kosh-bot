@@ -31,36 +31,35 @@ async def render_accounts_panel(
     user_id: int, db: Database, manage_unlink: bool = False
 ) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Clean Synced Accounts View:
-    - Primary screen lists connected accounts cleanly inside a blockquote with just 2 rows of buttons.
-    - Unlink actions only appear inside '🔓 Manage Linked' sub-view (Progressive Disclosure).
+    Ultra-crisp Synced Accounts Panel:
+    - Minimal header + clean blockquote device list
     """
     user = await db.get_user(user_id)
     linked = await db.get_linked_accounts(user["vault_id"])
 
     trail = (
-        breadcrumb("Vault", "Settings", "Accounts", "Unlink")
+        breadcrumb("Vault", "Accounts", "Unlink")
         if manage_unlink
-        else breadcrumb("Vault", "Settings", "Synced Accounts")
+        else breadcrumb("Vault", "Accounts")
     )
 
     acc_lines: list[str] = []
     for acc in linked:
-        uname = f"@{esc(acc['username'])}" if acc["username"] else "No username"
-        you_tag = " · <i>This device</i>" if acc["user_id"] == user["user_id"] else ""
+        uname = f"@{esc(acc['username'])}" if acc["username"] else "no-user"
+        you_tag = " · <i>You</i>" if acc["user_id"] == user["user_id"] else ""
         acc_lines.append(
-            f"• <b>{esc(acc['full_name'] or 'Telegram User')}</b> ({uname}){you_tag}"
+            f"• <b>{esc(acc['full_name'] or 'User')}</b> ({uname}){you_tag}"
         )
 
     lines = [
         trail,
-        f"🔗 <b>Synced Accounts</b> · <i>{len(linked)} connected</i>\n",
-        "<blockquote>" + "\n".join(acc_lines) + "</blockquote>\n",
+        f"🔗 <b>Synced Accounts</b> · <i>{len(linked)} linked</i>",
+        "<blockquote>" + "\n".join(acc_lines) + "</blockquote>",
     ]
 
     buttons: list[list[InlineKeyboardButton]] = []
     if manage_unlink and len(linked) > 1:
-        lines.append("<i>Select an account below to detach it into a separate vault:</i>")
+        lines.append("<i>Select an account to detach:</i>")
         for acc in linked:
             buttons.append(
                 [
@@ -71,10 +70,8 @@ async def render_accounts_panel(
                     )
                 ]
             )
-        buttons.append([back_btn("nav:accounts", "◀ Back to Accounts")])
+        buttons.append([back_btn("nav:accounts", "◀ Accounts")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    lines.append("<i>Connected accounts share your vault, folders, and inline search in real time.</i>")
 
     buttons.append(
         [
@@ -91,19 +88,9 @@ async def render_accounts_panel(
     )
     if len(linked) > 1:
         buttons.append(
-            [
-                InlineKeyboardButton(
-                    text="🔓 Manage / Unlink",
-                    callback_data="acc:manage",
-                )
-            ]
+            [InlineKeyboardButton(text="🔓 Unlink Device", callback_data="acc:manage")]
         )
-    buttons.append(
-        [
-            back_btn("nav:settings", "◀ Settings"),
-            home_btn(),
-        ]
-    )
+    buttons.append([back_btn("nav:settings", "◀ Settings"), home_btn()])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -121,22 +108,19 @@ async def _build_link_code_panel(
     mins = max(1, config.link_code_ttl_seconds // 60)
 
     text = (
-        f"{breadcrumb('Vault', 'Accounts', 'Link New')}\n"
-        f"🔐 <b>Link Secondary Account</b>\n\n"
-        f"<blockquote>"
-        f"<b>Sync Code:</b> <code>{req['code']}</code> <i>(valid {mins}m)</i>\n"
-        f"<b>Command:</b> <code>/verify {req['code']}</code>"
-        f"</blockquote>\n\n"
-        f"<i>Copy the link or code below, open it on your second account, then approve the request here.</i>"
+        f"{breadcrumb('Vault', 'Accounts', 'Link')}\n"
+        f"🔐 <b>Sync Code</b> · <i>{mins}m</i>\n"
+        f"<blockquote>Code: <code>{req['code']}</code>  ·  <code>/verify {req['code']}</code></blockquote>\n"
+        f"<i>Open on your 2nd account, then approve here.</i>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                copy_btn("📋 Copy Sync Link", deep_link, style="primary"),
+                copy_btn("📋 Copy Link", deep_link, style="primary"),
                 copy_btn("📋 Copy Code", req["code"]),
             ],
             [
-                InlineKeyboardButton(text="🔄 New Code", callback_data="nav:link"),
+                InlineKeyboardButton(text="🔄 Refresh", callback_data="nav:link"),
                 back_btn("nav:accounts", "◀ Accounts"),
             ],
         ]
@@ -191,9 +175,7 @@ async def cb_enter_code_prompt(callback: CallbackQuery, state: FSMContext) -> No
     await state.set_state(AccountStates.waiting_for_verify_code)
     await safe_edit_or_send(
         callback,
-        f"{breadcrumb('Vault', 'Accounts', 'Enter Code')}\n"
-        f"🔑 <b>Enter Sync Code</b>\n\n"
-        f"<blockquote>Paste the 6-character code generated on your primary Telegram account:</blockquote>",
+        f"🔑 <b>Enter Sync Code</b>\n<blockquote>Send the 6-character code from your primary account:</blockquote>",
         cancel_kb("nav:accounts"),
     )
     await callback.answer()
@@ -230,24 +212,21 @@ async def handle_verify_code(
 
     if not req or req["status"] != "pending" or req["expires_at"] < now:
         await message.answer(
-            "⚠️ <b>Invalid or Expired Code</b>\n"
-            "<blockquote>Generate a fresh code from your primary account using /link.</blockquote>",
+            "⚠️ <b>Expired or Invalid Code</b>\n<blockquote>Run /link on your primary account.</blockquote>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
         )
         return
 
     if req["owner_user_id"] == requester["user_id"]:
         await message.answer(
-            "⚠️ <b>Same Account Detected</b>\n"
-            "<blockquote>Open the link or code from your <i>secondary</i> Telegram account.</blockquote>",
+            "⚠️ <b>Same Account</b>\n<blockquote>Open this code on your 2nd Telegram account.</blockquote>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
         )
         return
 
     if req["owner_vault_id"] == requester["vault_id"]:
         await message.answer(
-            "✅ <b>Already Synced</b>\n"
-            "<blockquote>This account is already connected to that vault.</blockquote>",
+            "✅ <b>Already Synced</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
         )
         return
@@ -260,12 +239,12 @@ async def handle_verify_code(
     )
     if not ok:
         await message.answer(
-            "⚠️ Could not process verification code. Generate a new one with /link.",
+            "⚠️ Code unavailable. Run /link again.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
         )
         return
 
-    uname_display = f"@{esc(requester['username'])}" if requester["username"] else "No username"
+    uname_display = f"@{esc(requester['username'])}" if requester["username"] else "no-user"
     confirm_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -275,7 +254,7 @@ async def handle_verify_code(
                     style="danger",
                 ),
                 InlineKeyboardButton(
-                    text="✓ Approve & Sync",
+                    text="✓ Approve",
                     callback_data=f"acc:approve:{req['code']}",
                     style="success",
                 ),
@@ -287,22 +266,18 @@ async def handle_verify_code(
         await bot.send_message(
             chat_id=req["owner_user_id"],
             text=(
-                f"🛡️ <b>Vault Sync Request</b>\n\n"
-                f"<blockquote>"
-                f"👤 <b>Account:</b> {esc(requester['full_name'])} ({uname_display})\n"
-                f"🆔 <b>User ID:</b> <code>{requester['user_id']}</code>"
-                f"</blockquote>\n\n"
-                f"<i>Approve to merge and sync your files & folders across both accounts.</i>"
+                f"🛡️ <b>Sync Request</b>\n"
+                f"<blockquote>👤 <b>{esc(requester['full_name'])}</b> ({uname_display})\n"
+                f"🆔 <code>{requester['user_id']}</code></blockquote>"
             ),
             reply_markup=confirm_kb,
         )
     except Exception:
-        await message.answer("⚠️ Failed to notify the primary account. Please try again.")
+        await message.answer("⚠️ Could not reach primary account.")
         return
 
     await message.answer(
-        "⏳ <b>Approval Requested</b>\n\n"
-        "<blockquote>Switch to your primary Telegram account and tap <b>✓ Approve & Sync</b>.</blockquote>"
+        "⏳ <b>Approval Sent</b>\n<blockquote>Tap <b>✓ Approve</b> on your primary account.</blockquote>"
     )
 
 
@@ -314,9 +289,7 @@ async def cmd_verify(
     if not code:
         await state.set_state(AccountStates.waiting_for_verify_code)
         await message.answer(
-            f"{breadcrumb('Vault', 'Accounts', 'Verify')}\n"
-            f"🔑 <b>Verify Sync Code</b>\n\n"
-            f"<blockquote>Send the 6-character code generated on your primary account:</blockquote>",
+            "🔑 <b>Verify Code</b>\n<blockquote>Send the 6-character sync code:</blockquote>",
             reply_markup=cancel_kb("nav:accounts"),
         )
         return
@@ -330,19 +303,17 @@ async def cb_approve_link(callback: CallbackQuery, db: Database, bot: Bot) -> No
     code = callback.data.split(":")[2]
     req = await db.approve_link_request(code, callback.from_user.id)
     if not req:
-        await safe_edit_or_send(callback, "⚠️ Request expired or already processed.")
+        await safe_edit_or_send(callback, "⚠️ Expired or already handled.")
         await callback.answer()
         return
 
     await safe_edit_or_send(
         callback,
-        f"🎉 <b>Accounts Synced</b>\n\n"
-        f"<blockquote><b>{esc(req['requester_name'])}</b> (<code>{req['requester_user_id']}</code>) "
-        f"is now connected to your vault.</blockquote>",
+        f"🎉 <b>Synced</b> · <b>{esc(req['requester_name'])}</b>",
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="🔗 View Accounts", callback_data="nav:accounts"),
+                    InlineKeyboardButton(text="🔗 Accounts", callback_data="nav:accounts"),
                     home_btn(),
                 ]
             ]
@@ -353,15 +324,14 @@ async def cb_approve_link(callback: CallbackQuery, db: Database, bot: Bot) -> No
         await bot.send_message(
             chat_id=req["requester_user_id"],
             text=(
-                f"🎉 <b>Vault Sync Active</b>\n\n"
-                f"<blockquote>All your files and folders are now unified.</blockquote>\n\n"
-                f"<i>Inline anywhere:</i> <code>@{esc(me.username)} </code>"
+                f"🎉 <b>Vault Synced</b>\n"
+                f"<blockquote>Inline anywhere: <code>@{esc(me.username)} </code></blockquote>"
             ),
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="🔍 Open Inline Vault",
+                            text="🔍 Search Inline",
                             switch_inline_query_current_chat="",
                             style="primary",
                         ),
@@ -372,7 +342,7 @@ async def cb_approve_link(callback: CallbackQuery, db: Database, bot: Bot) -> No
         )
     except Exception:
         pass
-    await callback.answer("Accounts synced!")
+    await callback.answer("Synced!")
 
 
 @router.callback_query(F.data.startswith("acc:reject:"))
@@ -382,20 +352,20 @@ async def cb_reject_link(callback: CallbackQuery, db: Database, bot: Bot) -> Non
     code = callback.data.split(":")[2]
     req = await db.reject_link_request(code, callback.from_user.id)
     if not req:
-        await safe_edit_or_send(callback, "⚠️ Request already processed.")
+        await safe_edit_or_send(callback, "⚠️ Already handled.")
         await callback.answer()
         return
 
     await safe_edit_or_send(
         callback,
-        "✕ <b>Sync Request Declined</b>\n<i>No changes were made to your vault.</i>",
+        "✕ <b>Declined</b>",
         InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
     )
     if req.get("requester_user_id"):
         try:
             await bot.send_message(
                 chat_id=req["requester_user_id"],
-                text="✕ Your vault sync request was declined by the primary account.",
+                text="✕ Sync request declined.",
             )
         except Exception:
             pass
@@ -440,13 +410,12 @@ async def cb_unlink_ask(callback: CallbackQuery, db: Database) -> None:
     target_id = int(callback.data.split(":")[2])
     target_user = await db.get_user(target_id)
     t_name = esc(target_user["full_name"]) if target_user else str(target_id)
-    # Safe action LEFT, Destructive action RIGHT (danger)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 back_btn("acc:manage", "◀ Cancel"),
                 InlineKeyboardButton(
-                    text="🔓 Yes, Unlink",
+                    text="🔓 Unlink",
                     callback_data=f"acc:unlink:{target_id}",
                     style="danger",
                 ),
@@ -455,9 +424,7 @@ async def cb_unlink_ask(callback: CallbackQuery, db: Database) -> None:
     )
     await safe_edit_or_send(
         callback,
-        f"⚠️ <b>Unlink {t_name}?</b>\n\n"
-        f"<blockquote>Account <code>{target_id}</code> will be moved into a fresh empty vault. "
-        f"Existing files stay safe in this vault.</blockquote>",
+        f"⚠️ <b>Unlink {t_name}?</b>\n<blockquote>Moves <code>{target_id}</code> to a separate vault.</blockquote>",
         kb,
     )
     await callback.answer()
@@ -471,8 +438,8 @@ async def cb_unlink(callback: CallbackQuery, db: Database) -> None:
     user = await db.get_user(callback.from_user.id)
     ok = await db.unlink_account(target_id, user["vault_id"])
     if not ok:
-        await callback.answer("Cannot unlink the only remaining account.", show_alert=True)
+        await callback.answer("Cannot unlink last account.", show_alert=True)
         return
     text, kb = await render_accounts_panel(callback.from_user.id, db)
     await safe_edit_or_send(callback, text, kb)
-    await callback.answer("Account unlinked")
+    await callback.answer("Unlinked")

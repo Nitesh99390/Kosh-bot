@@ -21,6 +21,7 @@ from utils.formatters import (
     back_btn,
     breadcrumb,
     cancel_kb,
+    esc,
     format_size,
     home_btn,
     safe_edit_or_send,
@@ -37,18 +38,15 @@ def _is_admin(user_id: int, config: Config) -> bool:
 async def _render_admin_panel(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     stats = await db.get_global_stats()
     cached_banners = await db.list_ui_assets()
-    banner_line = f"🖼️ <b>UI Banners Cached:</b> {len(cached_banners)}/{len(BANNER_FILES)} in Dump Channel"
+    ban_badge = f" · 🚫 {stats['banned']} banned" if stats.get("banned") else ""
     text = (
-        f"{breadcrumb('System', 'Admin Console')}\n"
-        f"🛠️ <b>KoshBox Admin Console</b>\n\n"
+        f"{breadcrumb('System', 'Admin')}\n"
+        f"🛠️ <b>Admin Console</b>\n"
         f"<blockquote>"
-        f"👤 <b>Users:</b> {stats['users']}  <i>({stats['active_24h']} active 24h)</i>\n"
-        f"🔐 <b>Vaults:</b> {stats['vaults']}  ·  📁 <b>Groups:</b> {stats['groups']}\n"
-        f"📦 <b>Files:</b> {stats['files']}  <i>({stats['trashed']} in trash)</i>\n"
-        f"💾 <b>Archived:</b> {format_size(stats['total_size'])}\n"
-        f"{banner_line}"
-        f"</blockquote>\n\n"
-        f"<i>Select an administrative action below:</i>"
+        f"👤 <b>{stats['users']}</b> users <i>({stats['active_24h']} 24h{ban_badge})</i>  ·  🔐 <b>{stats['vaults']}</b> vaults\n"
+        f"📦 <b>{stats['files']}</b> files  ·  🎒 <b>{stats.get('packs', 0)}</b> packs  ·  📁 <b>{stats['groups']}</b> groups\n"
+        f"💾 <b>{format_size(stats['total_size'])}</b>  ·  🖼️ Banners: <b>{len(cached_banners)}/{len(BANNER_FILES)}</b>"
+        f"</blockquote>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -65,12 +63,16 @@ async def _render_admin_panel(db: Database) -> tuple[str, InlineKeyboardMarkup]:
             ],
             [
                 InlineKeyboardButton(
-                    text="🖼️ Sync UI Banners",
+                    text="🚫 Ban / Unban",
+                    callback_data="adm:ban_prompt",
+                ),
+                InlineKeyboardButton(
+                    text="🖼️ Sync Banners",
                     callback_data="adm:sync_banners",
                 ),
-                InlineKeyboardButton(text="🔄 Refresh", callback_data="adm:refresh"),
             ],
             [
+                InlineKeyboardButton(text="🔄 Refresh", callback_data="adm:refresh"),
                 home_btn(),
             ],
         ]
@@ -91,11 +93,59 @@ async def cb_admin_refresh(
     callback: CallbackQuery, db: Database, config: Config
 ) -> None:
     if not callback.from_user or not _is_admin(callback.from_user.id, config):
-        await callback.answer("Admin access required.", show_alert=True)
+        await callback.answer("Admin only.", show_alert=True)
         return
     text, kb = await _render_admin_panel(db)
     await safe_edit_or_send(callback, text, kb)
-    await callback.answer("Metrics updated")
+    await callback.answer("Updated")
+
+
+@router.callback_query(F.data == "adm:ban_prompt")
+async def cb_admin_ban_prompt(
+    callback: CallbackQuery, state: FSMContext, config: Config
+) -> None:
+    if not callback.from_user or not _is_admin(callback.from_user.id, config):
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_ban_uid)
+    await safe_edit_or_send(
+        callback,
+        "🚫 <b>Ban / Unban User</b>\n<blockquote>Send numeric <code>User ID</code> to toggle ban status:</blockquote>",
+        cancel_kb("adm:refresh"),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_ban_uid)
+async def fsm_admin_toggle_ban(
+    message: Message, state: FSMContext, db: Database, config: Config
+) -> None:
+    if (
+        not message.from_user
+        or not message.text
+        or not _is_admin(message.from_user.id, config)
+    ):
+        return
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("⚠️ Send a numeric User ID.", reply_markup=cancel_kb("adm:refresh"))
+        return
+    target_uid = int(raw)
+    if target_uid in config.admin_ids:
+        await message.answer("⚠️ Cannot ban an admin.", reply_markup=cancel_kb("adm:refresh"))
+        return
+    await state.clear()
+    target = await db.get_user(target_uid)
+    if not target:
+        await message.answer("⚠️ User ID not found in DB.", reply_markup=cancel_kb("adm:refresh"))
+        return
+    new_ban = not bool(target.get("is_banned"))
+    await db.set_user_banned(target_uid, new_ban)
+    text, kb = await _render_admin_panel(db)
+    status_lbl = "🚫 Banned" if new_ban else "✅ Unbanned"
+    await message.answer(
+        f"{status_lbl} <code>{target_uid}</code>\n\n{text}", reply_markup=kb
+    )
 
 
 @router.callback_query(F.data == "adm:sync_banners")
@@ -103,16 +153,13 @@ async def cb_admin_sync_banners(
     callback: CallbackQuery, bot: Bot, db: Database, config: Config
 ) -> None:
     if not callback.from_user or not _is_admin(callback.from_user.id, config):
-        await callback.answer("Admin access required.", show_alert=True)
+        await callback.answer("Admin only.", show_alert=True)
         return
     status = await warmup_banners_in_dump_channel(bot, db, config, force_reupload=False)
     ok_cnt = sum(1 for v in status.values() if v)
     text, kb = await _render_admin_panel(db)
     await safe_edit_or_send(callback, text, kb)
-    await callback.answer(
-        f"🖼️ {ok_cnt}/{len(status)} UI banners cached in Dump Channel!",
-        show_alert=False,
-    )
+    await callback.answer(f"🖼️ {ok_cnt}/{len(status)} banners cached!")
 
 
 async def _send_db_backup(chat_id: int, bot: Bot, db: Database) -> bool:
@@ -139,7 +186,7 @@ async def cmd_backup(
         return
     ok = await _send_db_backup(message.chat.id, bot, db)
     if not ok:
-        await message.answer("⚠️ Database file not found.")
+        await message.answer("⚠️ DB file not found.")
 
 
 @router.callback_query(F.data == "adm:backup")
@@ -151,10 +198,10 @@ async def cb_admin_backup(
         or not callback.message
         or not _is_admin(callback.from_user.id, config)
     ):
-        await callback.answer("Admin access required.", show_alert=True)
+        await callback.answer("Admin only.", show_alert=True)
         return
     ok = await _send_db_backup(callback.message.chat.id, bot, db)
-    await callback.answer("Backup sent!" if ok else "Database file not found.", show_alert=not ok)
+    await callback.answer("Backup sent!" if ok else "DB not found.", show_alert=not ok)
 
 
 @router.message(Command("broadcast"))
@@ -165,9 +212,7 @@ async def cmd_broadcast(
         return
     await state.set_state(AdminStates.waiting_for_broadcast)
     await message.answer(
-        f"{breadcrumb('Admin', 'Broadcast')}\n"
-        f"📣 <b>New Broadcast</b>\n\n"
-        f"<blockquote>Send the message (text, photo, video, or document) to copy to all KoshBox users:</blockquote>",
+        "📣 <b>Broadcast</b>\n<blockquote>Send text or media to copy to all users:</blockquote>",
         reply_markup=cancel_kb("adm:refresh"),
     )
 
@@ -177,14 +222,12 @@ async def cb_admin_broadcast(
     callback: CallbackQuery, state: FSMContext, config: Config
 ) -> None:
     if not callback.from_user or not _is_admin(callback.from_user.id, config):
-        await callback.answer("Admin access required.", show_alert=True)
+        await callback.answer("Admin only.", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_for_broadcast)
     await safe_edit_or_send(
         callback,
-        f"{breadcrumb('Admin', 'Broadcast')}\n"
-        f"📣 <b>New Broadcast</b>\n\n"
-        f"<blockquote>Send the message (text, photo, video, or document) to copy to all KoshBox users:</blockquote>",
+        "📣 <b>Broadcast</b>\n<blockquote>Send text or media to copy to all users:</blockquote>",
         cancel_kb("adm:refresh"),
     )
     await callback.answer()
@@ -199,7 +242,7 @@ async def fsm_broadcast(
     await state.clear()
     user_ids = await db.get_all_user_ids()
     sent, failed = 0, 0
-    status_msg = await message.answer(f"⏳ Broadcasting to <b>{len(user_ids)}</b> users…")
+    status_msg = await message.answer(f"⏳ Sending to <b>{len(user_ids)}</b> users…")
 
     for uid in user_ids:
         try:
@@ -214,14 +257,8 @@ async def fsm_broadcast(
         await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
-        f"✅ <b>Broadcast Complete</b>\n\n"
-        f"<blockquote>Delivered: <b>{sent}</b>  ·  Skipped/Blocked: <b>{failed}</b></blockquote>",
+        f"✅ <b>Broadcast Done</b> · Sent: <b>{sent}</b> · Skipped: <b>{failed}</b>",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    back_btn("adm:refresh", "◀ Admin"),
-                    home_btn(),
-                ]
-            ]
+            inline_keyboard=[[back_btn("adm:refresh", "◀ Admin"), home_btn()]]
         ),
     )

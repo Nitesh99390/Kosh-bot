@@ -20,9 +20,11 @@ from utils.formatters import (
     breadcrumb,
     build_file_card_text,
     build_file_keyboard,
+    build_file_link_keyboard,
     build_file_manage_keyboard,
     cancel_kb,
     esc,
+    format_expiry_badge,
     format_size,
     home_btn,
     safe_edit_or_send,
@@ -45,7 +47,7 @@ FILTER_TO_MEDIA = {
 }
 
 FILTER_LABELS = {
-    "all": "All Files",
+    "all": "All",
     "fav": "⭐ Starred",
     "audio": "🎵 Audio",
     "video": "🎬 Video",
@@ -67,11 +69,10 @@ async def render_browse_page(
     text_query: str = "",
 ) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Clean Mobile-First File Browser:
-    - Shows 5 clean items per page (no overwhelming button list)
-    - Replaces the cramped 6-pill bar + sort row with a single '🌪️ Filter & Sort' drawer button + '🔎 Search'
-    - Clean pagination row only when multiple pages exist
-    - Consistent Back / Home footer
+    Ultra-crisp Mobile-First File Browser:
+    - 5 clean items per page
+    - 2-line minimal header
+    - Filter/Sort drawer + Search + clean navigation
     """
     user = await db.get_user(user_id)
     if sort_key == "def" or sort_key not in SORT_LABELS:
@@ -106,7 +107,6 @@ async def render_browse_page(
         else len(items)
     )
 
-    # Header & Breadcrumb
     if group_filter:
         grp = await db.get_group(group_filter)
         folder_name = grp["name"] if grp else "Folder"
@@ -114,35 +114,32 @@ async def render_browse_page(
         trail = breadcrumb("Vault", "Folders", esc(folder_name))
         heading = f"{folder_icon} <b>{esc(folder_name)}</b>"
     elif only_fav:
-        trail = breadcrumb("Vault", "Favorites")
-        heading = "⭐ <b>Starred Files</b>"
+        trail = breadcrumb("Vault", "Starred")
+        heading = "⭐ <b>Starred</b>"
     elif media_type:
-        trail = breadcrumb("Vault", "My Files", MEDIA_LABELS.get(media_type, "Filtered"))
+        trail = breadcrumb("Vault", "Files", MEDIA_LABELS.get(media_type, "Filter"))
         heading = f"{MEDIA_ICONS.get(media_type, '📦')} <b>{MEDIA_LABELS.get(media_type, 'Files')}</b>"
     elif text_query:
         trail = breadcrumb("Vault", "Search")
-        heading = f"🔎 <b>Results for</b> <code>{esc(text_query[:28])}</code>"
+        heading = f"🔎 <code>{esc(text_query[:26])}</code>"
     else:
-        trail = breadcrumb("Vault", "My Files")
+        trail = breadcrumb("Vault", "Files")
         heading = "📦 <b>My Files</b>"
 
     sort_name = SORT_LABELS.get(sort_key, "Newest")
-    flt_badge = FILTER_LABELS.get(flt, "All Files")
+    flt_badge = FILTER_LABELS.get(flt, "All")
     total_pages = max(1, (total_matching + BROWSE_PAGE_SIZE - 1) // BROWSE_PAGE_SIZE)
 
     lines = [
         trail,
-        heading,
-        f"<i>{total_matching} item(s)  ·  {flt_badge}  ·  {sort_name}</i>\n",
+        f"{heading} · <i>{total_matching} · {flt_badge} · {sort_name}</i>",
     ]
 
     buttons: list[list[InlineKeyboardButton]] = []
 
     if not items:
         if text_query or flt != "all":
-            lines.append(
-                "<blockquote>No files match your current filter or search.</blockquote>"
-            )
+            lines.append("<blockquote>No matching files found.</blockquote>")
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -153,16 +150,13 @@ async def render_browse_page(
                 ]
             )
         else:
-            lines.append(
-                "<blockquote>Your vault is empty right now.\n"
-                "Drop or forward any file into this chat to archive it!</blockquote>"
-            )
+            lines.append("<blockquote>Drop or forward any file here to save it.</blockquote>")
     else:
         for f in items:
             icon = MEDIA_ICONS.get(f["media_type"], "📦")
             star = "⭐ " if f.get("is_favorite") else ""
             sz = f" · {format_size(f['file_size'])}" if f.get("file_size") else ""
-            label = f"{star}{icon} {f['title'][:28]}{sz}"
+            label = f"{star}{icon} {f['title'][:26]}{sz}"
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -172,37 +166,35 @@ async def render_browse_page(
                 ]
             )
 
-    # Clean Pagination Row (only when needed)
     if page > 0 or has_next:
         nav_row: list[InlineKeyboardButton] = []
         if page > 0:
             nav_row.append(
                 InlineKeyboardButton(
-                    text="◀ Prev",
+                    text="◀",
                     callback_data=f"br:{flt}:{sort_key}:{gid}:{page - 1}",
                 )
             )
         nav_row.append(
             InlineKeyboardButton(
-                text=f"{page + 1} / {total_pages}",
+                text=f"{page + 1}/{total_pages}",
                 callback_data="noop",
             )
         )
         if has_next:
             nav_row.append(
                 InlineKeyboardButton(
-                    text="Next ▶",
+                    text="▶",
                     callback_data=f"br:{flt}:{sort_key}:{gid}:{page + 1}",
                 )
             )
         buttons.append(nav_row)
 
-    # Clean 2-button Toolbar: Filter & Sort Drawer + Search
     active_filter_dot = " ●" if flt != "all" else ""
     buttons.append(
         [
             InlineKeyboardButton(
-                text=f"🌪️ Filter & Sort{active_filter_dot}",
+                text=f"🌪️ Filter{active_filter_dot}",
                 callback_data=f"bf:{flt}:{sort_key}:{gid}:{page}",
             ),
             InlineKeyboardButton(
@@ -212,16 +204,15 @@ async def render_browse_page(
         ]
     )
 
-    # Footer Navigation
     bottom_row: list[InlineKeyboardButton] = []
     if group_filter:
         bottom_row.append(back_btn(f"grp:open:{group_filter}", "◀ Folder"))
         bottom_row.append(home_btn())
     elif text_query:
-        bottom_row.append(back_btn("br:all:def:0:0", "◀ All Files"))
+        bottom_row.append(back_btn("br:all:def:0:0", "◀ Files"))
         bottom_row.append(home_btn())
     else:
-        bottom_row.append(back_btn("nav:home", "◀ Back to Vault"))
+        bottom_row.append(back_btn("nav:home", "◀ Vault"))
     buttons.append(bottom_row)
 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -230,21 +221,13 @@ async def render_browse_page(
 def render_filter_sort_drawer(
     flt: str, sort_key: str, gid: int, page: int
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """
-    Dedicated Filter & Sort Sub-Menu (Progressive Disclosure).
-    Keeps the main file list completely clutter-free while offering ALL 8 media filters + 5 sort modes!
-    """
-    cur_flt_lbl = FILTER_LABELS.get(flt, "All Files")
+    cur_flt_lbl = FILTER_LABELS.get(flt, "All")
     cur_sort_lbl = SORT_LABELS.get(sort_key, "Newest")
 
     text = (
-        f"{breadcrumb('Vault', 'My Files', 'Filter & Sort')}\n"
-        f"🌪️ <b>Filter & Sort Options</b>\n\n"
-        f"<blockquote>"
-        f"<b>Active Filter:</b> {cur_flt_lbl}\n"
-        f"<b>Sort Order:</b> {cur_sort_lbl}"
-        f"</blockquote>\n\n"
-        f"<i>Choose a category or cycle the sort order:</i>"
+        f"{breadcrumb('Vault', 'Files', 'Filter')}\n"
+        f"🌪️ <b>Filter & Sort</b>\n"
+        f"<blockquote>Filter: <b>{cur_flt_lbl}</b>  ·  Sort: <b>{cur_sort_lbl}</b></blockquote>"
     )
 
     def _fbtn(key: str, lbl: str) -> InlineKeyboardButton:
@@ -254,29 +237,56 @@ def render_filter_sort_drawer(
             callback_data=f"bfs:{key}:{sort_key}:{gid}",
         )
 
-    next_idx = (SORT_ORDER.index(sort_key) + 1) % len(SORT_ORDER) if sort_key in SORT_ORDER else 0
+    next_idx = (
+        (SORT_ORDER.index(sort_key) + 1) % len(SORT_ORDER)
+        if sort_key in SORT_ORDER
+        else 0
+    )
     next_sort = SORT_ORDER[next_idx]
 
     rows = [
-        [_fbtn("all", "All Files"), _fbtn("fav", "⭐ Starred")],
+        [_fbtn("all", "All"), _fbtn("fav", "⭐ Starred")],
         [_fbtn("audio", "🎵 Audio"), _fbtn("video", "🎬 Video")],
         [_fbtn("doc", "📄 Docs"), _fbtn("photo", "🖼️ Photos")],
         [_fbtn("voice", "🎙️ Voice"), _fbtn("gif", "🎞️ GIFs")],
         [
             InlineKeyboardButton(
-                text=f"↕️ Sort: {cur_sort_lbl} (Tap to switch)",
+                text=f"↕️ Sort: {cur_sort_lbl}",
                 callback_data=f"bf:{flt}:{next_sort}:{gid}:0",
             )
         ],
         [
             InlineKeyboardButton(
-                text="✓ Done — View Files",
+                text="✓ Apply",
                 callback_data=f"br:{flt}:{sort_key}:{gid}:0",
                 style="primary",
             )
         ],
     ]
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _render_file_link_card(file_row: dict, bot_username: str) -> str:
+    icon = MEDIA_ICONS.get(file_row["media_type"], "📦")
+    has_link = bool(file_row.get("share_token"))
+    lines = [
+        breadcrumb("Vault", "File", "Link"),
+        f"🔗 <b>Share Link</b> · {icon} <b>{esc(file_row['title'][:30])}</b>",
+    ]
+    if not has_link:
+        lines.append(
+            "<blockquote>Create a public link with optional <b>PIN lock</b>, <b>No-Forward</b>, and <b>Auto-Expiry</b>.</blockquote>"
+        )
+    else:
+        url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
+        pin_status = "ON" if file_row.get("share_pin_hash") else "Off"
+        prot_status = "ON" if file_row.get("protect_share") else "Off"
+        exp_status = format_expiry_badge(file_row.get("share_expires_at"))
+        lines.append(
+            f"<blockquote>🔑 PIN: <b>{pin_status}</b> · 🛡️ No-Fwd: <b>{prot_status}</b> · ⏳ Expiry: <b>{exp_status}</b></blockquote>\n"
+            f"<code>{url}</code>"
+        )
+    return "\n".join(lines)
 
 
 async def render_trash_page(
@@ -293,21 +303,20 @@ async def render_trash_page(
     total_pages = max(1, (total + BROWSE_PAGE_SIZE - 1) // BROWSE_PAGE_SIZE)
 
     lines = [
-        breadcrumb("Vault", "Settings", "Trash"),
-        f"🗑️ <b>Recycle Trash</b> · <i>{total} item(s)</i>\n",
+        breadcrumb("Vault", "Trash"),
+        f"🗑️ <b>Trash</b> · <i>{total} item(s)</i>",
     ]
     buttons: list[list[InlineKeyboardButton]] = []
 
     if not items:
-        lines.append("<blockquote>Your recycle trash is clean.</blockquote>")
+        lines.append("<blockquote>Trash is empty.</blockquote>")
     else:
-        lines.append("<i>Tap an item to restore it or delete permanently:</i>")
         for f in items:
             icon = MEDIA_ICONS.get(f["media_type"], "📦")
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text=f"{icon} {f['title'][:32]}",
+                        text=f"{icon} {f['title'][:30]}",
                         callback_data=f"f:open:{f['id']}",
                     )
                 ]
@@ -316,29 +325,24 @@ async def render_trash_page(
     if page > 0 or has_next:
         nav_row: list[InlineKeyboardButton] = []
         if page > 0:
-            nav_row.append(InlineKeyboardButton(text="◀ Prev", callback_data=f"trash:{page - 1}"))
-        nav_row.append(InlineKeyboardButton(text=f"{page + 1} / {total_pages}", callback_data="noop"))
+            nav_row.append(InlineKeyboardButton(text="◀", callback_data=f"trash:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
         if has_next:
-            nav_row.append(InlineKeyboardButton(text="Next ▶", callback_data=f"trash:{page + 1}"))
+            nav_row.append(InlineKeyboardButton(text="▶", callback_data=f"trash:{page + 1}"))
         buttons.append(nav_row)
 
     if total > 0:
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text="💥 Empty Entire Trash",
+                    text="💥 Empty Trash",
                     callback_data="trash:empty_confirm",
                     style="danger",
                 )
             ]
         )
 
-    buttons.append(
-        [
-            back_btn("nav:settings", "◀ Settings"),
-            home_btn(),
-        ]
-    )
+    buttons.append([back_btn("nav:settings", "◀ Settings"), home_btn()])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -407,8 +411,8 @@ async def cmd_search(
     await state.set_state(SearchStates.waiting_for_query)
     await message.answer(
         f"{breadcrumb('Vault', 'Search')}\n"
-        f"🔎 <b>Search Your Vault</b>\n\n"
-        f"<blockquote>Type any keyword, artist, filename, or <code>#tag</code> below:</blockquote>",
+        f"🔎 <b>Search Vault</b>\n"
+        f"<blockquote>Send keyword, artist, filename, or <code>#tag</code>:</blockquote>",
         reply_markup=cancel_kb("br:all:def:0:0"),
     )
 
@@ -419,8 +423,8 @@ async def cb_search_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await safe_edit_or_send(
         callback,
         f"{breadcrumb('Vault', 'Search')}\n"
-        f"🔎 <b>Search Your Vault</b>\n\n"
-        f"<blockquote>Type any keyword, artist, filename, or <code>#tag</code> below:</blockquote>",
+        f"🔎 <b>Search Vault</b>\n"
+        f"<blockquote>Send keyword, artist, filename, or <code>#tag</code>:</blockquote>",
         cancel_kb("br:all:def:0:0"),
     )
     await callback.answer()
@@ -433,8 +437,8 @@ async def cb_search_prompt_ctx(callback: CallbackQuery, state: FSMContext) -> No
     await safe_edit_or_send(
         callback,
         f"{breadcrumb('Vault', 'Search')}\n"
-        f"🔎 <b>Search Your Vault</b>\n\n"
-        f"<blockquote>Type any keyword, artist, filename, or <code>#tag</code> below:</blockquote>",
+        f"🔎 <b>Search Vault</b>\n"
+        f"<blockquote>Send keyword, artist, filename, or <code>#tag</code>:</blockquote>",
         cancel_kb(back_target),
     )
     await callback.answer()
@@ -478,13 +482,12 @@ async def cb_trash_empty_confirm(callback: CallbackQuery, db: Database) -> None:
         return
     user = await db.get_user(callback.from_user.id)
     cnt = await db.count_trashed_files(user["vault_id"])
-    # Safe action LEFT, Destructive action RIGHT with danger style
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 back_btn("trash:0", "◀ Cancel"),
                 InlineKeyboardButton(
-                    text="💥 Delete All Forever",
+                    text="💥 Purge All",
                     callback_data="trash:empty_do",
                     style="danger",
                 ),
@@ -493,8 +496,7 @@ async def cb_trash_empty_confirm(callback: CallbackQuery, db: Database) -> None:
     )
     await safe_edit_or_send(
         callback,
-        f"⚠️ <b>Empty Recycle Trash?</b>\n\n"
-        f"<blockquote>This permanently deletes <b>{cnt}</b> file(s) from your vault. This cannot be undone.</blockquote>",
+        f"⚠️ <b>Empty Trash ({cnt})?</b>\n<blockquote>Permanently deletes all trashed files.</blockquote>",
         kb,
     )
     await callback.answer()
@@ -508,7 +510,7 @@ async def cb_trash_empty_do(callback: CallbackQuery, db: Database) -> None:
     removed = await db.empty_trash(user["vault_id"])
     text, kb = await render_trash_page(callback.from_user.id, 0, db)
     await safe_edit_or_send(callback, text, kb)
-    await callback.answer(f"Deleted {removed} file(s) forever.")
+    await callback.answer(f"Purged {removed} file(s).")
 
 
 @router.callback_query(F.data.startswith("trash:"))
@@ -528,7 +530,6 @@ async def cb_trash_list(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 
-# Legacy browse:0 compatibility + new br:flt:sort:gid:page
 @router.callback_query(F.data.startswith("browse:"))
 async def cb_legacy_browse(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
@@ -607,7 +608,6 @@ async def cb_open_file(callback: CallbackQuery, db: Database, bot: Bot) -> None:
 async def cb_open_file_manage(
     callback: CallbackQuery, db: Database, bot: Bot
 ) -> None:
-    """Opens the Progressive Disclosure Level-2 'Edit & More' file drawer."""
     if not callback.from_user:
         return
     if callback.data.startswith("fm:"):
@@ -632,6 +632,35 @@ async def cb_open_file_manage(
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("fsl:") | F.data.startswith("f:link:"))
+async def cb_open_file_link_panel(
+    callback: CallbackQuery, db: Database, bot: Bot
+) -> None:
+    """Opens the dedicated Share Link & Security panel (PIN, No-Fwd, Expiry)."""
+    if not callback.from_user:
+        return
+    if callback.data.startswith("fsl:"):
+        parts = callback.data.split(":", 2)
+        fid = int(parts[1])
+        back_cb: Optional[str] = parts[2] if len(parts) > 2 else None
+    else:
+        fid = int(callback.data.split(":")[2])
+        back_cb = None
+
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or not await db.can_vault_access_file(user["vault_id"], f):
+        await callback.answer("File not found.", show_alert=True)
+        return
+    me = await bot.get_me()
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(f, me.username or ""),
+        build_file_link_keyboard(f, back_cb=back_cb, bot_username=me.username or ""),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("f:get:"))
 async def cb_get_file_here(callback: CallbackQuery, db: Database, bot: Bot) -> None:
     if not callback.from_user or not callback.message:
@@ -642,11 +671,17 @@ async def cb_get_file_here(callback: CallbackQuery, db: Database, bot: Bot) -> N
     if not f or not await db.can_vault_access_file(user["vault_id"], f):
         await callback.answer("File not found.", show_alert=True)
         return
-    ok = await send_stored_media(bot, callback.message.chat.id, f)
-    if ok:
-        await callback.answer("📥 Sent to chat!")
+    sent = await send_stored_media(
+        bot,
+        callback.message.chat.id,
+        f,
+        protect_content=bool(user.get("protect_content")),
+        auto_delete_ttl=int(user.get("auto_delete_ttl") or 0),
+    )
+    if sent:
+        await callback.answer("📥 Sent!")
     else:
-        await callback.answer("Unsupported media format.", show_alert=True)
+        await callback.answer("Unsupported format.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("ffav:") | F.data.startswith("f:fav:"))
@@ -674,7 +709,7 @@ async def cb_toggle_fav(callback: CallbackQuery, db: Database, bot: Bot) -> None
         build_file_card_text(updated, me.username or ""),
         build_file_keyboard(updated, back_cb=back_cb, bot_username=me.username or ""),
     )
-    await callback.answer("⭐ Starred!" if is_fav else "Removed from Starred")
+    await callback.answer("⭐ Starred" if is_fav else "Unstarred")
 
 
 @router.callback_query(F.data.startswith("fsh:") | F.data.startswith("f:share:"))
@@ -699,10 +734,107 @@ async def cb_toggle_share(callback: CallbackQuery, db: Database, bot: Bot) -> No
     me = await bot.get_me()
     await safe_edit_or_send(
         callback,
-        build_file_card_text(updated, me.username or "", edit_mode=True),
-        build_file_manage_keyboard(updated, back_cb=back_cb, bot_username=me.username or ""),
+        _render_file_link_card(updated, me.username or ""),
+        build_file_link_keyboard(updated, back_cb=back_cb, bot_username=me.username or ""),
     )
-    await callback.answer("🔗 Public link created!" if token else "Public link revoked")
+    await callback.answer("🔗 Link ready!" if token else "Link revoked")
+
+
+@router.callback_query(F.data.startswith("f:prot:"))
+async def cb_file_toggle_protect(
+    callback: CallbackQuery, db: Database, bot: Bot
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    on = await db.toggle_file_protect_share(fid)
+    updated = await db.get_file(fid)
+    me = await bot.get_me()
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(updated, me.username or ""),
+        build_file_link_keyboard(updated, bot_username=me.username or ""),
+    )
+    await callback.answer("🛡️ No-Forward ON" if on else "No-Forward OFF")
+
+
+@router.callback_query(F.data.startswith("f:exp:"))
+async def cb_file_cycle_expiry(
+    callback: CallbackQuery, db: Database, bot: Bot
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    new_exp = await db.cycle_file_share_expiry(fid)
+    updated = await db.get_file(fid)
+    me = await bot.get_me()
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(updated, me.username or ""),
+        build_file_link_keyboard(updated, bot_username=me.username or ""),
+    )
+    await callback.answer(f"⏳ Expiry: {format_expiry_badge(new_exp)}")
+
+
+@router.callback_query(F.data.startswith("f:pin:"))
+async def cb_file_pin_prompt(
+    callback: CallbackQuery, state: FSMContext, db: Database
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    await state.set_state(FileEditStates.waiting_for_share_pin)
+    await state.update_data(edit_file_id=fid)
+    status = "ON" if f.get("share_pin_hash") else "Off"
+    await safe_edit_or_send(
+        callback,
+        f"🔑 <b>Link PIN Lock</b> · <i>{status}</i>\n"
+        f"<blockquote>Send a PIN/password (up to 24 chars), or <code>-</code> to clear:</blockquote>",
+        cancel_kb(f"f:link:{fid}"),
+    )
+    await callback.answer()
+
+
+@router.message(FileEditStates.waiting_for_share_pin)
+async def fsm_save_file_pin(
+    message: Message, state: FSMContext, db: Database, bot: Bot
+) -> None:
+    if not message.text:
+        return
+    data = await state.get_data()
+    fid = data.get("edit_file_id")
+    await state.clear()
+    if not fid:
+        return
+    raw = message.text.strip()
+    pin = None if raw == "-" else raw[:24]
+    await db.set_file_share_pin(fid, pin)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    updated = await db.get_file(fid)
+    me = await bot.get_me()
+    await message.answer(
+        _render_file_link_card(updated, me.username or ""),
+        reply_markup=build_file_link_keyboard(updated, bot_username=me.username or ""),
+        disable_web_page_preview=True,
+    )
 
 
 @router.callback_query(F.data.startswith("f:trash:") | F.data.startswith("f:del:"))
@@ -713,38 +845,32 @@ async def cb_trash_file(callback: CallbackQuery, db: Database) -> None:
     user = await db.get_user(callback.from_user.id)
     f = await db.get_file(fid)
     if not f or f["vault_id"] != user["vault_id"]:
-        await callback.answer("Only the vault owner can trash this file.", show_alert=True)
+        await callback.answer("Owner only.", show_alert=True)
         return
     await db.trash_file(fid)
-    # Safe Undo action LEFT (success), Permanent Delete RIGHT (danger)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="↩️ Undo (Restore)",
+                    text="↩️ Undo",
                     callback_data=f"f:restore:{fid}",
                     style="success",
                 ),
                 InlineKeyboardButton(
-                    text="💥 Delete Forever",
+                    text="💥 Purge",
                     callback_data=f"f:purge:{fid}",
                     style="danger",
                 ),
             ],
-            [
-                back_btn("br:all:def:0:0", "◀ My Files"),
-                home_btn(),
-            ],
+            [back_btn("br:all:def:0:0", "◀ Files"), home_btn()],
         ]
     )
     await safe_edit_or_send(
         callback,
-        f"🗑️ <b>Moved to Trash</b>\n\n"
-        f"<blockquote><b>{esc(f['title'])}</b> was moved to Recycle Trash.\n"
-        f"Tap <b>Undo</b> below to restore it immediately.</blockquote>",
+        f"🗑️ <b>Moved to Trash</b>\n<blockquote><b>{esc(f['title'])}</b> — tap Undo to restore.</blockquote>",
         kb,
     )
-    await callback.answer("Moved to Trash")
+    await callback.answer("Trashed")
 
 
 @router.callback_query(F.data.startswith("f:restore:"))
@@ -763,7 +889,7 @@ async def cb_restore_file(callback: CallbackQuery, db: Database, bot: Bot) -> No
     await safe_edit_or_send(
         callback,
         build_file_card_text(
-            restored, me.username or "", header_badge="♻️ <b>Restored to Vault</b>"
+            restored, me.username or "", header_badge="♻️ <b>Restored</b>"
         ),
         build_file_keyboard(restored, bot_username=me.username or ""),
     )
@@ -778,18 +904,17 @@ async def cb_purge_file(callback: CallbackQuery, db: Database) -> None:
     user = await db.get_user(callback.from_user.id)
     f = await db.get_file(fid)
     if not f or f["vault_id"] != user["vault_id"]:
-        await callback.answer("Only the vault owner can delete this file.", show_alert=True)
+        await callback.answer("Owner only.", show_alert=True)
         return
     await safe_edit_or_send(
         callback,
-        f"⚠️ <b>Delete Forever?</b>\n\n"
-        f"<blockquote>Permanently remove <b>{esc(f['title'])}</b>? This cannot be undone.</blockquote>",
+        f"⚠️ <b>Purge Forever?</b>\n<blockquote>Remove <b>{esc(f['title'])}</b> permanently?</blockquote>",
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     back_btn(f"f:open:{fid}", "◀ Cancel"),
                     InlineKeyboardButton(
-                        text="💥 Confirm Delete",
+                        text="💥 Delete",
                         callback_data=f"f:purge_do:{fid}",
                         style="danger",
                     ),
@@ -808,23 +933,15 @@ async def cb_purge_file_do(callback: CallbackQuery, db: Database) -> None:
     user = await db.get_user(callback.from_user.id)
     f = await db.get_file(fid)
     if not f or f["vault_id"] != user["vault_id"]:
-        await callback.answer("Only the vault owner can delete this file.", show_alert=True)
+        await callback.answer("Owner only.", show_alert=True)
         return
     await db.delete_file(fid)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                back_btn("trash:0", "◀ Trash"),
-                home_btn(),
-            ]
-        ]
-    )
     await safe_edit_or_send(
         callback,
-        f"💥 <b>Permanently Deleted</b>\n<blockquote><b>{esc(f['title'])}</b> has been removed.</blockquote>",
-        kb,
+        f"💥 <b>Deleted</b> · <i>{esc(f['title'])}</i>",
+        InlineKeyboardMarkup(inline_keyboard=[[back_btn("trash:0", "◀ Trash"), home_btn()]]),
     )
-    await callback.answer("Deleted forever")
+    await callback.answer("Deleted")
 
 
 @router.callback_query(F.data.startswith("f:rename:"))
@@ -841,10 +958,7 @@ async def cb_rename_prompt(callback: CallbackQuery, state: FSMContext, db: Datab
     await state.update_data(edit_file_id=fid)
     await safe_edit_or_send(
         callback,
-        f"{breadcrumb('Vault', 'Manage File', 'Rename')}\n"
-        f"✏️ <b>Rename File</b>\n\n"
-        f"<blockquote>Current: <code>{esc(f['title'])}</code></blockquote>\n\n"
-        f"<i>Send the new title below:</i>",
+        f"✏️ <b>Rename File</b>\n<blockquote><code>{esc(f['title'])}</code></blockquote>\n<i>Send new title:</i>",
         cancel_kb(f"f:manage:{fid}"),
     )
     await callback.answer()
@@ -869,7 +983,7 @@ async def fsm_save_title(
     me = await bot.get_me()
     await message.answer(
         build_file_card_text(
-            updated, me.username or "", header_badge="✅ <b>Title Updated</b>"
+            updated, me.username or "", header_badge="✅ <b>Renamed</b>"
         ),
         reply_markup=build_file_keyboard(updated, bot_username=me.username or ""),
         disable_web_page_preview=True,
@@ -891,10 +1005,7 @@ async def cb_tags_prompt(callback: CallbackQuery, state: FSMContext, db: Databas
     cur_tags = f"<code>{esc(f['tags'])}</code>" if f.get("tags") else "<i>None</i>"
     await safe_edit_or_send(
         callback,
-        f"{breadcrumb('Vault', 'Manage File', 'Tags')}\n"
-        f"🏷️ <b>Edit Tags</b>\n\n"
-        f"<blockquote><b>{esc(f['title'])}</b>\nCurrent: {cur_tags}</blockquote>\n\n"
-        f"<i>Send hashtags (e.g. <code>#lofi #chill</code>) or <code>-</code> to clear:</i>",
+        f"🏷️ <b>Edit Tags</b> · {cur_tags}\n<blockquote>Send hashtags (e.g. <code>#lofi #work</code>) or <code>-</code> to clear:</blockquote>",
         cancel_kb(f"f:manage:{fid}"),
     )
     await callback.answer()
@@ -923,7 +1034,7 @@ async def fsm_save_tags(
     me = await bot.get_me()
     await message.answer(
         build_file_card_text(
-            updated, me.username or "", header_badge="✅ <b>Tags Updated</b>"
+            updated, me.username or "", header_badge="✅ <b>Tags Saved</b>"
         ),
         reply_markup=build_file_keyboard(updated, bot_username=me.username or ""),
         disable_web_page_preview=True,
@@ -942,13 +1053,10 @@ async def cb_caption_prompt(callback: CallbackQuery, state: FSMContext, db: Data
         return
     await state.set_state(FileEditStates.waiting_for_caption)
     await state.update_data(edit_file_id=fid)
-    cur_cap = f"<i>{esc(f['caption'][:120])}</i>" if f.get("caption") else "<i>None</i>"
+    cur_cap = f"<i>{esc(f['caption'][:90])}</i>" if f.get("caption") else "<i>None</i>"
     await safe_edit_or_send(
         callback,
-        f"{breadcrumb('Vault', 'Manage File', 'Caption')}\n"
-        f"💬 <b>Inline Caption</b>\n\n"
-        f"<blockquote><b>{esc(f['title'])}</b>\nCurrent: {cur_cap}</blockquote>\n\n"
-        f"<i>Send caption text for inline shares, or <code>-</code> to clear:</i>",
+        f"💬 <b>Caption</b> · {cur_cap}\n<blockquote>Send caption text or <code>-</code> to clear:</blockquote>",
         cancel_kb(f"f:manage:{fid}"),
     )
     await callback.answer()
@@ -972,7 +1080,7 @@ async def fsm_save_caption(
     me = await bot.get_me()
     await message.answer(
         build_file_card_text(
-            updated, me.username or "", header_badge="✅ <b>Caption Updated</b>"
+            updated, me.username or "", header_badge="✅ <b>Caption Saved</b>"
         ),
         reply_markup=build_file_keyboard(updated, bot_username=me.username or ""),
         disable_web_page_preview=True,
@@ -992,14 +1100,13 @@ async def cb_move_menu(callback: CallbackQuery, db: Database) -> None:
     groups = await db.list_vault_groups(user["vault_id"])
 
     buttons: list[list[InlineKeyboardButton]] = []
-    # Arrange folders neatly in up to 2 columns if multiple exist
     row_buf: list[InlineKeyboardButton] = []
     for g in groups:
         icon = "👥" if g["is_shared"] else "📁"
         prefix = "✅ " if f.get("group_id") == g["id"] else f"{icon} "
         row_buf.append(
             InlineKeyboardButton(
-                text=f"{prefix}{g['name'][:18]}",
+                text=f"{prefix}{g['name'][:16]}",
                 callback_data=f"f:setgrp:{fid}:{g['id']}",
             )
         )
@@ -1013,23 +1120,21 @@ async def cb_move_menu(callback: CallbackQuery, db: Database) -> None:
     buttons.append(
         [
             InlineKeyboardButton(
-                text=f"{unassigned_prefix}Personal Vault (Root)",
+                text=f"{unassigned_prefix}Personal Vault",
                 callback_data=f"f:setgrp:{fid}:0",
             )
         ]
     )
     buttons.append(
         [
-            InlineKeyboardButton(text="➕ New Folder", callback_data="grp:new:personal"),
+            InlineKeyboardButton(text="➕ Folder", callback_data="grp:new:personal"),
             back_btn(f"f:manage:{fid}", "◀ Back"),
         ]
     )
 
     await safe_edit_or_send(
         callback,
-        f"{breadcrumb('Vault', 'Manage File', 'Move')}\n"
-        f"📁 <b>Move to Folder</b>\n\n"
-        f"<blockquote>Select a destination for <b>{esc(f['title'])}</b>:</blockquote>",
+        f"📁 <b>Move File</b>\n<blockquote><b>{esc(f['title'][:36])}</b></blockquote>",
         InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await callback.answer()
@@ -1054,4 +1159,4 @@ async def cb_set_file_group(callback: CallbackQuery, db: Database, bot: Bot) -> 
         build_file_card_text(updated, me.username or ""),
         build_file_keyboard(updated, bot_username=me.username or ""),
     )
-    await callback.answer("📁 Moved to folder!")
+    await callback.answer("📁 Moved!")

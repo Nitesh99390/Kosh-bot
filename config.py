@@ -13,6 +13,9 @@ class Config:
     db_path: str
     inline_page_size: int
     link_code_ttl_seconds: int
+    force_sub_channel: str = ""
+    force_sub_url: str = ""
+    rate_limit_interval: float = 0.35
 
 
 def load_config() -> Config:
@@ -39,6 +42,9 @@ def load_config() -> Config:
     db_path = os.getenv("DB_PATH", "data/koshbox.db").strip() or "data/koshbox.db"
     inline_page_size = min(max(int(os.getenv("INLINE_PAGE_SIZE", "25")), 5), 50)
     link_code_ttl = max(int(os.getenv("LINK_CODE_TTL_SECONDS", "300")), 60)
+    force_sub_channel = os.getenv("FORCE_SUB_CHANNEL", "").strip()
+    force_sub_url = os.getenv("FORCE_SUB_URL", "").strip()
+    rate_limit_interval = max(float(os.getenv("RATE_LIMIT_INTERVAL", "0.35")), 0.0)
 
     return Config(
         bot_token=bot_token,
@@ -47,4 +53,7 @@ def load_config() -> Config:
         db_path=db_path,
         inline_page_size=inline_page_size,
         link_code_ttl_seconds=link_code_ttl,
+        force_sub_channel=force_sub_channel,
+        force_sub_url=force_sub_url,
+        rate_limit_interval=rate_limit_interval,
     )

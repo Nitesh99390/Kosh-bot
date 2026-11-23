@@ -5,6 +5,18 @@ class FileEditStates(StatesGroup):
     waiting_for_title = State()
     waiting_for_tags = State()
     waiting_for_caption = State()
+    waiting_for_share_pin = State()
+
+
+class ShareUnlockStates(StatesGroup):
+    waiting_for_file_pin = State()
+    waiting_for_pack_pin = State()
+
+
+class PackStates(StatesGroup):
+    collecting_items = State()
+    waiting_for_title = State()
+    waiting_for_pin = State()
 
 
 class GroupStates(StatesGroup):
@@ -24,3 +36,4 @@ class SearchStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
+    waiting_for_ban_uid = State()

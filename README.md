@@ -1,58 +1,63 @@
-# KoshBox — Modern Telegram Cloud Vault & Inline Bot
+# KoshBox — Pro Telegram Cloud Vault, Pack-Store & Inline Bot
 
-A fast, lightweight, Oracle Cloud–ready Telegram bot with a **clean, Progressive-Disclosure UI/UX** that archives your media & files into a private Dump Channel and lets you search and send them from **any chat** via Telegram's native **Inline Menu** (`@YourBot query`).
+A fast, lightweight, Oracle Cloud–ready Telegram bot inspired by **Linear / Raycast UI** and flagship open-source **Telegram FileStore + Inline Vault** architectures (`Codeflix-Bots/FileStore`, `VJ-File-Store`, `PostBot`, `aiogram-sentinel`).
 
-## Highlights & Professional UI/UX Architecture
-- **PostBot-Style 3D Visual Banner Cards (One-Time Dump Channel Cache)**:
-  - Custom 3D KoshBox mascot banners (`assets/banners/welcome.jpg`, `upload.jpg`, `guide.jpg`) give `/start`, Inline Upload (`/start upload`), `/help`, and `/accounts` a polished, premium visual header card.
-  - **Zero Repeated Server Uploads**: On first startup, the bot uploads each banner **once** from the server to your private `DUMP_CHANNEL_ID` and saves its Telegram `file_id` + `SHA-256` hash in SQLite (`ui_assets`). Every subsequent card render or navigation transition reuses Telegram's cached `file_id` with zero disk/network upload overhead.
-- **Progressive Disclosure & Zero Button Clutter**:
-  - **Hero Dashboard (`/start`)**: Focused 3-row layout (`🔍 Search Vault Inline`, `📦 My Files`, `📁 Folders`, `⭐ Favorites`, `⚙️ Settings & Tools`) with native HTML `<blockquote>` cards and breadcrumb navigation.
-  - **Clean Upload Receipts**: Uploading a file returns a minimal 2-row receipt (`📤 Send to Chat` + `🛠️ Edit & Organize`) instead of spamming 11 buttons under every message.
-  - **2-Tier File Detail & Management**: Primary File Card shows only essential actions (`📥 Get Here`, `📤 Send to Chat`, `⭐ Star`, `🛠️ Edit & More`), while Rename, Move Folder, Tags, Caption, Public Link, and Trash live neatly inside the `🛠️ Edit & More` drawer.
-  - **Native Telegram Bot API 9.4 Styling & One-Tap Copy**: Uses `style="primary"`, `style="success"`, `style="danger"` button accents plus native `CopyTextButton` (`📋 Copy Public Link`, `📋 Copy Group Invite Link`, `📋 Copy Sync Code`) and safe-left / destructive-right confirmations.
-- **Mobile-First File Browser (`/files`, `/search`)**:
-  - Clean 5-item pages with a dedicated `🌪️ Filter & Sort` drawer supporting **All, ⭐ Starred, 🎵 Audio, 🎬 Video, 📄 Docs, 🖼️ Photos, 🎙️ Voice, 🎞️ GIFs** and 5 sort modes (**Newest, Most Used, A–Z, Largest, Oldest**).
-- **2-Column Folders & Collaborative Shared Groups (`/groups`)**:
-  - Compact 2-column folder grid, `+ Create or Join` action menu, one-tap invite link copying, and `⚙️ Manage` sub-drawer for Rename, Reset Invite, and Leave/Delete.
-- **Safe Recycle Trash & Instant Undo (`/trash`)**:
-  - Deleting a file moves it to **Trash** with a green **↩️ Undo (Restore)** button and a 2-step confirmation before permanent deletion.
-- **Native Inline Search (`@YourBot query`)**:
-  - Personal vault isolation (`is_personal=True`) with hybrid **SQLite FTS5** + substring matching and infinite scroll.
-  - Inline modifiers: `type:audio`, `type:video`, `type:doc`, `type:photo`, `type:voice`, `type:gif`, `type:sticker`, `g:folder`, `#tag`, `fav`, `top`, `sort:az`, `sort:size`.
-- **Multi-Account Real-Time Sync (`/accounts`, `/link`, `/verify`)**:
-  - Connect secondary Telegram accounts via one-tap copyable link or 6-character code with **Approve / Reject** owner verification.
-- **Visual Analytics (`/stats`) & Interactive Admin Console (`/admin`)**:
-  - Progress-bar media breakdown, top sent inline files, 24h active user metrics, one-tap SQLite snapshot backup, and rich broadcast.
+Archive any file, album, or media into your private Dump Channel once — then search & send from **any chat** via Inline Mode (`@YourBot query`) or share **PIN-locked, expiring, forward-protected File & Multi-File Pack links**.
+
+---
+
+## Key Pro Capabilities & Ultra-Short UI/UX
+
+- **Ultra-Short, Crisp Card Design (Zero Clutter)**:
+  - Compact 3–4 line scannable headers with native `<blockquote>` cards, subtle breadcrumbs (`Vault › Files`), and clean 2-column button grids.
+  - Native Telegram Bot API 9.4 styling (`style="primary"`, `style="success"`, `style="danger"`), one-tap `CopyTextButton` (`📋 Copy Link`, `📋 Copy Code`), and native Telegram Share Sheet (`↗️ Share`).
+- **One-Time Dump Channel 3D Banner Cache**:
+  - Custom 3D mascot banners (`assets/banners/*.jpg`) upload **once** to `DUMP_CHANNEL_ID` on startup and reuse cached Telegram `file_id` + `SHA-256` forever with zero repeated server uploads.
+- **Multi-File Packs / Batch Link Builder (`/packs`, `/batch`)**:
+  - Bundle multiple files into **one shareable link** (`?start=pack_<TOKEN>`).
+  - Create packs interactively via `/batch` + `/done`, **1-tap from any uploaded Media Album** (`🎒 Create Pack Link`), or **1-tap from any Folder** (`🎒 Pack All into Link`).
+  - Inline Pack sharing: type `@YourBot packs` in any chat to send interactive Pack cards!
+- **Advanced Link Security (PIN Lock, No-Forward, Auto-Expiry)**:
+  - Protect both **Single-File Links** and **Multi-File Packs** with:
+    - `🔑 PIN Lock` (salted SHA-256 + constant-time `hmac` check; auto-deletes user PIN messages).
+    - `🛡️ No-Fwd` (`protect_content=True` — blocks forwarding, saving, and screenshots in Telegram).
+    - `⏳ Expiry Timer` (`1h` / `24h` / `7d` / `Never`).
+- **Auto-Delete Delivery Timer (`/settings`)**:
+  - Optional self-destruct timer (`Off` / `5m` / `15m` / `1h` / `24h`) that automatically cleans up delivered files and packs from user chats.
+- **Outer Guard & Anti-Flood Middleware**:
+  - Built-in rate-limiting (`RATE_LIMIT_INTERVAL`, album-aware so multi-file drops never throttle), user Ban/Unban guard, and optional **Force-Subscribe Channel Gate** (`FORCE_SUB_CHANNEL`).
+- **Hybrid FTS5 Instant Inline Search (`@YourBot`)**:
+  - Supports `t:audio`, `t:video`, `t:doc`, `t:photo`, `t:voice`, `t:gif`, `t:sticker`, `g:folder`, `#tag`, `fav`, `top`, `packs`, `s:az`, `s:size`.
+- **Folders, Shared Collaborative Groups & Multi-Account Sync**:
+  - 2-column folder grid, invite-code collaborative groups (`/groups`), safe Recycle Trash with 1-tap Undo (`/trash`), and real-time multi-account vault merging (`/accounts`, `/link`, `/verify`).
 
 ---
 
 ## Step 1: Telegram & BotFather Setup
 
-1. Open [@BotFather](https://t.me/BotFather) and create a bot with `/newbot` → copy your `BOT_TOKEN`.
-2. **Enable Inline Mode** (required for `@BotUsername` search in any chat):
-   - Send `/setinline` to `@BotFather` → select your bot → set placeholder: `Search vault (or type:audio, g:folder, fav, top)...`
-3. **Recommended**: Send `/setinlinefeedback` → select your bot → choose `100%` so "Most Used" counters update automatically.
-4. **Create a Private Dump Channel**:
-   - Create a private Telegram Channel and add your bot as **Administrator** with **Post Messages** permission.
-   - Copy the channel ID (starts with `-100...`).
+1. Create a bot in [@BotFather](https://t.me/BotFather) with `/newbot` → copy `BOT_TOKEN`.
+2. **Enable Inline Mode**:
+   - Send `/setinline` to `@BotFather` → select your bot → placeholder: `Search vault (t:audio, g:folder, fav, packs)…`
+   - Send `/setinlinefeedback` → choose `100%` so popularity (`top`) counters update automatically.
+3. **Create a Private Dump Channel**:
+   - Create a private Telegram Channel, add your bot as **Administrator** (`Post Messages`), and copy its ID (`-100...`).
 
 ---
 
-## Step 2: Deploy on Oracle Cloud (or Any Linux VPS)
+## Step 2: Deploy (Oracle Cloud / Any Linux VPS)
 
 1. Configure `.env`:
    ```bash
    cp .env.example .env
    nano .env
    ```
-   Set `BOT_TOKEN`, `DUMP_CHANNEL_ID`, and `ADMIN_IDS`.
-2. Run the automated installer (creates `.venv` + `systemd` 24/7 service):
+   Set `BOT_TOKEN`, `DUMP_CHANNEL_ID`, and `ADMIN_IDS` (optional: `FORCE_SUB_CHANNEL`, `RATE_LIMIT_INTERVAL`).
+2. Run the automated installer (`.venv` + `systemd` 24/7 service):
    ```bash
    chmod +x deploy_oracle.sh
    ./deploy_oracle.sh
    ```
-3. Check live status:
+3. Manage service:
    ```bash
    sudo systemctl status koshbox
    journalctl -u koshbox -f

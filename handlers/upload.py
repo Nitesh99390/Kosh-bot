@@ -3,6 +3,7 @@ import re
 from typing import Any, Optional
 
 from aiogram import Bot, F, Router
+from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import Config
@@ -14,6 +15,7 @@ from utils.formatters import (
     esc,
     home_btn,
 )
+from utils.states import PackStates
 
 router = Router(name="upload")
 
@@ -85,7 +87,7 @@ def _extract_media(msg: Message) -> Optional[dict[str, Any]]:
             "media_type": "video_note",
             "file_id": vn.file_id,
             "file_unique_id": vn.file_unique_id,
-            "title": f"Video Note ({vn.duration}s)",
+            "title": f"Round ({vn.duration}s)",
             "performer": "",
             "file_name": "",
             "mime_type": "video/mp4",
@@ -97,7 +99,7 @@ def _extract_media(msg: Message) -> Optional[dict[str, Any]]:
 
     if msg.voice:
         vc = msg.voice
-        title = caption[:60] if caption else f"Voice Note ({vc.duration}s)"
+        title = caption[:60] if caption else f"Voice ({vc.duration}s)"
         return {
             "media_type": "voice",
             "file_id": vc.file_id,
@@ -182,7 +184,7 @@ MEDIA_FILTER = (
 async def _flush_album_summary(
     album_key: str, anchor_message: Message
 ) -> None:
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(1.1)
     items = _ALBUM_BUFFER.pop(album_key, [])
     _ALBUM_TASKS.pop(album_key, None)
     if not items:
@@ -192,43 +194,52 @@ async def _flush_album_summary(
     dup_items = [x for x in items if x["status"] == "dup"]
 
     title_line = (
-        f"✅ <b>Album Archived</b> · <i>{len(saved_items)} saved"
-        + (f", {len(dup_items)} duplicate" if dup_items else "")
-        + "</i>\n"
+        f"✅ <b>Album Saved</b> · <i>{len(saved_items)} new"
+        + (f", {len(dup_items)} dup" if dup_items else "")
+        + "</i>"
     )
     list_lines: list[str] = []
-    for entry in items[:8]:
+    for entry in items[:6]:
         f = entry["file"]
         ic = MEDIA_ICONS.get(f["media_type"], "📦")
         badge = "♻️ " if entry["status"] == "dup" else ""
-        list_lines.append(f"• {badge}{ic} <b>{esc(f['title'][:34])}</b>")
-    if len(items) > 8:
-        list_lines.append(f"<i>…and {len(items) - 8} more item(s)</i>")
+        list_lines.append(f"• {badge}{ic} {esc(f['title'][:30])}")
+    if len(items) > 6:
+        list_lines.append(f"<i>…+{len(items) - 6} more</i>")
 
     body = title_line + "\n<blockquote>" + "\n".join(list_lines) + "</blockquote>"
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+    # Build 1-tap Pack callback if encoded IDs fit in 64 bytes
+    all_ids = [str(entry["file"]["id"]) for entry in items]
+    pack_cb = f"pk:quick_album:{','.join(all_ids)}"
+    action_row = [
+        InlineKeyboardButton(
+            text="📦 Files",
+            callback_data="br:all:def:0:0",
+        ),
+        InlineKeyboardButton(
+            text="🔍 Inline",
+            switch_inline_query_current_chat="",
+        ),
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    if len(pack_cb.encode("utf-8")) <= 64 and len(all_ids) >= 2:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="📦 Browse Files",
-                    callback_data="br:all:def:0:0",
+                    text="🎒 Create Pack Link",
+                    callback_data=pack_cb,
                     style="primary",
-                ),
-                InlineKeyboardButton(
-                    text="🔍 Open Inline",
-                    switch_inline_query_current_chat="",
-                ),
-            ],
-            [home_btn()],
-        ]
-    )
-    await anchor_message.reply(body, reply_markup=kb)
+                )
+            ]
+        )
+    rows.append(action_row)
+    await anchor_message.reply(body, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.message(F.chat.type == "private", MEDIA_FILTER)
 async def handle_media_upload(
-    message: Message, bot: Bot, db: Database, config: Config
+    message: Message, state: FSMContext, bot: Bot, db: Database, config: Config
 ) -> None:
     if not message.from_user:
         return
@@ -242,30 +253,26 @@ async def handle_media_upload(
     if not meta:
         return
 
+    cur_state = await state.get_state()
+    in_pack_builder = cur_state == PackStates.collecting_items.state
+
     existing = await db.find_duplicate(user["vault_id"], meta["file_unique_id"])
     me = await bot.get_me()
 
-    # Auto-restore if the duplicate was sitting in Recycle Trash
-    if existing and existing.get("is_trashed"):
-        await db.restore_file(existing["id"])
-        restored = await db.get_file(existing["id"])
-        await message.reply(
-            build_file_card_text(
-                restored,
-                me.username or "",
-                header_badge="♻️ <b>Restored from Trash</b>",
-            ),
-            reply_markup=build_upload_quick_keyboard(restored),
-            disable_web_page_preview=True,
-        )
-        return
-
     if existing:
-        existing_full = await db.get_file(existing["id"])
+        if existing.get("is_trashed"):
+            await db.restore_file(existing["id"])
+        target_file = await db.get_file(existing["id"])
+        assert target_file is not None
+
+        if in_pack_builder:
+            await _append_to_pack_builder(message, state, target_file)
+            return
+
         if message.media_group_id:
             album_key = f"{user['user_id']}:{message.media_group_id}"
             _ALBUM_BUFFER.setdefault(album_key, []).append(
-                {"status": "dup", "file": existing_full}
+                {"status": "dup", "file": target_file}
             )
             if album_key not in _ALBUM_TASKS:
                 _ALBUM_TASKS[album_key] = asyncio.create_task(
@@ -274,15 +281,16 @@ async def handle_media_upload(
             return
 
         if user["bulk_mode"]:
-            await message.reply(f"♻️ <i>Already archived:</i> <b>{esc(existing_full['title'])}</b>")
+            await message.reply(f"♻️ <i>In Vault:</i> <b>{esc(target_file['title'])}</b>")
         else:
+            badge = (
+                "♻️ <b>Restored</b>"
+                if existing.get("is_trashed")
+                else "♻️ <b>Already Saved</b>"
+            )
             await message.reply(
-                build_file_card_text(
-                    existing_full,
-                    me.username or "",
-                    header_badge="♻️ <b>Already in Your Vault</b>",
-                ),
-                reply_markup=build_upload_quick_keyboard(existing_full),
+                build_file_card_text(target_file, me.username or "", header_badge=badge),
+                reply_markup=build_upload_quick_keyboard(target_file),
                 disable_web_page_preview=True,
             )
         return
@@ -296,8 +304,8 @@ async def handle_media_upload(
         )
     except Exception as exc:
         await message.reply(
-            f"⚠️ <b>Archive Channel Error</b>\n\n"
-            f"<blockquote>Ensure @{esc(me.username)} is an <b>Administrator</b> in your Dump Channel with Post Messages permission.</blockquote>\n\n"
+            f"⚠️ <b>Dump Channel Error</b>\n"
+            f"<blockquote>Make @{esc(me.username)} Admin with Post Messages permission.</blockquote>\n"
             f"<code>{esc(str(exc))}</code>"
         )
         return
@@ -328,7 +336,11 @@ async def handle_media_upload(
         tags=meta["tags"],
     )
 
-    # Batch media albums cleanly into a single summary card
+    if in_pack_builder:
+        await _append_to_pack_builder(message, state, saved)
+        return
+
+    # Batch media albums cleanly into a single summary card with 1-tap Pack Link
     if message.media_group_id and not user["bulk_mode"]:
         album_key = f"{user['user_id']}:{message.media_group_id}"
         _ALBUM_BUFFER.setdefault(album_key, []).append(
@@ -342,15 +354,45 @@ async def handle_media_upload(
 
     if user["bulk_mode"]:
         grp = f" · 📁 {esc(saved['group_name'])}" if saved.get("group_name") else ""
-        await message.reply(f"✅ <b>Archived:</b> {esc(saved['title'])}{grp}")
+        await message.reply(f"✅ <b>{esc(saved['title'])}</b>{grp}")
         return
 
     await message.reply(
         build_file_card_text(
             saved,
             me.username or "",
-            header_badge="✅ <b>Saved to Vault</b>",
+            header_badge="✅ <b>Saved</b>",
         ),
         reply_markup=build_upload_quick_keyboard(saved),
         disable_web_page_preview=True,
+    )
+
+
+async def _append_to_pack_builder(
+    message: Message, state: FSMContext, file_row: dict[str, Any]
+) -> None:
+    data = await state.get_data()
+    fids: list[int] = list(data.get("pack_file_ids") or [])
+    if file_row["id"] not in fids:
+        fids.append(file_row["id"])
+        await state.update_data(pack_file_ids=fids)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"✓ Finish Pack ({len(fids)})",
+                    callback_data="pk:finish",
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="✕ Cancel",
+                    callback_data="fsm:cancel:pk:list:0",
+                ),
+            ]
+        ]
+    )
+    await message.reply(
+        f"🎒 <b>Added #{len(fids)}:</b> {esc(file_row['title'][:36])}",
+        reply_markup=kb,
     )

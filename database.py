@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import os
 import secrets
 import string
@@ -11,6 +13,23 @@ def _gen_token(length: int = 8) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
+
+def hash_pin(pin: str) -> str:
+    salt = secrets.token_hex(8)
+    digest = hashlib.sha256(f"{salt}:{pin.strip()}".encode("utf-8")).hexdigest()
+    return f"{salt}${digest}"
+
+
+def verify_pin(pin: str, stored_hash: str) -> bool:
+    if not stored_hash or "$" not in stored_hash:
+        return False
+    salt, expected = stored_hash.split("$", 1)
+    actual = hashlib.sha256(f"{salt}:{pin.strip()}".encode("utf-8")).hexdigest()
+    return hmac.compare_digest(actual, expected)
+
+
+AUTO_DELETE_CYCLE = [0, 300, 900, 3600, 86400]
+SHARE_TTL_CYCLE = [0, 3600, 86400, 604800]
 
 SORT_CLAUSES = {
     "new": "f.is_favorite DESC, f.created_at DESC",
@@ -60,6 +79,9 @@ class Database:
                 active_group_id INTEGER DEFAULT NULL,
                 bulk_mode INTEGER DEFAULT 0,
                 default_sort TEXT DEFAULT 'new',
+                auto_delete_ttl INTEGER DEFAULT 0,
+                protect_content INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL,
                 FOREIGN KEY (vault_id) REFERENCES vaults(id)
@@ -106,6 +128,9 @@ class Database:
                 is_trashed INTEGER DEFAULT 0,
                 trashed_at INTEGER DEFAULT NULL,
                 share_token TEXT UNIQUE,
+                share_pin_hash TEXT DEFAULT '',
+                share_expires_at INTEGER DEFAULT NULL,
+                protect_share INTEGER DEFAULT 0,
                 use_count INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
@@ -138,6 +163,34 @@ class Database:
                 expires_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS packs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                creator_user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                share_token TEXT UNIQUE NOT NULL,
+                pin_hash TEXT DEFAULT '',
+                protect_content INTEGER DEFAULT 0,
+                expires_at INTEGER DEFAULT NULL,
+                views INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS pack_items (
+                pack_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                pos INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (pack_id, file_id),
+                FOREIGN KEY (pack_id) REFERENCES packs(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_packs_vault
+                ON packs(vault_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_packs_token
+                ON packs(share_token);
+
             CREATE TABLE IF NOT EXISTS ui_assets (
                 asset_key TEXT PRIMARY KEY,
                 file_id TEXT NOT NULL,
@@ -163,6 +216,18 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE users ADD COLUMN default_sort TEXT DEFAULT 'new';"
             )
+        if "auto_delete_ttl" not in user_cols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN auto_delete_ttl INTEGER DEFAULT 0;"
+            )
+        if "protect_content" not in user_cols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN protect_content INTEGER DEFAULT 0;"
+            )
+        if "is_banned" not in user_cols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0;"
+            )
 
         file_cols = await _table_cols("files")
         if "is_trashed" not in file_cols:
@@ -172,6 +237,18 @@ class Database:
         if "trashed_at" not in file_cols:
             await self.conn.execute(
                 "ALTER TABLE files ADD COLUMN trashed_at INTEGER DEFAULT NULL;"
+            )
+        if "share_pin_hash" not in file_cols:
+            await self.conn.execute(
+                "ALTER TABLE files ADD COLUMN share_pin_hash TEXT DEFAULT '';"
+            )
+        if "share_expires_at" not in file_cols:
+            await self.conn.execute(
+                "ALTER TABLE files ADD COLUMN share_expires_at INTEGER DEFAULT NULL;"
+            )
+        if "protect_share" not in file_cols:
+            await self.conn.execute(
+                "ALTER TABLE files ADD COLUMN protect_share INTEGER DEFAULT 0;"
             )
 
         await self.conn.commit()
@@ -240,6 +317,56 @@ class Database:
         )
         await self.conn.commit()
         return bool(new_val)
+
+    async def toggle_protect_content(self, user_id: int) -> bool:
+        assert self.conn is not None
+        user = await self.get_user(user_id)
+        new_val = 0 if (user and user.get("protect_content")) else 1
+        await self.conn.execute(
+            "UPDATE users SET protect_content = ? WHERE user_id = ?", (new_val, user_id)
+        )
+        await self.conn.commit()
+        return bool(new_val)
+
+    async def cycle_auto_delete_ttl(self, user_id: int) -> int:
+        assert self.conn is not None
+        user = await self.get_user(user_id)
+        cur_val = int((user or {}).get("auto_delete_ttl") or 0)
+        if cur_val in AUTO_DELETE_CYCLE:
+            nxt = AUTO_DELETE_CYCLE[(AUTO_DELETE_CYCLE.index(cur_val) + 1) % len(AUTO_DELETE_CYCLE)]
+        else:
+            nxt = 0
+        await self.conn.execute(
+            "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?", (nxt, user_id)
+        )
+        await self.conn.commit()
+        return nxt
+
+    async def set_auto_delete_ttl(self, user_id: int, ttl_seconds: int) -> int:
+        assert self.conn is not None
+        val = max(0, int(ttl_seconds))
+        await self.conn.execute(
+            "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?", (val, user_id)
+        )
+        await self.conn.commit()
+        return val
+
+    async def set_user_banned(self, user_id: int, banned: bool) -> bool:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "UPDATE users SET is_banned = ? WHERE user_id = ?",
+            (1 if banned else 0, user_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def is_user_banned(self, user_id: int) -> bool:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        return bool(row and row["is_banned"])
 
     async def set_default_sort(self, user_id: int, sort_key: str) -> str:
         assert self.conn is not None
@@ -349,6 +476,10 @@ class Database:
             )
             await self.conn.execute(
                 "UPDATE groups SET owner_vault_id = ? WHERE owner_vault_id = ?",
+                (target_vault_id, old_vault_id),
+            )
+            await self.conn.execute(
+                "UPDATE packs SET vault_id = ? WHERE vault_id = ?",
                 (target_vault_id, old_vault_id),
             )
             await self.conn.execute(
@@ -662,14 +793,17 @@ class Database:
 
     async def get_file_by_share_token(self, token: str) -> Optional[dict[str, Any]]:
         assert self.conn is not None
+        now = int(time.time())
         cur = await self.conn.execute(
             """
             SELECT f.*, COALESCE(g.name, '') AS group_name
             FROM files f
             LEFT JOIN groups g ON g.id = f.group_id
-            WHERE f.share_token = ? AND COALESCE(f.is_trashed, 0) = 0
+            WHERE f.share_token = ?
+              AND COALESCE(f.is_trashed, 0) = 0
+              AND (f.share_expires_at IS NULL OR f.share_expires_at = 0 OR f.share_expires_at >= ?)
             """,
-            (token,),
+            (token, now),
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -734,7 +868,12 @@ class Database:
             return None
         if f["share_token"]:
             await self.conn.execute(
-                "UPDATE files SET share_token = NULL WHERE id = ?", (db_file_id,)
+                """
+                UPDATE files
+                SET share_token = NULL, share_pin_hash = '', share_expires_at = NULL, protect_share = 0
+                WHERE id = ?
+                """,
+                (db_file_id,),
             )
             await self.conn.commit()
             return None
@@ -744,6 +883,49 @@ class Database:
         )
         await self.conn.commit()
         return token
+
+    async def set_file_share_pin(self, db_file_id: int, pin: Optional[str]) -> bool:
+        assert self.conn is not None
+        hashed = hash_pin(pin) if (pin and pin.strip()) else ""
+        await self.conn.execute(
+            "UPDATE files SET share_pin_hash = ? WHERE id = ?", (hashed, db_file_id)
+        )
+        await self.conn.commit()
+        return bool(hashed)
+
+    async def toggle_file_protect_share(self, db_file_id: int) -> bool:
+        assert self.conn is not None
+        f = await self.get_file(db_file_id)
+        new_val = 0 if (f and f.get("protect_share")) else 1
+        await self.conn.execute(
+            "UPDATE files SET protect_share = ? WHERE id = ?", (new_val, db_file_id)
+        )
+        await self.conn.commit()
+        return bool(new_val)
+
+    async def cycle_file_share_expiry(self, db_file_id: int) -> Optional[int]:
+        assert self.conn is not None
+        f = await self.get_file(db_file_id)
+        if not f:
+            return None
+        now = int(time.time())
+        cur_exp = f.get("share_expires_at")
+        remaining = max(0, int(cur_exp) - now) if cur_exp else 0
+        # Determine next step in SHARE_TTL_CYCLE [0, 3600, 86400, 604800]
+        if remaining == 0:
+            nxt_ttl = 3600
+        elif remaining <= 3600 + 60:
+            nxt_ttl = 86400
+        elif remaining <= 86400 + 60:
+            nxt_ttl = 604800
+        else:
+            nxt_ttl = 0
+        new_exp = (now + nxt_ttl) if nxt_ttl > 0 else None
+        await self.conn.execute(
+            "UPDATE files SET share_expires_at = ? WHERE id = ?", (new_exp, db_file_id)
+        )
+        await self.conn.commit()
+        return new_exp
 
     async def trash_file(self, db_file_id: int) -> None:
         assert self.conn is not None
@@ -817,6 +999,207 @@ class Database:
             "UPDATE files SET use_count = use_count + 1 WHERE id = ?", (db_file_id,)
         )
         await self.conn.commit()
+
+    # -------------------- PACKS / MULTI-FILE BUNDLES --------------------
+
+    async def create_pack(
+        self,
+        vault_id: int,
+        creator_user_id: int,
+        title: str,
+        file_ids: list[int],
+        *,
+        pin: Optional[str] = None,
+        protect_content: bool = False,
+        ttl_seconds: int = 0,
+    ) -> dict[str, Any]:
+        assert self.conn is not None
+        now = int(time.time())
+        token = _gen_token(10)
+        pin_h = hash_pin(pin) if (pin and pin.strip()) else ""
+        exp = (now + ttl_seconds) if ttl_seconds > 0 else None
+        cur = await self.conn.execute(
+            """
+            INSERT INTO packs (
+                vault_id, creator_user_id, title, share_token,
+                pin_hash, protect_content, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                vault_id,
+                creator_user_id,
+                title.strip() or "File Pack",
+                token,
+                pin_h,
+                1 if protect_content else 0,
+                exp,
+                now,
+            ),
+        )
+        pack_id = cur.lastrowid
+        seen: set[int] = set()
+        for idx, fid in enumerate(file_ids):
+            if fid in seen:
+                continue
+            seen.add(fid)
+            await self.conn.execute(
+                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, pos) VALUES (?, ?, ?)",
+                (pack_id, fid, idx),
+            )
+        await self.conn.commit()
+        res = await self.get_pack(pack_id)
+        assert res is not None
+        return res
+
+    async def get_pack(self, pack_id: int) -> Optional[dict[str, Any]]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            """
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM pack_items pi
+                    JOIN files f ON f.id = pi.file_id
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS item_count,
+                   (SELECT COALESCE(SUM(f.file_size), 0) FROM pack_items pi
+                    JOIN files f ON f.id = pi.file_id
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size
+            FROM packs p
+            WHERE p.id = ?
+            """,
+            (pack_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_pack_by_token(self, token: str) -> Optional[dict[str, Any]]:
+        assert self.conn is not None
+        now = int(time.time())
+        cur = await self.conn.execute(
+            """
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM pack_items pi
+                    JOIN files f ON f.id = pi.file_id
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS item_count,
+                   (SELECT COALESCE(SUM(f.file_size), 0) FROM pack_items pi
+                    JOIN files f ON f.id = pi.file_id
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size
+            FROM packs p
+            WHERE p.share_token = ?
+              AND (p.expires_at IS NULL OR p.expires_at = 0 OR p.expires_at >= ?)
+            """,
+            (token, now),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_pack_files(self, pack_id: int) -> list[dict[str, Any]]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            """
+            SELECT f.*, COALESCE(g.name, '') AS group_name
+            FROM pack_items pi
+            JOIN files f ON f.id = pi.file_id
+            LEFT JOIN groups g ON g.id = f.group_id
+            WHERE pi.pack_id = ? AND COALESCE(f.is_trashed, 0) = 0
+            ORDER BY pi.pos ASC, f.id ASC
+            """,
+            (pack_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def list_vault_packs(
+        self, vault_id: int, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            """
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM pack_items pi
+                    JOIN files f ON f.id = pi.file_id
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS item_count,
+                   (SELECT COALESCE(SUM(f.file_size), 0) FROM pack_items pi
+                    JOIN files f ON f.id = pi.file_id
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size
+            FROM packs p
+            WHERE p.vault_id = ?
+            ORDER BY p.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (vault_id, limit, offset),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def count_vault_packs(self, vault_id: int) -> int:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM packs WHERE vault_id = ?", (vault_id,)
+        )
+        return int((await cur.fetchone())[0])
+
+    async def set_pack_pin(self, pack_id: int, pin: Optional[str]) -> bool:
+        assert self.conn is not None
+        hashed = hash_pin(pin) if (pin and pin.strip()) else ""
+        await self.conn.execute(
+            "UPDATE packs SET pin_hash = ? WHERE id = ?", (hashed, pack_id)
+        )
+        await self.conn.commit()
+        return bool(hashed)
+
+    async def toggle_pack_protect(self, pack_id: int) -> bool:
+        assert self.conn is not None
+        p = await self.get_pack(pack_id)
+        new_val = 0 if (p and p.get("protect_content")) else 1
+        await self.conn.execute(
+            "UPDATE packs SET protect_content = ? WHERE id = ?", (new_val, pack_id)
+        )
+        await self.conn.commit()
+        return bool(new_val)
+
+    async def cycle_pack_expiry(self, pack_id: int) -> Optional[int]:
+        assert self.conn is not None
+        p = await self.get_pack(pack_id)
+        if not p:
+            return None
+        now = int(time.time())
+        cur_exp = p.get("expires_at")
+        remaining = max(0, int(cur_exp) - now) if cur_exp else 0
+        if remaining == 0:
+            nxt_ttl = 3600
+        elif remaining <= 3600 + 60:
+            nxt_ttl = 86400
+        elif remaining <= 86400 + 60:
+            nxt_ttl = 604800
+        else:
+            nxt_ttl = 0
+        new_exp = (now + nxt_ttl) if nxt_ttl > 0 else None
+        await self.conn.execute(
+            "UPDATE packs SET expires_at = ? WHERE id = ?", (new_exp, pack_id)
+        )
+        await self.conn.commit()
+        return new_exp
+
+    async def regenerate_pack_token(self, pack_id: int) -> str:
+        assert self.conn is not None
+        token = _gen_token(10)
+        await self.conn.execute(
+            "UPDATE packs SET share_token = ? WHERE id = ?", (token, pack_id)
+        )
+        await self.conn.commit()
+        return token
+
+    async def increment_pack_views(self, pack_id: int) -> None:
+        assert self.conn is not None
+        await self.conn.execute(
+            "UPDATE packs SET views = views + 1 WHERE id = ?", (pack_id,)
+        )
+        await self.conn.commit()
+
+    async def delete_pack(self, pack_id: int, vault_id: int) -> bool:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "DELETE FROM packs WHERE id = ? AND vault_id = ?", (pack_id, vault_id)
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
 
     # -------------------- INLINE & VAULT SEARCH --------------------
 
@@ -994,12 +1377,14 @@ class Database:
         )
         linked_accounts = (await acc_cur.fetchone())["cnt"]
 
+        packs_cnt = await self.count_vault_packs(vault_id)
         trash_cnt = await self.count_trashed_files(vault_id)
 
         base["by_type"] = by_type
         base["top_files"] = top_files
         base["groups_count"] = groups_count
         base["linked_accounts"] = linked_accounts
+        base["packs_count"] = packs_cnt
         base["trash_count"] = trash_cnt
         return base
 
@@ -1008,6 +1393,13 @@ class Database:
         now = int(time.time())
         day_ago = now - 86400
         u = (await (await self.conn.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+        banned = (
+            await (
+                await self.conn.execute(
+                    "SELECT COUNT(*) FROM users WHERE COALESCE(is_banned, 0) = 1"
+                )
+            ).fetchone()
+        )[0]
         active_24h = (
             await (
                 await self.conn.execute(
@@ -1031,6 +1423,7 @@ class Database:
             ).fetchone()
         )[0]
         g = (await (await self.conn.execute("SELECT COUNT(*) FROM groups")).fetchone())[0]
+        p = (await (await self.conn.execute("SELECT COUNT(*) FROM packs")).fetchone())[0]
         s = (
             await (
                 await self.conn.execute("SELECT COALESCE(SUM(file_size), 0) FROM files")
@@ -1038,17 +1431,21 @@ class Database:
         )[0]
         return {
             "users": u,
+            "banned": banned,
             "active_24h": active_24h,
             "vaults": v,
             "files": f,
             "trashed": trashed,
             "groups": g,
+            "packs": p,
             "total_size": s,
         }
 
     async def get_all_user_ids(self) -> list[int]:
         assert self.conn is not None
-        cur = await self.conn.execute("SELECT user_id FROM users")
+        cur = await self.conn.execute(
+            "SELECT user_id FROM users WHERE COALESCE(is_banned, 0) = 0"
+        )
         return [r[0] for r in await cur.fetchall()]
 
     # -------------------- UI BANNER ASSETS (DUMP CHANNEL CACHE) --------------------
@@ -1102,4 +1499,3 @@ class Database:
         cur = await self.conn.execute("DELETE FROM ui_assets")
         await self.conn.commit()
         return cur.rowcount
-
