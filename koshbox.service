@@ -1,0 +1,16 @@
+[Unit]
+Description=KoshBox Telegram Inline Dump Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/koshbox_bot
+ExecStart=/home/ubuntu/koshbox_bot/.venv/bin/python /home/ubuntu/koshbox_bot/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
