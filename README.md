@@ -13,15 +13,19 @@ Archive any file, album, or media into your private Dump Channel once — then s
   - Native Telegram Bot API 9.4 styling (`style="primary"`, `style="success"`, `style="danger"`), one-tap `CopyTextButton` (`📋 Copy Link`, `📋 Copy Code`), and native Telegram Share Sheet (`↗️ Share`).
 - **One-Time Dump Channel 3D Banner Cache**:
   - Custom 3D mascot banners (`assets/banners/*.jpg`) upload **once** to `DUMP_CHANNEL_ID` on startup and reuse cached Telegram `file_id` + `SHA-256` forever with zero repeated server uploads.
-- **Multi-File Packs / Batch Link Builder (`/packs`, `/batch`)**:
-  - Bundle multiple files into **one shareable link** (`?start=pack_<TOKEN>`).
-  - Create packs interactively via `/batch` + `/done`, **1-tap from any uploaded Media Album** (`🎒 Create Pack Link`), or **1-tap from any Folder** (`🎒 Pack All into Link`).
+- **Multi-File Packs / Smart Auto-Pack & Zero-Spam Builder (`/packs`, `/batch`)**:
+  - **Smart Multi-Drop Auto-Pack**: Drop or forward **2 or more files together** (even 100+ files at once!) and KoshBox automatically saves them into **one Pack** and replies with **1 clean Share Link card** instead of spamming 100 separate messages.
+  - **Zero-Spam Live Pack Builder**: Interactive `/batch`, `➕ New Pack`, and `➕ Add Files` modes debounce rapid drops and update **one live status card in-place** (no repeated `Added #54 / Finish Pack` flood errors).
+  - **Chunked Flood-Safe Pack Delivery**: Packs with 100+ files deliver cleanly in 20-file batches with a 1-tap `📥 Send Next Batch` continuation button and automatic `TelegramRetryAfter` backoff.
   - Inline Pack sharing: type `@YourBot packs` in any chat to send interactive Pack cards!
-- **Advanced Link Security (PIN Lock, No-Forward, Auto-Expiry)**:
+- **Advanced Bug-Proof Link Security (PIN Lock, Max Opens, Pause, No-Forward, Auto-Expiry)**:
   - Protect both **Single-File Links** and **Multi-File Packs** with:
-    - `🔑 PIN Lock` (salted SHA-256 + constant-time `hmac` check; auto-deletes user PIN messages).
+    - `🔑 PIN Lock` (salted SHA-256 + constant-time `hmac` check, auto-deletes user PIN messages, plus **5-attempt brute-force lockout**).
+    - `👁 Access Limit` (`∞` / `1` / `5` / `10` / `50` / `100` max opens; owner test opens don't burn visitor quota).
+    - `⏸ Pause / ▶️ Resume` (temporarily freeze or re-open any link without losing its URL) & `🔄 Reset Link`.
     - `🛡️ No-Fwd` (`protect_content=True` — blocks forwarding, saving, and screenshots in Telegram).
     - `⏳ Expiry Timer` (`1h` / `24h` / `7d` / `Never`).
+    - `🛠️ Edit Pack` (rename pack, set welcome note/description, add more files, or remove individual items anytime).
 - **Auto-Delete Delivery Timer (`/settings`)**:
   - Optional self-destruct timer (`Off` / `5m` / `15m` / `1h` / `24h`) that automatically cleans up delivered files and packs from user chats.
 - **Outer Guard & Anti-Flood Middleware**:

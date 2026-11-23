@@ -43,9 +43,19 @@ class GuardAndThrottleMiddleware(BaseMiddleware):
 
         is_admin = bool(config and user.id in config.admin_ids)
 
-        # 1. Lightweight anti-flood (skip album chunks so multi-file drops never throttle)
-        is_album_item = isinstance(event, Message) and bool(event.media_group_id)
-        if self.rate_limit > 0 and not is_admin and not is_album_item:
+        # 1. Lightweight anti-flood (NEVER drop media uploads so 100+ file drops never lose files)
+        is_media_upload = not isinstance(event, CallbackQuery) and bool(
+            getattr(event, "media_group_id", None)
+            or getattr(event, "audio", None)
+            or getattr(event, "document", None)
+            or getattr(event, "video", None)
+            or getattr(event, "video_note", None)
+            or getattr(event, "voice", None)
+            or getattr(event, "photo", None)
+            or getattr(event, "animation", None)
+            or getattr(event, "sticker", None)
+        )
+        if self.rate_limit > 0 and not is_admin and not is_media_upload:
             now = time.monotonic()
             prev = self._last_hit.get(user.id, 0.0)
             if now - prev < self.rate_limit:

@@ -1,19 +1,24 @@
 import asyncio
+import os
 import re
 from typing import Any, Optional
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import Config
 from database import Database
+from handlers.packs import render_pack_detail
 from utils.formatters import (
     MEDIA_ICONS,
+    breadcrumb,
     build_file_card_text,
     build_upload_quick_keyboard,
     esc,
-    home_btn,
+    format_size,
+    tg_retry_call,
 )
 from utils.states import PackStates
 
@@ -21,9 +26,53 @@ router = Router(name="upload")
 
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 
-# Debounce buffer for Telegram media albums (media_group_id)
-_ALBUM_BUFFER: dict[str, list[dict[str, Any]]] = {}
-_ALBUM_TASKS: dict[str, asyncio.Task] = {}
+# Debounce windows (in seconds) — tunable via env or overridden in tests for fast assertions
+DROP_WINDOW_SECONDS: float = float(os.getenv("MULTI_DROP_WINDOW_SECONDS", "1.4"))
+PACK_STATUS_DEBOUNCE_SECONDS: float = float(
+    os.getenv("PACK_BUILDER_DEBOUNCE_SECONDS", "0.9")
+)
+
+# Per-user burst buffers for automatic Multi-File Pack creation (>1 file dropped together)
+_USER_DROP_BUFFER: dict[int, list[dict[str, Any]]] = {}
+_USER_DROP_TASKS: dict[int, asyncio.Task] = {}
+_USER_DROP_LOCKS: dict[int, asyncio.Lock] = {}
+
+# Per-user debounced live status updater for interactive Pack Builder (`/batch`, `➕ New Pack`, `➕ Add Files`)
+_PACK_BUILDER_TASKS: dict[int, asyncio.Task] = {}
+_PACK_BUILDER_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _get_drop_lock(user_id: int) -> asyncio.Lock:
+    lock = _USER_DROP_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _USER_DROP_LOCKS[user_id] = lock
+    return lock
+
+
+def _get_builder_lock(user_id: int) -> asyncio.Lock:
+    lock = _PACK_BUILDER_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PACK_BUILDER_LOCKS[user_id] = lock
+    return lock
+
+
+def _clean_auto_pack_title(files: list[dict[str, Any]]) -> str:
+    """Derives a clean, human-readable Pack title from a batch of uploaded files."""
+    if not files:
+        return "File Pack"
+    first_raw = (files[0].get("title") or "File Pack").strip()
+    # Strip common file extensions
+    base = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", first_raw)
+    base = base.replace("_", " ").strip()
+    # Strip trailing episode/chapter/part numbers if multiple files share a series prefix
+    if len(files) >= 2:
+        stripped = re.sub(r"[\s\-–_#]*(?:ep|ch|part|pt|vol)?[\s\-_#]*\d+\s*$", "", base, flags=re.IGNORECASE).strip()
+        if len(stripped) >= 4:
+            base = stripped
+    base = base[:38].strip() or "File Pack"
+    return f"{base} ({len(files)})"[:60]
 
 
 def _extract_media(msg: Message) -> Optional[dict[str, Any]]:
@@ -181,60 +230,135 @@ MEDIA_FILTER = (
 )
 
 
-async def _flush_album_summary(
-    album_key: str, anchor_message: Message
+async def _queue_user_drop(
+    user_id: int,
+    entry: dict[str, Any],
+    anchor_message: Message,
+    bot: Bot,
+    db: Database,
 ) -> None:
-    await asyncio.sleep(1.1)
-    items = _ALBUM_BUFFER.pop(album_key, [])
-    _ALBUM_TASKS.pop(album_key, None)
+    """
+    Sliding-window coalescer for all incoming user drops outside Pack Builder:
+    - 1 file dropped alone -> sends standard single-file receipt card (or 1-line Bulk receipt).
+    - 2 or more files dropped/forwarded together (even 100+ files!) -> automatically
+      saves all of them into ONE Pack and sends ONE clean Pack Share Link card!
+    """
+    async with _get_drop_lock(user_id):
+        _USER_DROP_BUFFER.setdefault(user_id, []).append(entry)
+        prev_task = _USER_DROP_TASKS.get(user_id)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        _USER_DROP_TASKS[user_id] = asyncio.create_task(
+            _flush_user_drop(user_id, anchor_message, bot, db)
+        )
+
+
+async def _flush_user_drop(
+    user_id: int,
+    anchor_message: Message,
+    bot: Bot,
+    db: Database,
+) -> None:
+    try:
+        await asyncio.sleep(DROP_WINDOW_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    async with _get_drop_lock(user_id):
+        items = _USER_DROP_BUFFER.pop(user_id, [])
+        _USER_DROP_TASKS.pop(user_id, None)
+
     if not items:
         return
 
-    saved_items = [x for x in items if x["status"] == "saved"]
-    dup_items = [x for x in items if x["status"] == "dup"]
+    user = await db.get_user(user_id)
+    if not user:
+        return
+    me = await bot.get_me()
 
-    title_line = (
-        f"✅ <b>Album Saved</b> · <i>{len(saved_items)} new"
-        + (f", {len(dup_items)} dup" if dup_items else "")
-        + "</i>"
-    )
-    list_lines: list[str] = []
-    for entry in items[:6]:
-        f = entry["file"]
-        ic = MEDIA_ICONS.get(f["media_type"], "📦")
-        badge = "♻️ " if entry["status"] == "dup" else ""
-        list_lines.append(f"• {badge}{ic} {esc(f['title'][:30])}")
-    if len(items) > 6:
-        list_lines.append(f"<i>…+{len(items) - 6} more</i>")
+    # Case 1: Exactly ONE file sent -> keep crisp single-file behavior
+    if len(items) == 1:
+        item = items[0]
+        f = item["file"]
+        status = item["status"]
 
-    body = title_line + "\n<blockquote>" + "\n".join(list_lines) + "</blockquote>"
-
-    # Build 1-tap Pack callback if encoded IDs fit in 64 bytes
-    all_ids = [str(entry["file"]["id"]) for entry in items]
-    pack_cb = f"pk:quick_album:{','.join(all_ids)}"
-    action_row = [
-        InlineKeyboardButton(
-            text="📦 Files",
-            callback_data="br:all:def:0:0",
-        ),
-        InlineKeyboardButton(
-            text="🔍 Inline",
-            switch_inline_query_current_chat="",
-        ),
-    ]
-    rows: list[list[InlineKeyboardButton]] = []
-    if len(pack_cb.encode("utf-8")) <= 64 and len(all_ids) >= 2:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="🎒 Create Pack Link",
-                    callback_data=pack_cb,
-                    style="primary",
+        if user.get("bulk_mode"):
+            if status in ("dup", "restored"):
+                await tg_retry_call(
+                    anchor_message.reply,
+                    f"♻️ <i>In Vault:</i> <b>{esc(f['title'])}</b>",
                 )
-            ]
+            else:
+                grp = f" · 📁 {esc(f['group_name'])}" if f.get("group_name") else ""
+                await tg_retry_call(
+                    anchor_message.reply,
+                    f"✅ <b>{esc(f['title'])}</b>{grp}",
+                )
+            return
+
+        if status == "restored":
+            badge = "♻️ <b>Restored</b>"
+        elif status == "dup":
+            badge = "♻️ <b>Already Saved</b>"
+        else:
+            badge = "✅ <b>Saved</b>"
+
+        await tg_retry_call(
+            anchor_message.reply,
+            build_file_card_text(f, me.username or "", header_badge=badge),
+            reply_markup=build_upload_quick_keyboard(f),
+            disable_web_page_preview=True,
         )
-    rows.append(action_row)
-    await anchor_message.reply(body, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+
+    # Case 2: 2 or MORE files sent together -> Auto-Bundle into a Pack with 1 clean card!
+    unique_files: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    new_cnt = 0
+    dup_cnt = 0
+    for entry in items:
+        f = entry["file"]
+        if entry["status"] == "saved":
+            new_cnt += 1
+        else:
+            dup_cnt += 1
+        if f["id"] not in seen_ids:
+            seen_ids.add(f["id"])
+            unique_files.append(f)
+
+    # Edge case: user sent the exact same duplicate file twice -> treat as single duplicate
+    if len(unique_files) == 1:
+        f = unique_files[0]
+        await tg_retry_call(
+            anchor_message.reply,
+            build_file_card_text(
+                f, me.username or "", header_badge="♻️ <b>Already Saved</b>"
+            ),
+            reply_markup=build_upload_quick_keyboard(f),
+            disable_web_page_preview=True,
+        )
+        return
+
+    pack_title = _clean_auto_pack_title(unique_files)
+    pack = await db.create_pack(
+        vault_id=user["vault_id"],
+        creator_user_id=user["user_id"],
+        title=pack_title,
+        file_ids=[f["id"] for f in unique_files],
+        protect_content=bool(user.get("protect_content")),
+    )
+
+    rendered = await render_pack_detail(user_id, pack["id"], db, bot)
+    if rendered:
+        stat_note = f"✅ <b>Auto-Packed {len(unique_files)} files</b>"
+        if dup_cnt:
+            stat_note += f" <i>({new_cnt} new · {dup_cnt} in vault)</i>"
+        await tg_retry_call(
+            anchor_message.reply,
+            f"{stat_note}\n{rendered[0]}",
+            reply_markup=rendered[1],
+            disable_web_page_preview=True,
+        )
 
 
 @router.message(F.chat.type == "private", MEDIA_FILTER)
@@ -257,64 +381,55 @@ async def handle_media_upload(
     in_pack_builder = cur_state == PackStates.collecting_items.state
 
     existing = await db.find_duplicate(user["vault_id"], meta["file_unique_id"])
-    me = await bot.get_me()
 
     if existing:
-        if existing.get("is_trashed"):
+        was_trashed = bool(existing.get("is_trashed"))
+        if was_trashed:
             await db.restore_file(existing["id"])
         target_file = await db.get_file(existing["id"])
         assert target_file is not None
 
         if in_pack_builder:
-            await _append_to_pack_builder(message, state, target_file)
+            await _append_to_pack_builder(message, state, bot, target_file)
             return
 
-        if message.media_group_id:
-            album_key = f"{user['user_id']}:{message.media_group_id}"
-            _ALBUM_BUFFER.setdefault(album_key, []).append(
-                {"status": "dup", "file": target_file}
-            )
-            if album_key not in _ALBUM_TASKS:
-                _ALBUM_TASKS[album_key] = asyncio.create_task(
-                    _flush_album_summary(album_key, message)
-                )
-            return
-
-        if user["bulk_mode"]:
-            await message.reply(f"♻️ <i>In Vault:</i> <b>{esc(target_file['title'])}</b>")
-        else:
-            badge = (
-                "♻️ <b>Restored</b>"
-                if existing.get("is_trashed")
-                else "♻️ <b>Already Saved</b>"
-            )
-            await message.reply(
-                build_file_card_text(target_file, me.username or "", header_badge=badge),
-                reply_markup=build_upload_quick_keyboard(target_file),
-                disable_web_page_preview=True,
-            )
+        await _queue_user_drop(
+            user["user_id"],
+            {"status": "restored" if was_trashed else "dup", "file": target_file},
+            message,
+            bot,
+            db,
+        )
         return
 
-    # Forward to dump channel for permanent Telegram cloud storage
+    # Forward to dump channel for permanent Telegram cloud storage (FloodWait-safe)
     try:
-        dumped = await bot.forward_message(
+        dumped = await tg_retry_call(
+            bot.forward_message,
             chat_id=config.dump_channel_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id,
         )
     except Exception as exc:
-        await message.reply(
+        me = await bot.get_me()
+        await tg_retry_call(
+            message.reply,
             f"⚠️ <b>Dump Channel Error</b>\n"
             f"<blockquote>Make @{esc(me.username)} Admin with Post Messages permission.</blockquote>\n"
-            f"<code>{esc(str(exc))}</code>"
+            f"<code>{esc(str(exc))}</code>",
         )
+        return
+
+    if dumped is None:
         return
 
     dumped_meta = _extract_media(dumped)
     stored_file_id = dumped_meta["file_id"] if dumped_meta else meta["file_id"]
 
     active_group_id = user.get("active_group_id")
-    if active_group_id and not await db.is_vault_in_group(user["vault_id"], active_group_id):
+    if active_group_id and not await db.is_vault_in_group(
+        user["vault_id"], active_group_id
+    ):
         active_group_id = None
         await db.set_active_group(user["user_id"], None)
 
@@ -337,62 +452,155 @@ async def handle_media_upload(
     )
 
     if in_pack_builder:
-        await _append_to_pack_builder(message, state, saved)
+        await _append_to_pack_builder(message, state, bot, saved)
         return
 
-    # Batch media albums cleanly into a single summary card with 1-tap Pack Link
-    if message.media_group_id and not user["bulk_mode"]:
-        album_key = f"{user['user_id']}:{message.media_group_id}"
-        _ALBUM_BUFFER.setdefault(album_key, []).append(
-            {"status": "saved", "file": saved}
-        )
-        if album_key not in _ALBUM_TASKS:
-            _ALBUM_TASKS[album_key] = asyncio.create_task(
-                _flush_album_summary(album_key, message)
-            )
-        return
-
-    if user["bulk_mode"]:
-        grp = f" · 📁 {esc(saved['group_name'])}" if saved.get("group_name") else ""
-        await message.reply(f"✅ <b>{esc(saved['title'])}</b>{grp}")
-        return
-
-    await message.reply(
-        build_file_card_text(
-            saved,
-            me.username or "",
-            header_badge="✅ <b>Saved</b>",
-        ),
-        reply_markup=build_upload_quick_keyboard(saved),
-        disable_web_page_preview=True,
+    await _queue_user_drop(
+        user["user_id"],
+        {"status": "saved", "file": saved},
+        message,
+        bot,
+        db,
     )
 
 
-async def _append_to_pack_builder(
-    message: Message, state: FSMContext, file_row: dict[str, Any]
-) -> None:
-    data = await state.get_data()
-    fids: list[int] = list(data.get("pack_file_ids") or [])
-    if file_row["id"] not in fids:
-        fids.append(file_row["id"])
-        await state.update_data(pack_file_ids=fids)
+def _build_live_pack_status_card(
+    fids_count: int,
+    total_size: int,
+    recent_titles: list[str],
+    append_pack_id: Optional[int] = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Builds the single consolidated live Pack Builder status message (zero spam!)."""
+    mode_lbl = "Add to Pack" if append_pack_id else "Pack Builder"
+    cancel_target = f"pk:open:{append_pack_id}" if append_pack_id else "pk:list:0"
+    finish_lbl = (
+        f"✓ Save {fids_count} to Pack"
+        if append_pack_id
+        else f"✓ Finish Pack ({fids_count})"
+    )
 
+    recent_lines = [f"• {esc(t[:36])}" for t in recent_titles[-4:]]
+    if fids_count > len(recent_lines):
+        recent_lines.insert(0, f"<i>…+{fids_count - len(recent_lines)} earlier file(s)</i>")
+    preview = "\n".join(recent_lines) if recent_lines else "<i>Waiting for files…</i>"
+
+    text = (
+        f"{breadcrumb('Vault', 'Packs', mode_lbl)}\n"
+        f"🎒 <b>{mode_lbl}</b> · <b>{fids_count}</b> queued <i>({format_size(total_size)})</i>\n"
+        f"<blockquote>{preview}</blockquote>\n"
+        f"<i>Send more files or tap <b>{esc(finish_lbl)}</b> below.</i>"
+    )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"✓ Finish Pack ({len(fids)})",
+                    text=finish_lbl,
                     callback_data="pk:finish",
                     style="success",
                 ),
                 InlineKeyboardButton(
                     text="✕ Cancel",
-                    callback_data="fsm:cancel:pk:list:0",
+                    callback_data=f"fsm:cancel:{cancel_target}",
                 ),
             ]
         ]
     )
-    await message.reply(
-        f"🎒 <b>Added #{len(fids)}:</b> {esc(file_row['title'][:36])}",
-        reply_markup=kb,
-    )
+    return text, kb
+
+
+async def _append_to_pack_builder(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    file_row: dict[str, Any],
+) -> None:
+    """
+    Appends a file to the active Pack Builder session WITHOUT sending 100 separate messages!
+    Debounces updates and edits a SINGLE live status card in-place.
+    """
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+
+    async with _get_builder_lock(uid):
+        data = await state.get_data()
+        fids: list[int] = list(data.get("pack_file_ids") or [])
+        total_sz = int(data.get("pack_total_size") or 0)
+        recent: list[str] = list(data.get("pack_recent_titles") or [])
+
+        if file_row["id"] not in fids:
+            fids.append(file_row["id"])
+            total_sz += int(file_row.get("file_size") or 0)
+            icon = MEDIA_ICONS.get(file_row["media_type"], "📦")
+            recent.append(f"{icon} {file_row['title']}")
+            recent = recent[-5:]
+            await state.update_data(
+                pack_file_ids=fids,
+                pack_total_size=total_sz,
+                pack_recent_titles=recent,
+            )
+
+        prev_task = _PACK_BUILDER_TASKS.get(uid)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        _PACK_BUILDER_TASKS[uid] = asyncio.create_task(
+            _flush_pack_builder_status(uid, message.chat.id, state, bot)
+        )
+
+
+async def _flush_pack_builder_status(
+    user_id: int,
+    chat_id: int,
+    state: FSMContext,
+    bot: Bot,
+) -> None:
+    try:
+        await asyncio.sleep(PACK_STATUS_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    async with _get_builder_lock(user_id):
+        _PACK_BUILDER_TASKS.pop(user_id, None)
+        cur_state = await state.get_state()
+        if cur_state != PackStates.collecting_items.state:
+            return
+
+        data = await state.get_data()
+        fids: list[int] = list(data.get("pack_file_ids") or [])
+        if not fids:
+            return
+        total_sz = int(data.get("pack_total_size") or 0)
+        recent: list[str] = list(data.get("pack_recent_titles") or [])
+        status_msg_id: Optional[int] = data.get("pack_status_msg_id")
+        append_pack_id: Optional[int] = data.get("append_pack_id")
+
+        text, kb = _build_live_pack_status_card(
+            len(fids), total_sz, recent, append_pack_id=append_pack_id
+        )
+
+        # Edit existing collector/status card in-place so chat stays 100% clean
+        if status_msg_id:
+            try:
+                await tg_retry_call(
+                    bot.edit_message_text,
+                    chat_id=chat_id,
+                    message_id=status_msg_id,
+                    text=text,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                return
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+            except Exception:
+                pass
+
+        sent = await tg_retry_call(
+            bot.send_message,
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+        )
+        if sent and getattr(sent, "message_id", None):
+            await state.update_data(pack_status_msg_id=sent.message_id)

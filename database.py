@@ -30,6 +30,7 @@ def verify_pin(pin: str, stored_hash: str) -> bool:
 
 AUTO_DELETE_CYCLE = [0, 300, 900, 3600, 86400]
 SHARE_TTL_CYCLE = [0, 3600, 86400, 604800]
+MAX_VIEWS_CYCLE = [0, 1, 5, 10, 50, 100]
 
 SORT_CLAUSES = {
     "new": "f.is_favorite DESC, f.created_at DESC",
@@ -131,6 +132,9 @@ class Database:
                 share_pin_hash TEXT DEFAULT '',
                 share_expires_at INTEGER DEFAULT NULL,
                 protect_share INTEGER DEFAULT 0,
+                share_max_views INTEGER DEFAULT 0,
+                share_views INTEGER DEFAULT 0,
+                share_paused INTEGER DEFAULT 0,
                 use_count INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
@@ -168,10 +172,13 @@ class Database:
                 vault_id INTEGER NOT NULL,
                 creator_user_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
+                description TEXT DEFAULT '',
                 share_token TEXT UNIQUE NOT NULL,
                 pin_hash TEXT DEFAULT '',
                 protect_content INTEGER DEFAULT 0,
                 expires_at INTEGER DEFAULT NULL,
+                max_views INTEGER DEFAULT 0,
+                is_paused INTEGER DEFAULT 0,
                 views INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE
@@ -249,6 +256,32 @@ class Database:
         if "protect_share" not in file_cols:
             await self.conn.execute(
                 "ALTER TABLE files ADD COLUMN protect_share INTEGER DEFAULT 0;"
+            )
+        if "share_max_views" not in file_cols:
+            await self.conn.execute(
+                "ALTER TABLE files ADD COLUMN share_max_views INTEGER DEFAULT 0;"
+            )
+        if "share_views" not in file_cols:
+            await self.conn.execute(
+                "ALTER TABLE files ADD COLUMN share_views INTEGER DEFAULT 0;"
+            )
+        if "share_paused" not in file_cols:
+            await self.conn.execute(
+                "ALTER TABLE files ADD COLUMN share_paused INTEGER DEFAULT 0;"
+            )
+
+        pack_cols = await _table_cols("packs")
+        if "description" not in pack_cols:
+            await self.conn.execute(
+                "ALTER TABLE packs ADD COLUMN description TEXT DEFAULT '';"
+            )
+        if "max_views" not in pack_cols:
+            await self.conn.execute(
+                "ALTER TABLE packs ADD COLUMN max_views INTEGER DEFAULT 0;"
+            )
+        if "is_paused" not in pack_cols:
+            await self.conn.execute(
+                "ALTER TABLE packs ADD COLUMN is_paused INTEGER DEFAULT 0;"
             )
 
         await self.conn.commit()
@@ -791,8 +824,12 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
-    async def get_file_by_share_token(self, token: str) -> Optional[dict[str, Any]]:
+    async def get_file_by_share_token(
+        self, token: str, *, include_unavailable: bool = False
+    ) -> Optional[dict[str, Any]]:
         assert self.conn is not None
+        if not token or not token.strip():
+            return None
         now = int(time.time())
         cur = await self.conn.execute(
             """
@@ -801,12 +838,25 @@ class Database:
             LEFT JOIN groups g ON g.id = f.group_id
             WHERE f.share_token = ?
               AND COALESCE(f.is_trashed, 0) = 0
-              AND (f.share_expires_at IS NULL OR f.share_expires_at = 0 OR f.share_expires_at >= ?)
             """,
-            (token, now),
+            (token.strip(),),
         )
         row = await cur.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        data = dict(row)
+        if include_unavailable:
+            return data
+        if data.get("share_paused"):
+            return None
+        exp = data.get("share_expires_at")
+        if exp and int(exp) > 0 and int(exp) < now:
+            return None
+        max_v = int(data.get("share_max_views") or 0)
+        cur_v = int(data.get("share_views") or 0)
+        if max_v > 0 and cur_v >= max_v:
+            return None
+        return data
 
     async def can_vault_access_file(
         self, vault_id: int, file_row: dict[str, Any]
@@ -870,7 +920,8 @@ class Database:
             await self.conn.execute(
                 """
                 UPDATE files
-                SET share_token = NULL, share_pin_hash = '', share_expires_at = NULL, protect_share = 0
+                SET share_token = NULL, share_pin_hash = '', share_expires_at = NULL,
+                    protect_share = 0, share_max_views = 0, share_views = 0, share_paused = 0
                 WHERE id = ?
                 """,
                 (db_file_id,),
@@ -879,10 +930,53 @@ class Database:
             return None
         token = _gen_token(10)
         await self.conn.execute(
-            "UPDATE files SET share_token = ? WHERE id = ?", (token, db_file_id)
+            "UPDATE files SET share_token = ?, share_views = 0, share_paused = 0 WHERE id = ?",
+            (token, db_file_id),
         )
         await self.conn.commit()
         return token
+
+    async def regenerate_file_share_token(self, db_file_id: int) -> str:
+        assert self.conn is not None
+        token = _gen_token(10)
+        await self.conn.execute(
+            "UPDATE files SET share_token = ?, share_views = 0 WHERE id = ?",
+            (token, db_file_id),
+        )
+        await self.conn.commit()
+        return token
+
+    async def toggle_file_share_paused(self, db_file_id: int) -> bool:
+        assert self.conn is not None
+        f = await self.get_file(db_file_id)
+        new_val = 0 if (f and f.get("share_paused")) else 1
+        await self.conn.execute(
+            "UPDATE files SET share_paused = ? WHERE id = ?", (new_val, db_file_id)
+        )
+        await self.conn.commit()
+        return bool(new_val)
+
+    async def cycle_file_share_max_views(self, db_file_id: int) -> int:
+        assert self.conn is not None
+        f = await self.get_file(db_file_id)
+        cur_val = int((f or {}).get("share_max_views") or 0)
+        if cur_val in MAX_VIEWS_CYCLE:
+            nxt = MAX_VIEWS_CYCLE[(MAX_VIEWS_CYCLE.index(cur_val) + 1) % len(MAX_VIEWS_CYCLE)]
+        else:
+            nxt = 0
+        await self.conn.execute(
+            "UPDATE files SET share_max_views = ? WHERE id = ?", (nxt, db_file_id)
+        )
+        await self.conn.commit()
+        return nxt
+
+    async def increment_file_share_views(self, db_file_id: int) -> None:
+        assert self.conn is not None
+        await self.conn.execute(
+            "UPDATE files SET share_views = COALESCE(share_views, 0) + 1, use_count = use_count + 1 WHERE id = ?",
+            (db_file_id,),
+        )
+        await self.conn.commit()
 
     async def set_file_share_pin(self, db_file_id: int, pin: Optional[str]) -> bool:
         assert self.conn is not None
@@ -1009,9 +1103,11 @@ class Database:
         title: str,
         file_ids: list[int],
         *,
+        description: str = "",
         pin: Optional[str] = None,
         protect_content: bool = False,
         ttl_seconds: int = 0,
+        max_views: int = 0,
     ) -> dict[str, Any]:
         assert self.conn is not None
         now = int(time.time())
@@ -1021,18 +1117,20 @@ class Database:
         cur = await self.conn.execute(
             """
             INSERT INTO packs (
-                vault_id, creator_user_id, title, share_token,
-                pin_hash, protect_content, expires_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                vault_id, creator_user_id, title, description, share_token,
+                pin_hash, protect_content, expires_at, max_views, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 vault_id,
                 creator_user_id,
                 title.strip() or "File Pack",
+                description.strip()[:300],
                 token,
                 pin_h,
                 1 if protect_content else 0,
                 exp,
+                max(0, int(max_views)),
                 now,
             ),
         )
@@ -1050,6 +1148,48 @@ class Database:
         res = await self.get_pack(pack_id)
         assert res is not None
         return res
+
+    async def append_files_to_pack(
+        self, pack_id: int, file_ids: list[int]
+    ) -> Optional[dict[str, Any]]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT COALESCE(MAX(pos), -1) FROM pack_items WHERE pack_id = ?",
+            (pack_id,),
+        )
+        base_pos = int((await cur.fetchone())[0]) + 1
+        for offset, fid in enumerate(file_ids):
+            await self.conn.execute(
+                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, pos) VALUES (?, ?, ?)",
+                (pack_id, fid, base_pos + offset),
+            )
+        await self.conn.commit()
+        return await self.get_pack(pack_id)
+
+    async def remove_file_from_pack(self, pack_id: int, file_id: int) -> bool:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "DELETE FROM pack_items WHERE pack_id = ? AND file_id = ?",
+            (pack_id, file_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def rename_pack(self, pack_id: int, new_title: str) -> None:
+        assert self.conn is not None
+        title = new_title.strip()[:80] or "File Pack"
+        await self.conn.execute(
+            "UPDATE packs SET title = ? WHERE id = ?", (title, pack_id)
+        )
+        await self.conn.commit()
+
+    async def set_pack_description(self, pack_id: int, description: str) -> None:
+        assert self.conn is not None
+        await self.conn.execute(
+            "UPDATE packs SET description = ? WHERE id = ?",
+            (description.strip()[:300], pack_id),
+        )
+        await self.conn.commit()
 
     async def get_pack(self, pack_id: int) -> Optional[dict[str, Any]]:
         assert self.conn is not None
@@ -1070,8 +1210,12 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
-    async def get_pack_by_token(self, token: str) -> Optional[dict[str, Any]]:
+    async def get_pack_by_token(
+        self, token: str, *, include_unavailable: bool = False
+    ) -> Optional[dict[str, Any]]:
         assert self.conn is not None
+        if not token or not token.strip():
+            return None
         now = int(time.time())
         cur = await self.conn.execute(
             """
@@ -1084,12 +1228,25 @@ class Database:
                     WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size
             FROM packs p
             WHERE p.share_token = ?
-              AND (p.expires_at IS NULL OR p.expires_at = 0 OR p.expires_at >= ?)
             """,
-            (token, now),
+            (token.strip(),),
         )
         row = await cur.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        data = dict(row)
+        if include_unavailable:
+            return data
+        if data.get("is_paused"):
+            return None
+        exp = data.get("expires_at")
+        if exp and int(exp) > 0 and int(exp) < now:
+            return None
+        max_v = int(data.get("max_views") or 0)
+        cur_v = int(data.get("views") or 0)
+        if max_v > 0 and cur_v >= max_v:
+            return None
+        return data
 
     async def get_pack_files(self, pack_id: int) -> list[dict[str, Any]]:
         assert self.conn is not None
@@ -1177,11 +1334,36 @@ class Database:
         await self.conn.commit()
         return new_exp
 
+    async def toggle_pack_paused(self, pack_id: int) -> bool:
+        assert self.conn is not None
+        p = await self.get_pack(pack_id)
+        new_val = 0 if (p and p.get("is_paused")) else 1
+        await self.conn.execute(
+            "UPDATE packs SET is_paused = ? WHERE id = ?", (new_val, pack_id)
+        )
+        await self.conn.commit()
+        return bool(new_val)
+
+    async def cycle_pack_max_views(self, pack_id: int) -> int:
+        assert self.conn is not None
+        p = await self.get_pack(pack_id)
+        cur_val = int((p or {}).get("max_views") or 0)
+        if cur_val in MAX_VIEWS_CYCLE:
+            nxt = MAX_VIEWS_CYCLE[(MAX_VIEWS_CYCLE.index(cur_val) + 1) % len(MAX_VIEWS_CYCLE)]
+        else:
+            nxt = 0
+        await self.conn.execute(
+            "UPDATE packs SET max_views = ? WHERE id = ?", (nxt, pack_id)
+        )
+        await self.conn.commit()
+        return nxt
+
     async def regenerate_pack_token(self, pack_id: int) -> str:
         assert self.conn is not None
         token = _gen_token(10)
         await self.conn.execute(
-            "UPDATE packs SET share_token = ? WHERE id = ?", (token, pack_id)
+            "UPDATE packs SET share_token = ?, views = 0, is_paused = 0 WHERE id = ?",
+            (token, pack_id),
         )
         await self.conn.commit()
         return token

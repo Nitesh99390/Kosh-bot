@@ -25,6 +25,7 @@ from utils.formatters import (
     cancel_kb,
     esc,
     format_expiry_badge,
+    format_max_views_badge,
     format_size,
     home_btn,
     safe_edit_or_send,
@@ -275,15 +276,21 @@ def _render_file_link_card(file_row: dict, bot_username: str) -> str:
     ]
     if not has_link:
         lines.append(
-            "<blockquote>Create a public link with optional <b>PIN lock</b>, <b>No-Forward</b>, and <b>Auto-Expiry</b>.</blockquote>"
+            "<blockquote>Create a public link with optional <b>PIN lock</b>, <b>Max Opens</b>, <b>No-Forward</b>, <b>Pause</b>, and <b>Auto-Expiry</b>.</blockquote>"
         )
     else:
         url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
         pin_status = "ON" if file_row.get("share_pin_hash") else "Off"
         prot_status = "ON" if file_row.get("protect_share") else "Off"
         exp_status = format_expiry_badge(file_row.get("share_expires_at"))
+        views_badge = format_max_views_badge(
+            int(file_row.get("share_views") or 0),
+            int(file_row.get("share_max_views") or 0),
+        )
+        state_badge = "⏸ Paused" if file_row.get("share_paused") else "🟢 Live"
         lines.append(
-            f"<blockquote>🔑 PIN: <b>{pin_status}</b> · 🛡️ No-Fwd: <b>{prot_status}</b> · ⏳ Expiry: <b>{exp_status}</b></blockquote>\n"
+            f"<blockquote>{state_badge} · {views_badge} · ⏳ <b>{exp_status}</b>\n"
+            f"🔑 PIN: <b>{pin_status}</b> · 🛡️ No-Fwd: <b>{prot_status}</b></blockquote>\n"
             f"<code>{url}</code>"
         )
     return "\n".join(lines)
@@ -784,6 +791,76 @@ async def cb_file_cycle_expiry(
         build_file_link_keyboard(updated, bot_username=me.username or ""),
     )
     await callback.answer(f"⏳ Expiry: {format_expiry_badge(new_exp)}")
+
+
+@router.callback_query(F.data.startswith("f:maxv:"))
+async def cb_file_cycle_max_views(
+    callback: CallbackQuery, db: Database, bot: Bot
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    lim = await db.cycle_file_share_max_views(fid)
+    updated = await db.get_file(fid)
+    me = await bot.get_me()
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(updated, me.username or ""),
+        build_file_link_keyboard(updated, bot_username=me.username or ""),
+    )
+    lbl = f"{lim} opens max" if lim > 0 else "Unlimited opens"
+    await callback.answer(f"👁 Access Limit: {lbl}")
+
+
+@router.callback_query(F.data.startswith("f:pause:"))
+async def cb_file_toggle_pause(
+    callback: CallbackQuery, db: Database, bot: Bot
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    paused = await db.toggle_file_share_paused(fid)
+    updated = await db.get_file(fid)
+    me = await bot.get_me()
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(updated, me.username or ""),
+        build_file_link_keyboard(updated, bot_username=me.username or ""),
+    )
+    await callback.answer("⏸ Link Paused" if paused else "▶️ Link Active")
+
+
+@router.callback_query(F.data.startswith("f:regen:"))
+async def cb_file_regen_token(
+    callback: CallbackQuery, db: Database, bot: Bot
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    await db.regenerate_file_share_token(fid)
+    updated = await db.get_file(fid)
+    me = await bot.get_me()
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(updated, me.username or ""),
+        build_file_link_keyboard(updated, bot_username=me.username or ""),
+    )
+    await callback.answer("🔄 New file link generated (views reset)")
 
 
 @router.callback_query(F.data.startswith("f:pin:"))

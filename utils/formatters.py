@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     CallbackQuery,
     CopyTextButton,
@@ -99,6 +99,30 @@ def format_expiry_badge(expires_at: Optional[int]) -> str:
     if rem < 86400:
         return f"{round(rem / 3600)}h left"
     return f"{round(rem / 86400)}d left"
+
+
+def format_max_views_badge(views: int, max_views: int) -> str:
+    cur = max(0, int(views or 0))
+    lim = max(0, int(max_views or 0))
+    if lim <= 0:
+        return f"👁 {cur}×"
+    return f"👁 {cur}/{lim}"
+
+
+async def tg_retry_call(coro_factory, *args, max_retries: int = 4, **kwargs):
+    """
+    Executes a Telegram Bot API coroutine with automatic FloodWait (`TelegramRetryAfter`)
+    backoff so 100+ file bursts or pack deliveries never crash or drop files.
+    """
+    for attempt in range(max_retries):
+        try:
+            return await coro_factory(*args, **kwargs)
+        except TelegramRetryAfter as exc:
+            wait_s = min(max(float(exc.retry_after), 0.5), 45.0) + 0.25
+            if attempt + 1 >= max_retries:
+                raise
+            await asyncio.sleep(wait_s)
+    return None
 
 
 def copy_btn(text: str, value: str, style: Optional[str] = None) -> InlineKeyboardButton:
@@ -275,36 +299,46 @@ async def send_stored_media(
     fid = file_row["file_id"]
     sent: Optional[Message] = None
 
-    if mtype == "sticker":
-        sent = await bot.send_sticker(
-            chat_id=chat_id, sticker=fid, protect_content=protect_content
-        )
-    elif mtype == "video_note":
-        sent = await bot.send_video_note(
-            chat_id=chat_id, video_note=fid, protect_content=protect_content
-        )
-    else:
-        method_map = {
-            "audio": ("audio", "send_audio"),
-            "voice": ("voice", "send_voice"),
-            "video": ("video", "send_video"),
-            "document": ("document", "send_document"),
-            "photo": ("photo", "send_photo"),
-            "animation": ("animation", "send_animation"),
-        }
-        entry = method_map.get(mtype)
-        if not entry:
-            return None
-        kwarg_name, method_name = entry
-        sender = getattr(bot, method_name, None)
-        if not sender:
-            return None
-        sent = await sender(
-            chat_id=chat_id,
-            **{kwarg_name: fid},
-            caption=caption,
-            protect_content=protect_content,
-        )
+    try:
+        if mtype == "sticker":
+            sent = await tg_retry_call(
+                bot.send_sticker,
+                chat_id=chat_id,
+                sticker=fid,
+                protect_content=protect_content,
+            )
+        elif mtype == "video_note":
+            sent = await tg_retry_call(
+                bot.send_video_note,
+                chat_id=chat_id,
+                video_note=fid,
+                protect_content=protect_content,
+            )
+        else:
+            method_map = {
+                "audio": ("audio", "send_audio"),
+                "voice": ("voice", "send_voice"),
+                "video": ("video", "send_video"),
+                "document": ("document", "send_document"),
+                "photo": ("photo", "send_photo"),
+                "animation": ("animation", "send_animation"),
+            }
+            entry = method_map.get(mtype)
+            if not entry:
+                return None
+            kwarg_name, method_name = entry
+            sender = getattr(bot, method_name, None)
+            if not sender:
+                return None
+            sent = await tg_retry_call(
+                sender,
+                chat_id=chat_id,
+                **{kwarg_name: fid},
+                caption=caption,
+                protect_content=protect_content,
+            )
+    except Exception:
+        return None
 
     if sent and auto_delete_ttl > 0:
         msg_id = getattr(sent, "message_id", None)
@@ -366,7 +400,14 @@ def build_file_card_text(
 
     if file_row.get("share_token") and bot_username:
         share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
-        sec_badges: list[str] = []
+        sec_badges: list[str] = [
+            format_max_views_badge(
+                int(file_row.get("share_views") or 0),
+                int(file_row.get("share_max_views") or 0),
+            )
+        ]
+        if file_row.get("share_paused"):
+            sec_badges.append("⏸ Paused")
         if file_row.get("share_pin_hash"):
             sec_badges.append("🔑 PIN")
         if file_row.get("protect_share"):
@@ -547,6 +588,11 @@ def build_file_link_keyboard(
     pin_lbl = "🔑 PIN: ON" if file_row.get("share_pin_hash") else "🔑 Set PIN"
     prot_lbl = toggle_label(bool(file_row.get("protect_share")), "No-Fwd")
     exp_lbl = f"⏳ {format_expiry_badge(file_row.get('share_expires_at'))}"
+    max_v = int(file_row.get("share_max_views") or 0)
+    cur_v = int(file_row.get("share_views") or 0)
+    limit_lbl = f"👁 Limit: {cur_v}/{max_v}" if max_v > 0 else "👁 Limit: ∞"
+    paused = bool(file_row.get("share_paused"))
+    pause_lbl = "▶️ Resume" if paused else "⏸ Pause"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -560,6 +606,11 @@ def build_file_link_keyboard(
             ],
             [
                 InlineKeyboardButton(text=exp_lbl, callback_data=f"f:exp:{fid}"),
+                InlineKeyboardButton(text=limit_lbl, callback_data=f"f:maxv:{fid}"),
+            ],
+            [
+                InlineKeyboardButton(text=pause_lbl, callback_data=f"f:pause:{fid}"),
+                InlineKeyboardButton(text="🔄 Reset", callback_data=f"f:regen:{fid}"),
                 InlineKeyboardButton(
                     text="🚫 Revoke",
                     callback_data=f"fsh:{fid}:{back_cb}" if back_cb else f"f:share:{fid}",

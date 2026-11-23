@@ -143,6 +143,11 @@ def _pack_to_inline_result(
     desc = f"{p['item_count']} files · {format_size(p['total_size'])}"
     if p.get("pin_hash"):
         desc += " · PIN Locked"
+    if p.get("max_views"):
+        desc += f" · {p['views']}/{p['max_views']} opens"
+    note_line = (
+        f"\n<i>{esc(p['description'][:100])}</i>" if p.get("description") else ""
+    )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -160,7 +165,7 @@ def _pack_to_inline_result(
         description=desc,
         input_message_content=InputTextMessageContent(
             message_text=(
-                f"🎒 <b>{esc(p['title'])}</b>\n"
+                f"🎒 <b>{esc(p['title'])}</b>{note_line}\n"
                 f"<blockquote>📦 <b>{p['item_count']}</b> files  ·  💾 <b>{format_size(p['total_size'])}</b></blockquote>"
             )
         ),

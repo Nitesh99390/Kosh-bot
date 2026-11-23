@@ -1,3 +1,5 @@
+import time
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -38,6 +40,102 @@ from utils.middleware import check_force_sub
 from utils.states import ShareUnlockStates
 
 router = Router(name="start_help")
+
+# Anti-brute-force PIN limiter: (user_id, token) -> {"fails": int, "locked_until": float}
+PIN_MAX_ATTEMPTS = 5
+PIN_LOCKOUT_SECONDS = 300
+_PIN_FAIL_TRACKER: dict[tuple[int, str], dict[str, float]] = {}
+
+
+def _check_pin_lockout(user_id: int, token: str) -> int:
+    """Returns remaining lockout seconds (>0 if locked out, 0 if allowed)."""
+    entry = _PIN_FAIL_TRACKER.get((user_id, token))
+    if not entry:
+        return 0
+    rem = int(entry.get("locked_until", 0) - time.time())
+    if rem <= 0:
+        if entry.get("locked_until", 0) > 0:
+            _PIN_FAIL_TRACKER.pop((user_id, token), None)
+        return 0
+    return rem
+
+
+def _record_pin_failure(user_id: int, token: str) -> tuple[int, int]:
+    """Records a failed PIN attempt; returns (attempts_left, lockout_seconds_if_triggered)."""
+    key = (user_id, token)
+    entry = _PIN_FAIL_TRACKER.setdefault(key, {"fails": 0, "locked_until": 0.0})
+    entry["fails"] = int(entry.get("fails", 0)) + 1
+    if entry["fails"] >= PIN_MAX_ATTEMPTS:
+        entry["locked_until"] = time.time() + PIN_LOCKOUT_SECONDS
+        entry["fails"] = 0
+        return 0, PIN_LOCKOUT_SECONDS
+    return PIN_MAX_ATTEMPTS - int(entry["fails"]), 0
+
+
+def _clear_pin_failures(user_id: int, token: str) -> None:
+    _PIN_FAIL_TRACKER.pop((user_id, token), None)
+
+
+def _diagnose_file_unavailable(raw_file: dict | None) -> tuple[str, str]:
+    now = int(time.time())
+    if not raw_file:
+        return (
+            "⚠️ <b>Link Invalid or Revoked</b>",
+            "This share link was revoked or removed by the owner.",
+        )
+    if raw_file.get("share_paused"):
+        return (
+            "⏸ <b>Link Temporarily Paused</b>",
+            "The owner has paused access to this link. Try again later.",
+        )
+    exp = raw_file.get("share_expires_at")
+    if exp and int(exp) > 0 and int(exp) < now:
+        return (
+            "⏳ <b>Link Expired</b>",
+            "The validity timer on this share link has ended.",
+        )
+    max_v = int(raw_file.get("share_max_views") or 0)
+    cur_v = int(raw_file.get("share_views") or 0)
+    if max_v > 0 and cur_v >= max_v:
+        return (
+            "🚫 <b>Access Limit Reached</b>",
+            f"This link reached its maximum open limit ({cur_v}/{max_v}).",
+        )
+    return (
+        "⚠️ <b>Link Unavailable</b>",
+        "This file is currently unavailable.",
+    )
+
+
+def _diagnose_pack_unavailable(raw_pack: dict | None) -> tuple[str, str]:
+    now = int(time.time())
+    if not raw_pack or raw_pack.get("item_count", 0) == 0:
+        return (
+            "⚠️ <b>Pack Unavailable</b>",
+            "This pack link was revoked, emptied, or removed.",
+        )
+    if raw_pack.get("is_paused"):
+        return (
+            "⏸ <b>Pack Link Paused</b>",
+            "The owner has temporarily paused this pack link.",
+        )
+    exp = raw_pack.get("expires_at")
+    if exp and int(exp) > 0 and int(exp) < now:
+        return (
+            "⏳ <b>Pack Link Expired</b>",
+            "The validity timer on this pack link has ended.",
+        )
+    max_v = int(raw_pack.get("max_views") or 0)
+    cur_v = int(raw_pack.get("views") or 0)
+    if max_v > 0 and cur_v >= max_v:
+        return (
+            "🚫 <b>Pack Limit Reached</b>",
+            f"This pack reached its maximum open limit ({cur_v}/{max_v}).",
+        )
+    return (
+        "⚠️ <b>Pack Unavailable</b>",
+        "This pack link is no longer active.",
+    )
 
 
 async def render_home_dashboard(
@@ -320,18 +418,24 @@ async def cmd_start(
     )
     args = (command.args or "").strip()
 
-    # Deep-link: shared single file (supports PIN, Expiry, Protect Content, Auto-Delete)
+    # Deep-link: shared single file (supports PIN, Brute-Force Lock, Max Views, Pause, Expiry, No-Fwd, Auto-Delete)
     if args.startswith("file_"):
-        token = args[5:]
+        token = args[5:].strip()
         file_row = await db.get_file_by_share_token(token)
         if not file_row:
-            await message.answer(
-                "⚠️ <b>Link Expired or Invalid</b>\n"
-                "<blockquote>This link was revoked, expired, or removed.</blockquote>"
-            )
+            raw_file = await db.get_file_by_share_token(token, include_unavailable=True)
+            hdr, reason = _diagnose_file_unavailable(raw_file)
+            await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
             return
 
         if file_row.get("share_pin_hash"):
+            lock_rem = _check_pin_lockout(message.from_user.id, f"f:{token}")
+            if lock_rem > 0:
+                await message.answer(
+                    f"⛔ <b>Too Many Wrong Attempts</b>\n"
+                    f"<blockquote>Please wait <b>{format_ttl_short(lock_rem)}</b> before trying again.</blockquote>"
+                )
+                return
             await state.set_state(ShareUnlockStates.waiting_for_file_pin)
             await state.update_data(unlock_file_token=token)
             await message.answer(
@@ -342,6 +446,7 @@ async def cmd_start(
             return
 
         owner = await db.get_user(file_row["uploader_user_id"])
+        is_owner = message.from_user.id == file_row["uploader_user_id"]
         ttl = int((owner or {}).get("auto_delete_ttl") or user.get("auto_delete_ttl") or 0)
         protect = bool(file_row.get("protect_share")) or bool((owner or {}).get("protect_content"))
         sent = await send_stored_media(
@@ -352,23 +457,32 @@ async def cmd_start(
             auto_delete_ttl=ttl,
         )
         if sent:
-            await db.increment_use_count(file_row["id"])
+            if is_owner:
+                await db.increment_use_count(file_row["id"])
+            else:
+                await db.increment_file_share_views(file_row["id"])
         else:
             await message.answer("⚠️ Unsupported media format.")
         return
 
-    # Deep-link: shared multi-file Pack (supports PIN, Expiry, Protect Content, Auto-Delete)
+    # Deep-link: shared multi-file Pack (supports PIN, Brute-Force Lock, Max Views, Pause, Expiry, Chunked Delivery)
     if args.startswith("pack_"):
-        token = args[5:]
+        token = args[5:].strip()
         pack = await db.get_pack_by_token(token)
         if not pack or pack["item_count"] == 0:
-            await message.answer(
-                "⚠️ <b>Pack Unavailable</b>\n"
-                "<blockquote>This pack link has expired or been removed.</blockquote>"
-            )
+            raw_pack = await db.get_pack_by_token(token, include_unavailable=True)
+            hdr, reason = _diagnose_pack_unavailable(raw_pack)
+            await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
             return
 
         if pack.get("pin_hash"):
+            lock_rem = _check_pin_lockout(message.from_user.id, f"p:{token}")
+            if lock_rem > 0:
+                await message.answer(
+                    f"⛔ <b>Too Many Wrong Attempts</b>\n"
+                    f"<blockquote>Please wait <b>{format_ttl_short(lock_rem)}</b> before trying again.</blockquote>"
+                )
+                return
             await state.set_state(ShareUnlockStates.waiting_for_pack_pin)
             await state.update_data(unlock_pack_token=token)
             await message.answer(
@@ -379,8 +493,16 @@ async def cmd_start(
             return
 
         creator = await db.get_user(pack["creator_user_id"])
+        is_creator = message.from_user.id == pack["creator_user_id"]
         ttl = int((creator or {}).get("auto_delete_ttl") or user.get("auto_delete_ttl") or 0)
-        await deliver_pack_to_chat(bot, message.chat.id, pack, db, auto_delete_ttl=ttl)
+        await deliver_pack_to_chat(
+            bot,
+            message.chat.id,
+            pack,
+            db,
+            auto_delete_ttl=ttl,
+            count_view=not is_creator,
+        )
         return
 
     # Deep-link: join shared group
@@ -465,29 +587,53 @@ async def fsm_unlock_shared_file(
     except Exception:
         pass
 
+    lock_key = f"f:{token}"
+    lock_rem = _check_pin_lockout(message.from_user.id, lock_key)
+    if lock_rem > 0:
+        await state.clear()
+        await message.answer(
+            f"⛔ <b>Locked Out</b> · Retry in <b>{format_ttl_short(lock_rem)}</b>."
+        )
+        return
+
     file_row = await db.get_file_by_share_token(token)
     if not file_row:
         await state.clear()
-        await message.answer("⚠️ Link expired or revoked.")
+        raw_file = await db.get_file_by_share_token(token, include_unavailable=True)
+        hdr, reason = _diagnose_file_unavailable(raw_file)
+        await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
         return
 
     if not verify_pin(pin_attempt, file_row.get("share_pin_hash") or ""):
+        left, locked_for = _record_pin_failure(message.from_user.id, lock_key)
+        if locked_for > 0:
+            await state.clear()
+            await message.answer(
+                f"⛔ <b>Too Many Wrong Attempts</b>\n"
+                f"<blockquote>Locked for <b>{format_ttl_short(locked_for)}</b> to protect this link.</blockquote>"
+            )
+            return
         await message.answer(
-            "❌ <b>Wrong PIN</b> — try again:",
+            f"❌ <b>Wrong PIN</b> · <i>{left} attempt(s) left</i> — try again:",
             reply_markup=cancel_kb("nav:home"),
         )
         return
 
+    _clear_pin_failures(message.from_user.id, lock_key)
     await state.clear()
     owner = await db.get_user(file_row["uploader_user_id"])
     visitor = await db.get_user(message.from_user.id)
+    is_owner = message.from_user.id == file_row["uploader_user_id"]
     ttl = int((owner or {}).get("auto_delete_ttl") or (visitor or {}).get("auto_delete_ttl") or 0)
     protect = bool(file_row.get("protect_share")) or bool((owner or {}).get("protect_content"))
     sent = await send_stored_media(
         bot, message.chat.id, file_row, protect_content=protect, auto_delete_ttl=ttl
     )
     if sent:
-        await db.increment_use_count(file_row["id"])
+        if is_owner:
+            await db.increment_use_count(file_row["id"])
+        else:
+            await db.increment_file_share_views(file_row["id"])
 
 
 @router.message(ShareUnlockStates.waiting_for_pack_pin)
@@ -504,24 +650,52 @@ async def fsm_unlock_shared_pack(
     except Exception:
         pass
 
-    pack = await db.get_pack_by_token(token)
-    if not pack:
+    lock_key = f"p:{token}"
+    lock_rem = _check_pin_lockout(message.from_user.id, lock_key)
+    if lock_rem > 0:
         await state.clear()
-        await message.answer("⚠️ Pack expired or removed.")
+        await message.answer(
+            f"⛔ <b>Locked Out</b> · Retry in <b>{format_ttl_short(lock_rem)}</b>."
+        )
+        return
+
+    pack = await db.get_pack_by_token(token)
+    if not pack or pack.get("item_count", 0) == 0:
+        await state.clear()
+        raw_pack = await db.get_pack_by_token(token, include_unavailable=True)
+        hdr, reason = _diagnose_pack_unavailable(raw_pack)
+        await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
         return
 
     if not verify_pin(pin_attempt, pack.get("pin_hash") or ""):
+        left, locked_for = _record_pin_failure(message.from_user.id, lock_key)
+        if locked_for > 0:
+            await state.clear()
+            await message.answer(
+                f"⛔ <b>Too Many Wrong Attempts</b>\n"
+                f"<blockquote>Locked for <b>{format_ttl_short(locked_for)}</b> to protect this pack.</blockquote>"
+            )
+            return
         await message.answer(
-            "❌ <b>Wrong PIN</b> — try again:",
+            f"❌ <b>Wrong PIN</b> · <i>{left} attempt(s) left</i> — try again:",
             reply_markup=cancel_kb("nav:home"),
         )
         return
 
+    _clear_pin_failures(message.from_user.id, lock_key)
     await state.clear()
     creator = await db.get_user(pack["creator_user_id"])
     visitor = await db.get_user(message.from_user.id)
+    is_creator = message.from_user.id == pack["creator_user_id"]
     ttl = int((creator or {}).get("auto_delete_ttl") or (visitor or {}).get("auto_delete_ttl") or 0)
-    await deliver_pack_to_chat(bot, message.chat.id, pack, db, auto_delete_ttl=ttl)
+    await deliver_pack_to_chat(
+        bot,
+        message.chat.id,
+        pack,
+        db,
+        auto_delete_ttl=ttl,
+        count_view=not is_creator,
+    )
 
 
 @router.callback_query(F.data == "nav:home")
@@ -641,6 +815,13 @@ async def cb_fsm_cancel(
         from handlers.packs import render_pack_detail
 
         rendered = await render_pack_detail(callback.from_user.id, pid, db, bot)
+        if rendered:
+            await safe_edit_or_send(callback, rendered[0], rendered[1])
+    elif target.startswith("pk:edit:"):
+        pid = int(target.split(":")[2])
+        from handlers.packs import render_pack_edit_drawer
+
+        rendered = await render_pack_edit_drawer(callback.from_user.id, pid, db, page=0)
         if rendered:
             await safe_edit_or_send(callback, rendered[0], rendered[1])
     elif target.startswith("br:"):

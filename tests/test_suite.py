@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import Config
 from database import Database, hash_pin, verify_pin
-from handlers import accounts, admin, file_actions, groups, inline, packs, start_help
+from handlers import accounts, admin, file_actions, groups, inline, packs, start_help, upload
+from utils.states import PackStates
 from utils.banners import (
     BANNER_FILES,
     compute_file_sha256,
@@ -43,6 +44,8 @@ class _DummyBot:
     def __init__(self) -> None:
         self.dump_uploads: list[tuple[int, str]] = []
         self.sent_media: list[dict] = []
+        self.edited_messages: list[dict] = []
+        self.forwarded_messages: list[tuple[int, int, int]] = []
         self.deleted_messages: list[tuple[int, int]] = []
         self._seq = 0
 
@@ -107,13 +110,69 @@ class _DummyBot:
         return SimpleNamespace(message_id=8000 + self._seq)
 
     async def send_message(
-        self, chat_id: int, text: str, protect_content: bool = False, reply_markup=None
+        self,
+        chat_id: int,
+        text: str,
+        protect_content: bool = False,
+        reply_markup=None,
+        disable_web_page_preview: bool = False,
     ):
         self._seq += 1
         self.sent_media.append(
-            {"type": "msg", "chat_id": chat_id, "text": text, "protect": protect_content}
+            {
+                "type": "msg",
+                "chat_id": chat_id,
+                "text": text,
+                "protect": protect_content,
+                "reply_markup": reply_markup,
+            }
         )
         return SimpleNamespace(message_id=9000 + self._seq)
+
+    async def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup=None,
+        disable_web_page_preview: bool = False,
+    ):
+        self.edited_messages.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": reply_markup,
+            }
+        )
+        return SimpleNamespace(message_id=message_id)
+
+    async def forward_message(
+        self, chat_id: int, from_chat_id: int, message_id: int
+    ):
+        self._seq += 1
+        self.forwarded_messages.append((chat_id, from_chat_id, message_id))
+        return SimpleNamespace(
+            message_id=10000 + self._seq,
+            audio=SimpleNamespace(
+                file_id=f"DUMP_AUD_{self._seq}",
+                file_unique_id=f"DUMP_UNIQ_{self._seq}",
+                title=f"Episode_{self._seq}",
+                performer="Gtts",
+                file_name=f"Little_Monkey_King_Ep_{self._seq}.mp3",
+                mime_type="audio/mpeg",
+                file_size=1_000_000,
+                duration=600,
+            ),
+            document=None,
+            video=None,
+            video_note=None,
+            voice=None,
+            photo=None,
+            animation=None,
+            sticker=None,
+            caption="",
+        )
 
     async def delete_message(self, chat_id: int, message_id: int):
         self.deleted_messages.append((chat_id, message_id))
@@ -437,6 +496,230 @@ async def run_tests() -> None:
         assert "Vault › Files" in breadcrumb("Vault", "Files")
         assert copy_btn("Copy", "hello").copy_text.text == "hello"
         assert "t.me/share/url" in (share_url_btn("Share", "https://t.me/test").url or "")
+
+        # 16. Middleware NEVER drops media uploads even during 100-file simultaneous bursts
+        burst_calls = 0
+
+        async def _burst_handler(ev, dt):
+            nonlocal burst_calls
+            burst_calls += 1
+            return "SAVED"
+
+        for idx in range(100):
+            media_ev = SimpleNamespace(
+                from_user=SimpleNamespace(id=1002),
+                media_group_id=None,  # Even non-album forwarded files!
+                audio=SimpleNamespace(file_id=f"A_{idx}"),
+                chat=SimpleNamespace(type="private"),
+            )
+            r = await mw(_burst_handler, media_ev, data_ctx)
+            assert r == "SAVED"
+        assert burst_calls == 100, "All 100 rapid non-album media uploads must pass middleware!"
+
+        # 17. 100-File Simultaneous Drop -> Auto-Packs into ONE Pack & sends ONLY 1 reply!
+        upload.DROP_WINDOW_SECONDS = 0.12
+        upload.PACK_STATUS_DEBOUNCE_SECONDS = 0.08
+        u_burst = await db.ensure_user(2026, "nitesh", "Nitesh")
+        replies_received: list[tuple[str, object]] = []
+
+        class _DummyFSM:
+            def __init__(self, state_val=None, initial_data=None):
+                self._state = state_val
+                self._data = dict(initial_data or {})
+
+            async def get_state(self):
+                return self._state
+
+            async def set_state(self, st):
+                self._state = st.state if hasattr(st, "state") else st
+
+            async def get_data(self):
+                return dict(self._data)
+
+            async def update_data(self, **kwargs):
+                self._data.update(kwargs)
+
+            async def clear(self):
+                self._state = None
+                self._data.clear()
+
+        def _make_audio_msg(idx: int, uid: int = 2026):
+            async def _reply(txt: str, reply_markup=None, disable_web_page_preview: bool = False):
+                replies_received.append((txt, reply_markup))
+                return SimpleNamespace(message_id=50000 + len(replies_received))
+
+            return SimpleNamespace(
+                message_id=30000 + idx,
+                chat=SimpleNamespace(id=uid, type="private"),
+                from_user=SimpleNamespace(id=uid, username="nitesh", full_name="Nitesh"),
+                media_group_id=None,
+                caption="",
+                audio=SimpleNamespace(
+                    file_id=f"SRC_AUD_{idx}",
+                    file_unique_id=f"UNIQ_MONKEY_{idx}",
+                    title=f"Little_Monkey_King_Ep_{idx:03d}.mp3",
+                    performer="Gtts",
+                    file_name=f"Little_Monkey_King_Ep_{idx:03d}.mp3",
+                    mime_type="audio/mpeg",
+                    file_size=2_000_000,
+                    duration=900,
+                ),
+                document=None,
+                video=None,
+                video_note=None,
+                voice=None,
+                photo=None,
+                animation=None,
+                sticker=None,
+                reply=_reply,
+            )
+
+        idle_fsm = _DummyFSM(None)
+        for i in range(1, 101):
+            await upload.handle_media_upload(
+                _make_audio_msg(i),  # type: ignore[arg-type]
+                idle_fsm,  # type: ignore[arg-type]
+                dummy_bot,  # type: ignore[arg-type]
+                db,
+                dummy_cfg,
+            )
+
+        # Wait for sliding-window debounce to flush
+        await asyncio.sleep(0.30)
+        assert len(replies_received) == 1, (
+            f"Expected 1 consolidated Auto-Pack message for 100 files, got {len(replies_received)}"
+        )
+        auto_pack_reply_txt, auto_pack_kb = replies_received[0]
+        assert "Auto-Packed 100 files" in auto_pack_reply_txt
+        assert "Little Monkey King" in auto_pack_reply_txt
+
+        user_packs = await db.list_vault_packs(u_burst["vault_id"])
+        assert len(user_packs) == 1 and user_packs[0]["item_count"] == 100
+        big_pack = user_packs[0]
+
+        # Single file drop check -> still produces standard 1-file Saved card (not a Pack)
+        replies_received.clear()
+        await upload.handle_media_upload(
+            _make_audio_msg(999),  # type: ignore[arg-type]
+            idle_fsm,  # type: ignore[arg-type]
+            dummy_bot,  # type: ignore[arg-type]
+            db,
+            dummy_cfg,
+        )
+        await asyncio.sleep(0.30)
+        assert len(replies_received) == 1
+        assert "Saved" in replies_received[0][0]
+        assert (await db.count_vault_packs(u_burst["vault_id"])) == 1
+
+        # 18. 100-File Interactive `/batch` Builder -> ZERO per-file spam (1 live status edit!)
+        replies_received.clear()
+        dummy_bot.edited_messages.clear()
+        msgs_before = len(dummy_bot.sent_media)
+        batch_fsm = _DummyFSM(
+            PackStates.collecting_items.state,
+            {
+                "pack_file_ids": [],
+                "pack_total_size": 0,
+                "pack_recent_titles": [],
+                "pack_status_msg_id": 88888,
+                "append_pack_id": None,
+            },
+        )
+        for i in range(1, 101):
+            # Re-dropping the 100 files into /batch builder
+            await upload.handle_media_upload(
+                _make_audio_msg(i),  # type: ignore[arg-type]
+                batch_fsm,  # type: ignore[arg-type]
+                dummy_bot,  # type: ignore[arg-type]
+                db,
+                dummy_cfg,
+            )
+        await asyncio.sleep(0.25)
+        assert len(replies_received) == 0, "Batch builder must NEVER send 100 per-file reply messages!"
+        assert len(dummy_bot.sent_media) == msgs_before, "No new spam messages sent!"
+        assert len(dummy_bot.edited_messages) == 1, "Single live collector card edited once after burst!"
+        assert "100</b> queued" in dummy_bot.edited_messages[0]["text"]
+
+        # 19. Large 100-File Pack Chunked Delivery (20 per batch + Next Batch button)
+        dummy_bot.sent_media.clear()
+        delivered_batch_1 = await packs.deliver_pack_to_chat(
+            dummy_bot,  # type: ignore[arg-type]
+            7777,
+            big_pack,
+            db,
+            start_offset=0,
+        )
+        assert delivered_batch_1 == packs.PACK_DELIVERY_BATCH_SIZE  # 20 files
+        # Check continuation footer message has `pk:more:<TOKEN>:20` button
+        footer_msgs = [
+            m for m in dummy_bot.sent_media if m["type"] == "msg" and m.get("reply_markup")
+        ]
+        assert len(footer_msgs) == 1
+        more_cb = footer_msgs[0]["reply_markup"].inline_keyboard[0][0].callback_data
+        assert more_cb == f"pk:more:{big_pack['share_token']}:20"
+        assert len(more_cb.encode("utf-8")) <= 64
+
+        # 20. Advanced Bug-Proof Link Security: Max Views, Pause/Resume, Edit Pack, PIN Brute-Force Lockout
+        # Pack Max Views & Pause/Resume
+        assert await db.cycle_pack_max_views(big_pack["id"]) == 1  # Limit: 1 open
+        # Note: big_pack already has 1 view from delivered_batch_1 above -> should now be blocked!
+        assert await db.get_pack_by_token(big_pack["share_token"]) is None
+        raw_p = await db.get_pack_by_token(big_pack["share_token"], include_unavailable=True)
+        diag_hdr, _ = start_help._diagnose_pack_unavailable(raw_p)
+        assert "Limit Reached" in diag_hdr
+
+        # Reset link resets views to 0 and unpauses
+        new_ptok = await db.regenerate_pack_token(big_pack["id"])
+        assert new_ptok != big_pack["share_token"]
+        assert await db.get_pack_by_token(new_ptok) is not None
+
+        # Pause / Resume pack link
+        assert await db.toggle_pack_paused(big_pack["id"]) is True
+        assert await db.get_pack_by_token(new_ptok) is None
+        diag_pause_hdr, _ = start_help._diagnose_pack_unavailable(
+            await db.get_pack_by_token(new_ptok, include_unavailable=True)
+        )
+        assert "Paused" in diag_pause_hdr
+        assert await db.toggle_pack_paused(big_pack["id"]) is False
+        assert await db.get_pack_by_token(new_ptok) is not None
+
+        # Pack Rename, Description, Remove Item & Append Item
+        await db.rename_pack(big_pack["id"], "Monkey King Complete")
+        await db.set_pack_description(big_pack["id"], "Full Audiobook Season 1")
+        p_files = await db.get_pack_files(big_pack["id"])
+        assert await db.remove_file_from_pack(big_pack["id"], p_files[-1]["id"]) is True
+        assert (await db.get_pack(big_pack["id"]))["item_count"] == 99
+        await db.append_files_to_pack(big_pack["id"], [p_files[-1]["id"]])
+        assert (await db.get_pack(big_pack["id"]))["item_count"] == 100
+
+        edit_drawer = await packs.render_pack_edit_drawer(2026, big_pack["id"], db, page=0)
+        assert edit_drawer is not None
+        for row in edit_drawer[1].inline_keyboard:
+            for btn in row:
+                if btn.callback_data:
+                    assert len(btn.callback_data.encode("utf-8")) <= 64
+
+        # Single-File Link Max Views & Pause/Resume
+        assert await db.cycle_file_share_max_views(f1["id"]) == 1
+        await db.increment_file_share_views(f1["id"])
+        assert await db.get_file_by_share_token(tok) is None
+        new_ftok = await db.regenerate_file_share_token(f1["id"])
+        assert await db.get_file_by_share_token(new_ftok) is not None
+        assert await db.toggle_file_share_paused(f1["id"]) is True
+        assert await db.get_file_by_share_token(new_ftok) is None
+        assert await db.toggle_file_share_paused(f1["id"]) is False
+        assert await db.get_file_by_share_token(new_ftok) is not None
+
+        # PIN Brute-Force Lockout (5 wrong tries -> 300s lockout)
+        start_help._clear_pin_failures(9090, "p:TESTTOK")
+        for attempt in range(1, 5):
+            left, lck = start_help._record_pin_failure(9090, "p:TESTTOK")
+            assert left == 5 - attempt and lck == 0
+        left5, lck5 = start_help._record_pin_failure(9090, "p:TESTTOK")
+        assert left5 == 0 and lck5 == start_help.PIN_LOCKOUT_SECONDS
+        assert start_help._check_pin_lockout(9090, "p:TESTTOK") > 0
+        start_help._clear_pin_failures(9090, "p:TESTTOK")
+        assert start_help._check_pin_lockout(9090, "p:TESTTOK") == 0
 
         await db.close()
         print("ALL PRO FEATURES, SECURITY, PACKS & CRISP UI/UX TESTS PASSED!")
