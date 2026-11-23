@@ -6,8 +6,17 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from config import Config
 from database import Database
 from handlers import accounts, admin, file_actions, groups, inline, start_help, upload
+from utils.banners import (
+    BANNER_FILES,
+    compute_file_sha256,
+    edit_or_send_banner,
+    get_or_upload_banner_file_id,
+    send_banner_message,
+    warmup_banners_in_dump_channel,
+)
 from utils.formatters import (
     breadcrumb,
     build_file_card_text,
@@ -24,8 +33,21 @@ from utils.formatters import (
 
 
 class _DummyBot:
+    def __init__(self) -> None:
+        self.dump_uploads: list[tuple[int, str]] = []
+        self._seq = 0
+
     async def get_me(self):
         return SimpleNamespace(username="KoshBox_Bot", id=99999, supports_inline_queries=True)
+
+    async def send_photo(self, chat_id: int, photo, caption: str = "", disable_notification: bool = False):
+        self._seq += 1
+        self.dump_uploads.append((chat_id, caption))
+        p_obj = SimpleNamespace(
+            file_id=f"CACHED_TG_PHOTO_ID_{self._seq}",
+            file_unique_id=f"UNIQ_PHOTO_{self._seq}",
+        )
+        return SimpleNamespace(message_id=7000 + self._seq, photo=[p_obj])
 
 
 async def run_tests() -> None:
@@ -208,7 +230,87 @@ async def run_tests() -> None:
 
         adm_txt, adm_kb = await admin._render_admin_panel(db)
         assert "Admin Console" in adm_txt
-        assert len(adm_kb.inline_keyboard) == 2
+        assert "UI Banners Cached:</b> 0/3" in adm_txt
+        assert len(adm_kb.inline_keyboard) == 3
+
+        # 7h. One-Time Dump Channel Banner Upload & Zero Re-Upload Caching Verification
+        dummy_cfg = Config(
+            bot_token="123456:TEST",
+            dump_channel_id=-1009988776655,
+            admin_ids=(1001,),
+            db_path=db_path,
+            inline_page_size=25,
+            link_code_ttl_seconds=300,
+        )
+        for key, bpath in BANNER_FILES.items():
+            assert os.path.isfile(bpath), f"Missing banner file: {bpath}"
+            assert os.path.getsize(bpath) > 10_000
+            assert len(compute_file_sha256(bpath)) == 64
+
+        # First warmup uploads all 3 banners ONCE to Dump Channel
+        warm1 = await warmup_banners_in_dump_channel(dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+        assert warm1 == {"welcome": True, "upload": True, "guide": True}
+        assert len(dummy_bot.dump_uploads) == 3
+        assert all(cid == -1009988776655 for cid, _ in dummy_bot.dump_uploads)
+
+        # Second warmup & repeated get_or_upload calls MUST NOT upload again from server!
+        warm2 = await warmup_banners_in_dump_channel(dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+        assert warm2 == {"welcome": True, "upload": True, "guide": True}
+        assert len(dummy_bot.dump_uploads) == 3  # Strictly still 3!
+
+        for _ in range(10):
+            fid_w = await get_or_upload_banner_file_id("welcome", dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+            fid_u = await get_or_upload_banner_file_id("upload", dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+            fid_g = await get_or_upload_banner_file_id("guide", dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+            assert fid_w == "CACHED_TG_PHOTO_ID_1"
+            assert fid_u == "CACHED_TG_PHOTO_ID_2"
+            assert fid_g == "CACHED_TG_PHOTO_ID_3"
+        assert len(dummy_bot.dump_uploads) == 3  # Zero extra server uploads!
+
+        adm_txt_after, _ = await admin._render_admin_panel(db)
+        assert "UI Banners Cached:</b> 3/3" in adm_txt_after
+
+        # Verify send_banner_message & edit_or_send_banner use cached file_id (strings, never FSInputFile)
+        sent_photos: list[tuple[str, str]] = []
+
+        class _DummyMsg:
+            def __init__(self, has_photo: bool = False, uniq: str = "UNIQ_PHOTO_1"):
+                self.photo = [SimpleNamespace(file_unique_id=uniq)] if has_photo else None
+                self.text = None if has_photo else "Old text"
+                self.edited_caption = None
+                self.edited_media = None
+
+            async def answer_photo(self, photo, caption: str = "", reply_markup=None):
+                assert isinstance(photo, str), "Must send cached file_id string, NOT re-upload file!"
+                sent_photos.append((photo, caption))
+                return self
+
+            async def edit_caption(self, caption: str = "", reply_markup=None):
+                self.edited_caption = caption
+
+            async def edit_media(self, media, reply_markup=None):
+                assert isinstance(media.media, str), "Must edit with cached file_id string!"
+                self.edited_media = media.media
+
+            async def delete(self):
+                pass
+
+        m1 = _DummyMsg(has_photo=False)
+        await send_banner_message(m1, "welcome", home_txt, home_kb, dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+        assert len(sent_photos) == 1 and sent_photos[0][0] == "CACHED_TG_PHOTO_ID_1"
+
+        # Same photo banner -> edits caption in-place
+        m_same = _DummyMsg(has_photo=True, uniq="UNIQ_PHOTO_1")
+        cb_same = SimpleNamespace(message=m_same)
+        await edit_or_send_banner(cb_same, "welcome", "Updated Home", home_kb, dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+        assert m_same.edited_caption == "Updated Home"
+
+        # Different photo banner -> swaps cached media file_id in-place
+        m_diff = _DummyMsg(has_photo=True, uniq="UNIQ_PHOTO_1")
+        cb_diff = SimpleNamespace(message=m_diff)
+        await edit_or_send_banner(cb_diff, "guide", "Guide Caption", home_kb, dummy_bot, db, dummy_cfg)  # type: ignore[arg-type]
+        assert m_diff.edited_media == "CACHED_TG_PHOTO_ID_3"
+        assert len(dummy_bot.dump_uploads) == 3  # Still zero extra uploads!
 
         # 8. Account sync & merge + Progressive Unlink view
         u3 = await db.ensure_user(1003, "alice_alt", "Alice Alt")

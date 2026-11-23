@@ -10,6 +10,7 @@ from aiogram.types import BotCommand
 from config import load_config
 from database import Database
 from handlers import accounts, admin, file_actions, groups, inline, start_help, upload
+from utils.banners import warmup_banners_in_dump_channel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +64,10 @@ async def main() -> None:
         )
 
     await _set_bot_commands(bot)
+
+    # Pre-warm custom 3D UI banners into Dump Channel ONCE (reuses SQLite file_id on subsequent boots)
+    banner_status = await warmup_banners_in_dump_channel(bot, db, config)
+    logger.info("UI Banner cache status (Dump Channel): %s", banner_status)
 
     try:
         await dp.start_polling(

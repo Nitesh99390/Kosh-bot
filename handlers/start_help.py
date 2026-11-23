@@ -11,6 +11,7 @@ from aiogram.types import (
 from config import Config
 from database import Database
 from handlers.accounts import handle_verify_code, render_accounts_panel
+from utils.banners import edit_or_send_banner, send_banner_message
 from utils.formatters import (
     DIVIDER,
     MEDIA_ICONS,
@@ -58,14 +59,15 @@ async def render_home_dashboard(
     total_size = format_size(stats["total_size"])
     groups_cnt = stats["groups_count"]
 
-    greeting = f" · {esc(first_name)}" if first_name else ""
+    greeting = f", <b>{esc(first_name)}</b>" if first_name else ""
     text = (
-        f"✨ <b>KoshBox Cloud Vault</b>{greeting}\n\n"
+        f"👋 <b>Welcome to @{uname}</b>{greeting}\n\n"
+        f"<i>Your personal Telegram Cloud Vault — archive any file once and send it in one click from any chat.</i>\n\n"
         f"<blockquote>"
         f"📦 <b>{total_files}</b> files  ·  💾 <b>{total_size}</b>  ·  📁 <b>{groups_cnt}</b> folders\n"
         f"🎯 Target: <b>{esc(active_folder)}</b>  ·  {bulk_badge}"
         f"</blockquote>\n\n"
-        f"<i>Drop any media here to archive · Inline:</i> <code>@{uname} </code>"
+        f"👇 <b>Drop media here or use the buttons below to get started</b>"
     )
 
     kb = InlineKeyboardMarkup(
@@ -349,30 +351,36 @@ async def cmd_start(
         return
 
     if args == "upload":
-        await message.answer(
-            f"📤 <b>Ready to Archive</b>\n\n"
-            f"<blockquote>Send or forward any <b>audio, video, document, photo, voice note, GIF, or sticker</b> right here.</blockquote>\n\n"
-            f"<i>Tip: Include hashtags like <code>#music #work</code> in captions to auto-tag.</i>",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="📁 Target Folder", callback_data="nav:groups"),
-                        home_btn("🏠 Vault"),
-                    ]
+        upload_caption = (
+            f"💡 <b>Ready to Archive into Your Vault</b>\n\n"
+            f"<i>Send or forward any <b>audio, video, document, photo, voice note, GIF, or sticker</b> right here — it is saved permanently and ready for instant inline sharing.</i>\n\n"
+            f"<blockquote>"
+            f"🏷️ <b>Pro Tip:</b> Include hashtags like <code>#music #work</code> in captions to auto-tag your files."
+            f"</blockquote>\n\n"
+            f"<b>Drop a file anytime when you're ready</b>"
+        )
+        upload_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📁 Target Folder", callback_data="nav:groups"),
+                    home_btn("🏠 Vault"),
                 ]
-            ),
+            ]
+        )
+        await send_banner_message(
+            message, "upload", upload_caption, upload_kb, bot, db, config
         )
         return
 
     text, kb = await render_home_dashboard(
         message.from_user.id, message.from_user.first_name or "", db, bot
     )
-    await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
+    await send_banner_message(message, "welcome", text, kb, bot, db, config)
 
 
 @router.callback_query(F.data == "nav:home")
 async def cb_nav_home(
-    callback: CallbackQuery, state: FSMContext, db: Database, bot: Bot
+    callback: CallbackQuery, state: FSMContext, db: Database, bot: Bot, config: Config
 ) -> None:
     if not callback.from_user:
         return
@@ -385,12 +393,14 @@ async def cb_nav_home(
     text, kb = await render_home_dashboard(
         callback.from_user.id, callback.from_user.first_name or "", db, bot
     )
-    await safe_edit_or_send(callback, text, kb)
+    await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
     await callback.answer()
 
 
 @router.callback_query(F.data == "home:bulk")
-async def cb_home_bulk(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_home_bulk(
+    callback: CallbackQuery, db: Database, bot: Bot, config: Config
+) -> None:
     if not callback.from_user:
         return
     await db.ensure_user(
@@ -402,33 +412,37 @@ async def cb_home_bulk(callback: CallbackQuery, db: Database, bot: Bot) -> None:
     text, kb = await render_home_dashboard(
         callback.from_user.id, callback.from_user.first_name or "", db, bot
     )
-    await safe_edit_or_send(callback, text, kb)
+    await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
     await callback.answer(
         "⚡ Bulk Upload Mode ON" if enabled else "Bulk Upload Mode OFF"
     )
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message, bot: Bot) -> None:
+async def cmd_help(message: Message, bot: Bot, db: Database, config: Config) -> None:
     me = await bot.get_me()
     text, kb = _render_help_panel(me.username or "", "inline")
-    await message.answer(text, reply_markup=kb)
+    await send_banner_message(message, "guide", text, kb, bot, db, config)
 
 
 @router.callback_query(F.data == "nav:help")
-async def cb_nav_help(callback: CallbackQuery, bot: Bot) -> None:
+async def cb_nav_help(
+    callback: CallbackQuery, bot: Bot, db: Database, config: Config
+) -> None:
     me = await bot.get_me()
     text, kb = _render_help_panel(me.username or "", "inline")
-    await safe_edit_or_send(callback, text, kb)
+    await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("help:"))
-async def cb_switch_help_tab(callback: CallbackQuery, bot: Bot) -> None:
+async def cb_switch_help_tab(
+    callback: CallbackQuery, bot: Bot, db: Database, config: Config
+) -> None:
     tab = callback.data.split(":", 1)[1]
     me = await bot.get_me()
     text, kb = _render_help_panel(me.username or "", tab)
-    await safe_edit_or_send(callback, text, kb)
+    await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
     await callback.answer()
 
 
@@ -450,7 +464,11 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("fsm:cancel:"))
 async def cb_fsm_cancel(
-    callback: CallbackQuery, state: FSMContext, db: Database, bot: Bot
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    config: Config,
 ) -> None:
     if not callback.from_user:
         return
@@ -464,7 +482,7 @@ async def cb_fsm_cancel(
         await safe_edit_or_send(callback, text, kb)
     elif target == "nav:accounts":
         text, kb = await render_accounts_panel(callback.from_user.id, db)
-        await safe_edit_or_send(callback, text, kb)
+        await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
     elif target == "adm:refresh":
         from handlers.admin import _render_admin_panel
 
@@ -504,7 +522,7 @@ async def cb_fsm_cancel(
             text, kb = await render_home_dashboard(
                 callback.from_user.id, callback.from_user.first_name or "", db, bot
             )
-            await safe_edit_or_send(callback, text, kb)
+            await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
     elif target.startswith("grp:open:"):
         gid = int(target.split(":")[2])
         from handlers.groups import render_single_group
@@ -516,7 +534,7 @@ async def cb_fsm_cancel(
         text, kb = await render_home_dashboard(
             callback.from_user.id, callback.from_user.first_name or "", db, bot
         )
-        await safe_edit_or_send(callback, text, kb)
+        await edit_or_send_banner(callback, "welcome", text, kb, bot, db, config)
     await callback.answer("Cancelled")
 
 

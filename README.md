@@ -3,6 +3,9 @@
 A fast, lightweight, Oracle Cloud–ready Telegram bot with a **clean, Progressive-Disclosure UI/UX** that archives your media & files into a private Dump Channel and lets you search and send them from **any chat** via Telegram's native **Inline Menu** (`@YourBot query`).
 
 ## Highlights & Professional UI/UX Architecture
+- **PostBot-Style 3D Visual Banner Cards (One-Time Dump Channel Cache)**:
+  - Custom 3D KoshBox mascot banners (`assets/banners/welcome.jpg`, `upload.jpg`, `guide.jpg`) give `/start`, Inline Upload (`/start upload`), `/help`, and `/accounts` a polished, premium visual header card.
+  - **Zero Repeated Server Uploads**: On first startup, the bot uploads each banner **once** from the server to your private `DUMP_CHANNEL_ID` and saves its Telegram `file_id` + `SHA-256` hash in SQLite (`ui_assets`). Every subsequent card render or navigation transition reuses Telegram's cached `file_id` with zero disk/network upload overhead.
 - **Progressive Disclosure & Zero Button Clutter**:
   - **Hero Dashboard (`/start`)**: Focused 3-row layout (`🔍 Search Vault Inline`, `📦 My Files`, `📁 Folders`, `⭐ Favorites`, `⚙️ Settings & Tools`) with native HTML `<blockquote>` cards and breadcrumb navigation.
   - **Clean Upload Receipts**: Uploading a file returns a minimal 2-row receipt (`📤 Send to Chat` + `🛠️ Edit & Organize`) instead of spamming 11 buttons under every message.

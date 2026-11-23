@@ -16,6 +16,7 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
+from utils.banners import BANNER_FILES, warmup_banners_in_dump_channel
 from utils.formatters import (
     back_btn,
     breadcrumb,
@@ -35,6 +36,8 @@ def _is_admin(user_id: int, config: Config) -> bool:
 
 async def _render_admin_panel(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     stats = await db.get_global_stats()
+    cached_banners = await db.list_ui_assets()
+    banner_line = f"🖼️ <b>UI Banners Cached:</b> {len(cached_banners)}/{len(BANNER_FILES)} in Dump Channel"
     text = (
         f"{breadcrumb('System', 'Admin Console')}\n"
         f"🛠️ <b>KoshBox Admin Console</b>\n\n"
@@ -42,7 +45,8 @@ async def _render_admin_panel(db: Database) -> tuple[str, InlineKeyboardMarkup]:
         f"👤 <b>Users:</b> {stats['users']}  <i>({stats['active_24h']} active 24h)</i>\n"
         f"🔐 <b>Vaults:</b> {stats['vaults']}  ·  📁 <b>Groups:</b> {stats['groups']}\n"
         f"📦 <b>Files:</b> {stats['files']}  <i>({stats['trashed']} in trash)</i>\n"
-        f"💾 <b>Archived:</b> {format_size(stats['total_size'])}"
+        f"💾 <b>Archived:</b> {format_size(stats['total_size'])}\n"
+        f"{banner_line}"
         f"</blockquote>\n\n"
         f"<i>Select an administrative action below:</i>"
     )
@@ -60,7 +64,13 @@ async def _render_admin_panel(db: Database) -> tuple[str, InlineKeyboardMarkup]:
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    text="🖼️ Sync UI Banners",
+                    callback_data="adm:sync_banners",
+                ),
                 InlineKeyboardButton(text="🔄 Refresh", callback_data="adm:refresh"),
+            ],
+            [
                 home_btn(),
             ],
         ]
@@ -86,6 +96,23 @@ async def cb_admin_refresh(
     text, kb = await _render_admin_panel(db)
     await safe_edit_or_send(callback, text, kb)
     await callback.answer("Metrics updated")
+
+
+@router.callback_query(F.data == "adm:sync_banners")
+async def cb_admin_sync_banners(
+    callback: CallbackQuery, bot: Bot, db: Database, config: Config
+) -> None:
+    if not callback.from_user or not _is_admin(callback.from_user.id, config):
+        await callback.answer("Admin access required.", show_alert=True)
+        return
+    status = await warmup_banners_in_dump_channel(bot, db, config, force_reupload=False)
+    ok_cnt = sum(1 for v in status.values() if v)
+    text, kb = await _render_admin_panel(db)
+    await safe_edit_or_send(callback, text, kb)
+    await callback.answer(
+        f"🖼️ {ok_cnt}/{len(status)} UI banners cached in Dump Channel!",
+        show_alert=False,
+    )
 
 
 async def _send_db_backup(chat_id: int, bot: Bot, db: Database) -> bool:

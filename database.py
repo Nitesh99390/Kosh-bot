@@ -137,6 +137,15 @@ class Database:
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS ui_assets (
+                asset_key TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT DEFAULT '',
+                dump_message_id INTEGER NOT NULL,
+                sha256 TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
+            );
             """
         )
         await self.conn.commit()
@@ -1041,3 +1050,56 @@ class Database:
         assert self.conn is not None
         cur = await self.conn.execute("SELECT user_id FROM users")
         return [r[0] for r in await cur.fetchall()]
+
+    # -------------------- UI BANNER ASSETS (DUMP CHANNEL CACHE) --------------------
+
+    async def get_ui_asset(self, asset_key: str) -> Optional[dict[str, Any]]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT * FROM ui_assets WHERE asset_key = ?", (asset_key,)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def upsert_ui_asset(
+        self,
+        *,
+        asset_key: str,
+        file_id: str,
+        file_unique_id: str = "",
+        dump_message_id: int = 0,
+        sha256: str = "",
+    ) -> dict[str, Any]:
+        assert self.conn is not None
+        now = int(time.time())
+        await self.conn.execute(
+            """
+            INSERT INTO ui_assets (asset_key, file_id, file_unique_id, dump_message_id, sha256, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asset_key) DO UPDATE SET
+                file_id = excluded.file_id,
+                file_unique_id = excluded.file_unique_id,
+                dump_message_id = excluded.dump_message_id,
+                sha256 = excluded.sha256,
+                updated_at = excluded.updated_at
+            """,
+            (asset_key, file_id, file_unique_id, dump_message_id, sha256, now),
+        )
+        await self.conn.commit()
+        res = await self.get_ui_asset(asset_key)
+        assert res is not None
+        return res
+
+    async def list_ui_assets(self) -> list[dict[str, Any]]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT * FROM ui_assets ORDER BY asset_key ASC"
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def clear_ui_assets(self) -> int:
+        assert self.conn is not None
+        cur = await self.conn.execute("DELETE FROM ui_assets")
+        await self.conn.commit()
+        return cur.rowcount
+

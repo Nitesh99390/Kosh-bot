@@ -140,9 +140,24 @@ async def safe_edit_or_send(
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
-    """Smoothly edit the existing panel message in-place, falling back to sending a clean message."""
+    """
+    Smoothly edit the existing panel message in-place:
+    - If the panel is a PostBot-style photo banner card, edits its caption seamlessly!
+    - If the panel is a text message, edits its text in-place.
+    - Falls back cleanly to sending a new message if needed.
+    """
     if not callback.message:
         return
+    if getattr(callback.message, "photo", None) and len(text) <= 1024:
+        try:
+            await callback.message.edit_caption(
+                caption=text,
+                reply_markup=reply_markup,
+            )
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
     if callback.message.text:
         try:
             await callback.message.edit_text(
@@ -154,11 +169,16 @@ async def safe_edit_or_send(
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return
-    await callback.message.answer(
+    sent = await callback.message.answer(
         text,
         reply_markup=reply_markup,
         disable_web_page_preview=True,
     )
+    if sent and getattr(callback.message, "photo", None):
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
 
 
 async def send_stored_media(

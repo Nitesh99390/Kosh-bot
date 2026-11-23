@@ -12,6 +12,7 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
+from utils.banners import edit_or_send_banner, send_banner_message
 from utils.formatters import (
     back_btn,
     breadcrumb,
@@ -402,7 +403,9 @@ async def cb_reject_link(callback: CallbackQuery, db: Database, bot: Bot) -> Non
 
 
 @router.message(Command("accounts"))
-async def cmd_accounts(message: Message, db: Database) -> None:
+async def cmd_accounts(
+    message: Message, db: Database, bot: Bot, config: Config
+) -> None:
     if not message.from_user:
         return
     await db.ensure_user(
@@ -411,11 +414,13 @@ async def cmd_accounts(message: Message, db: Database) -> None:
         message.from_user.full_name or "",
     )
     text, kb = await render_accounts_panel(message.from_user.id, db)
-    await message.answer(text, reply_markup=kb)
+    await send_banner_message(message, "guide", text, kb, bot, db, config)
 
 
 @router.callback_query(F.data == "nav:accounts")
-async def cb_nav_accounts(callback: CallbackQuery, db: Database) -> None:
+async def cb_nav_accounts(
+    callback: CallbackQuery, db: Database, bot: Bot, config: Config
+) -> None:
     if not callback.from_user:
         return
     await db.ensure_user(
@@ -424,7 +429,7 @@ async def cb_nav_accounts(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.full_name or "",
     )
     text, kb = await render_accounts_panel(callback.from_user.id, db)
-    await safe_edit_or_send(callback, text, kb)
+    await edit_or_send_banner(callback, "guide", text, kb, bot, db, config)
     await callback.answer()
 
 
