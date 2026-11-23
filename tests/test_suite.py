@@ -21,13 +21,21 @@ from utils.banners import (
     warmup_banners_in_dump_channel,
 )
 from utils.formatters import (
+    EFFECT_FIRE,
+    EFFECT_PARTY,
+    EFFECT_THUMBS_UP,
+    batch_delete_chat_messages,
     breadcrumb,
+    build_contact_owner_kb,
     build_file_card_text,
     build_file_keyboard,
     build_file_link_keyboard,
     build_file_manage_keyboard,
+    build_trial_expiry_notice_text,
+    build_trial_locked_card,
     build_upload_quick_keyboard,
     copy_btn,
+    execute_due_scheduled_deletes,
     format_duration,
     format_expiry_badge,
     format_size,
@@ -54,6 +62,9 @@ class _DummyBot:
         self.edited_messages: list[dict] = []
         self.forwarded_messages: list[tuple[int, int, int]] = []
         self.deleted_messages: list[tuple[int, int]] = []
+        self.batch_deleted_calls: list[tuple[int, list[int]]] = []
+        self.batch_copied_calls: list[dict] = []
+        self.effects_used: list[str] = []
         self._seq = 0
 
     async def get_me(self):
@@ -83,9 +94,16 @@ class _DummyBot:
         return SimpleNamespace(message_id=7000 + self._seq, photo=[p_obj])
 
     async def send_audio(
-        self, chat_id: int, audio: str, caption: str = "", protect_content: bool = False
+        self,
+        chat_id: int,
+        audio: str,
+        caption: str = "",
+        protect_content: bool = False,
+        message_effect_id: str | None = None,
     ):
         self._seq += 1
+        if message_effect_id:
+            self.effects_used.append(message_effect_id)
         self.sent_media.append(
             {
                 "type": "audio",
@@ -93,6 +111,7 @@ class _DummyBot:
                 "file_id": audio,
                 "caption": caption,
                 "protect": protect_content,
+                "effect": message_effect_id,
             }
         )
         return SimpleNamespace(message_id=8000 + self._seq)
@@ -103,8 +122,11 @@ class _DummyBot:
         document: str,
         caption: str = "",
         protect_content: bool = False,
+        message_effect_id: str | None = None,
     ):
         self._seq += 1
+        if message_effect_id:
+            self.effects_used.append(message_effect_id)
         self.sent_media.append(
             {
                 "type": "document",
@@ -112,6 +134,7 @@ class _DummyBot:
                 "file_id": document,
                 "caption": caption,
                 "protect": protect_content,
+                "effect": message_effect_id,
             }
         )
         return SimpleNamespace(message_id=8000 + self._seq)
@@ -123,8 +146,11 @@ class _DummyBot:
         protect_content: bool = False,
         reply_markup=None,
         disable_web_page_preview: bool = False,
+        message_effect_id: str | None = None,
     ):
         self._seq += 1
+        if message_effect_id:
+            self.effects_used.append(message_effect_id)
         self.sent_media.append(
             {
                 "type": "msg",
@@ -132,6 +158,7 @@ class _DummyBot:
                 "text": text,
                 "protect": protect_content,
                 "reply_markup": reply_markup,
+                "effect": message_effect_id,
             }
         )
         return SimpleNamespace(message_id=9000 + self._seq)
@@ -183,6 +210,34 @@ class _DummyBot:
 
     async def delete_message(self, chat_id: int, message_id: int):
         self.deleted_messages.append((chat_id, message_id))
+
+    async def delete_messages(self, chat_id: int, message_ids: list[int]):
+        self.batch_deleted_calls.append((chat_id, list(message_ids)))
+        for mid in message_ids:
+            self.deleted_messages.append((chat_id, mid))
+        return True
+
+    async def copy_messages(
+        self,
+        chat_id: int,
+        from_chat_id: int,
+        message_ids: list[int],
+        protect_content: bool = False,
+    ):
+        assert len(message_ids) <= 100, "copy_messages must chunk <= 100 IDs"
+        self.batch_copied_calls.append(
+            {
+                "chat_id": chat_id,
+                "from_chat_id": from_chat_id,
+                "message_ids": list(message_ids),
+                "protect": protect_content,
+            }
+        )
+        out = []
+        for _ in message_ids:
+            self._seq += 1
+            out.append(SimpleNamespace(message_id=12000 + self._seq))
+        return out
 
 
 async def run_tests() -> None:
@@ -422,8 +477,8 @@ async def run_tests() -> None:
         )
 
         set_txt, set_kb = await start_help._render_settings_panel(1001, db)
-        assert "Settings & Security" in set_txt
-        assert len(set_kb.inline_keyboard) == 5
+        assert "Settings" in set_txt
+        assert len(set_kb.inline_keyboard) == 6
 
         st_txt, st_kb = await start_help._render_stats_panel(1001, db)
         assert "Vault Analytics" in st_txt
@@ -551,7 +606,14 @@ async def run_tests() -> None:
                 self._data.clear()
 
         def _make_audio_msg(idx: int, uid: int = 2026):
-            async def _reply(txt: str, reply_markup=None, disable_web_page_preview: bool = False):
+            async def _reply(
+                txt: str,
+                reply_markup=None,
+                disable_web_page_preview: bool = False,
+                message_effect_id: str | None = None,
+            ):
+                if message_effect_id:
+                    dummy_bot.effects_used.append(message_effect_id)
                 replies_received.append((txt, reply_markup))
                 return SimpleNamespace(message_id=50000 + len(replies_received))
 
@@ -647,23 +709,44 @@ async def run_tests() -> None:
         assert len(dummy_bot.edited_messages) == 1, "Single live collector card edited once after burst!"
         assert "100</b> queued" in dummy_bot.edited_messages[0]["text"]
 
-        # 19. Large 100-File Pack Chunked Delivery (20 per batch + Next Batch button)
+        # 19. Large 100-File Pack Native 100-in-1 Batch Delivery (`copy_messages`) + Continuation >100
+        # Add 1 extra file (101 total) to verify both 100-in-1 batch copy AND >100 continuation!
+        extra_f = await db.add_file(
+            vault_id=u_burst["vault_id"],
+            uploader_user_id=2026,
+            group_id=None,
+            media_type="audio",
+            file_id="EXTRA_101",
+            file_unique_id="UNIQ_MONKEY_101",
+            dump_message_id=99999,
+            title="Little_Monkey_King_Ep_101.mp3",
+            file_size=2_000_000,
+        )
+        await db.append_files_to_pack(big_pack["id"], [extra_f["id"]])
+        big_pack = await db.get_pack(big_pack["id"])
+        assert big_pack["item_count"] == 101
+
         dummy_bot.sent_media.clear()
+        dummy_bot.batch_copied_calls.clear()
         delivered_batch_1 = await packs.deliver_pack_to_chat(
             dummy_bot,  # type: ignore[arg-type]
             7777,
             big_pack,
             db,
             start_offset=0,
+            dump_channel_id=dummy_cfg.dump_channel_id,
+            celebrate=True,
         )
-        assert delivered_batch_1 == packs.PACK_DELIVERY_BATCH_SIZE  # 20 files
-        # Check continuation footer message has `pk:more:<TOKEN>:20` button
+        assert delivered_batch_1 == 100  # Native 100-in-1 batch!
+        assert len(dummy_bot.batch_copied_calls) == 1
+        assert len(dummy_bot.batch_copied_calls[0]["message_ids"]) == 100
+        # Check continuation footer message has `pk:more:<TOKEN>:100` button
         footer_msgs = [
             m for m in dummy_bot.sent_media if m["type"] == "msg" and m.get("reply_markup")
         ]
         assert len(footer_msgs) == 1
         more_cb = footer_msgs[0]["reply_markup"].inline_keyboard[0][0].callback_data
-        assert more_cb == f"pk:more:{big_pack['share_token']}:20"
+        assert more_cb == f"pk:more:{big_pack['share_token']}:100"
         assert len(more_cb.encode("utf-8")) <= 64
 
         # 20. Advanced Bug-Proof Link Security: Max Views, Pause/Resume, Edit Pack, PIN Brute-Force Lockout
@@ -695,9 +778,9 @@ async def run_tests() -> None:
         await db.set_pack_description(big_pack["id"], "Full Audiobook Season 1")
         p_files = await db.get_pack_files(big_pack["id"])
         assert await db.remove_file_from_pack(big_pack["id"], p_files[-1]["id"]) is True
-        assert (await db.get_pack(big_pack["id"]))["item_count"] == 99
-        await db.append_files_to_pack(big_pack["id"], [p_files[-1]["id"]])
         assert (await db.get_pack(big_pack["id"]))["item_count"] == 100
+        await db.append_files_to_pack(big_pack["id"], [p_files[-1]["id"]])
+        assert (await db.get_pack(big_pack["id"]))["item_count"] == 101
 
         edit_drawer = await packs.render_pack_edit_drawer(2026, big_pack["id"], db, page=0)
         assert edit_drawer is not None
@@ -1011,8 +1094,230 @@ async def run_tests() -> None:
         assert "banner_ack:Home" in unhashable_events
         assert "edit_caption:Hero caption" in unhashable_events
 
+        # 29. Permanent Group-Safe Trial System + Atomic 1×/User Claim Lock + Dynamic Per-Owner Contact
+        creator_a = await db.ensure_user(4001, "creator_alpha", "Creator Alpha")
+        creator_no_user = await db.ensure_user(4002, "", "No Handle Owner")
+        visitor_a = await db.ensure_user(5001, "visitor_one", "Visitor One")
+        visitor_b = await db.ensure_user(5002, "visitor_two", "Visitor Two")
+
+        # Dynamic Per-Owner Contact Support resolution:
+        # Fallback to @username when support_contact is unset
+        assert (
+            await db.resolve_owner_contact_url(creator_a["vault_id"], preferred_user_id=4001)
+            == "https://t.me/creator_alpha"
+        )
+        # Override with custom @support handle -> normalized https://t.me/...
+        saved_sup = await db.set_support_contact(4001, "@AlphaSalesSupport")
+        assert saved_sup == "https://t.me/AlphaSalesSupport"
+        assert (
+            await db.resolve_owner_contact_url(creator_a["vault_id"], preferred_user_id=4001)
+            == "https://t.me/AlphaSalesSupport"
+        )
+        # Owner with neither support_contact nor @username -> cleanly returns '' (never invalid URL)
+        assert (
+            await db.resolve_owner_contact_url(
+                creator_no_user["vault_id"], preferred_user_id=4002
+            )
+            == ""
+        )
+        no_contact_txt, no_contact_kb = build_trial_locked_card("", title="Secret Demo")
+        assert "Trial Access Ended" in no_contact_txt
+        assert no_contact_kb is None  # Cleanly omitted when owner has no contact!
+
+        # Configure Creator Alpha: 2-hour trial auto-delete (7200s), No-Fwd ON, Default 1×/User ON
+        await db.set_auto_delete_ttl(4001, 7200)
+        assert format_ttl_short(7200) == "2h"
+        await db.toggle_protect_content(4001)
+        assert await db.toggle_default_one_time(4001) is True
+
+        trial_f1 = await db.add_file(
+            vault_id=creator_a["vault_id"],
+            uploader_user_id=4001,
+            group_id=None,
+            media_type="document",
+            file_id="TRIAL_DOC_1",
+            file_unique_id="TRIAL_UNIQ_1",
+            dump_message_id=70001,
+            title="Course_Module_1.pdf",
+            file_size=4_000_000,
+        )
+        trial_f2 = await db.add_file(
+            vault_id=creator_a["vault_id"],
+            uploader_user_id=4001,
+            group_id=None,
+            media_type="document",
+            file_id="TRIAL_DOC_2",
+            file_unique_id="TRIAL_UNIQ_2",
+            dump_message_id=70002,
+            title="Course_Module_2.pdf",
+            file_size=4_000_000,
+        )
+        trial_pack = await db.create_pack(
+            vault_id=creator_a["vault_id"],
+            creator_user_id=4001,
+            title="Flagship Masterclass Trial",
+            file_ids=[trial_f1["id"], trial_f2["id"]],
+            protect_content=True,
+        )
+        # Permanent by default + inherits default_one_time=1
+        assert trial_pack["expires_at"] is None
+        assert trial_pack["max_views"] == 0
+        assert trial_pack["one_time_per_user"] == 1
+
+        # Helper to simulate /start pack_<token> messages
+        start_answers: list[tuple[str, object]] = []
+
+        def _make_start_msg(uid: int, uname: str, fname: str):
+            async def _ans(txt: str, reply_markup=None, disable_web_page_preview: bool = False, **kw):
+                start_answers.append((txt, reply_markup))
+                return SimpleNamespace(message_id=60000 + len(start_answers))
+
+            return SimpleNamespace(
+                message_id=61000 + uid,
+                chat=SimpleNamespace(id=uid, type="private"),
+                from_user=SimpleNamespace(id=uid, username=uname, full_name=fname, first_name=fname),
+                answer=_ans,
+            )
+
+        # (a) Owner Preview: Creator opening their own 1×/User link is NEVER blocked and consumes 0 claims!
+        dummy_bot.batch_copied_calls.clear()
+        await start_help.cmd_start(
+            _make_start_msg(4001, "creator_alpha", "Creator Alpha"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{trial_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert len(dummy_bot.batch_copied_calls) == 1
+        assert await db.count_link_claims("pack", trial_pack["id"]) == 0
+        assert (await db.get_pack(trial_pack["id"]))["views"] == 0
+
+        # (b) First Open by Visitor A: Claims slot atomically, delivers protected files, schedules 2h delete
+        dummy_bot.batch_copied_calls.clear()
+        start_answers.clear()
+        await start_help.cmd_start(
+            _make_start_msg(5001, "visitor_one", "Visitor One"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{trial_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert len(dummy_bot.batch_copied_calls) == 1
+        assert dummy_bot.batch_copied_calls[0]["protect"] is True
+        assert await db.count_link_claims("pack", trial_pack["id"]) == 1
+        assert len(start_answers) == 0  # Delivered pack, not locked card
+
+        # (c) Repeat Open by Visitor A: Sends ZERO files, shows `🔒 Trial Access Ended` + Creator Alpha's Contact button!
+        dummy_bot.batch_copied_calls.clear()
+        dummy_bot.sent_media.clear()
+        start_answers.clear()
+        await start_help.cmd_start(
+            _make_start_msg(5001, "visitor_one", "Visitor One"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{trial_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert len(dummy_bot.batch_copied_calls) == 0, "Repeat visitor must receive ZERO files!"
+        assert len(dummy_bot.sent_media) == 0, "Repeat visitor must receive ZERO media!"
+        assert len(start_answers) == 1
+        locked_msg_txt, locked_msg_kb = start_answers[0]
+        assert "Trial Access Ended" in locked_msg_txt
+        assert locked_msg_kb is not None
+        contact_btn = locked_msg_kb.inline_keyboard[0][0]
+        assert contact_btn.text == "💬 Contact Owner"
+        assert contact_btn.url == "https://t.me/AlphaSalesSupport"
+        assert contact_btn.style == "primary"
+
+        # (d) New Visitor B on the SAME permanent link: Gets fresh 1-time trial + independent timer!
+        await start_help.cmd_start(
+            _make_start_msg(5002, "visitor_two", "Visitor Two"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{trial_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert len(dummy_bot.batch_copied_calls) == 1
+        assert await db.count_link_claims("pack", trial_pack["id"]) == 2
+
+        # (e) Resetting link (`regenerate_pack_token`) clears `link_user_claims`!
+        reset_tok = await db.regenerate_pack_token(trial_pack["id"])
+        assert reset_tok != trial_pack["share_token"]
+        assert await db.count_link_claims("pack", trial_pack["id"]) == 0
+
+        # 30. Restart-Safe Batch Auto-Delete (`scheduled_deletes` + `bot.delete_messages()` <=100 chunking)
+        # Verify Visitor A & B scheduled_deletes rows were persisted in SQLite, plus test >100 msg chunking
+        big_msg_ids = list(range(90001, 90251))  # 250 messages -> must chunk into 3 calls (100 + 100 + 50)
+        await db.add_scheduled_delete(
+            chat_id=5001,
+            message_ids=big_msg_ids,
+            delete_at=int(time.time()) - 5,  # Already due!
+            notify_text=build_trial_expiry_notice_text("Flagship Masterclass Trial", 7200),
+            contact_url="https://t.me/AlphaSalesSupport",
+        )
+        # Force earlier scheduled jobs to be due as well
+        await db.conn.execute("UPDATE scheduled_deletes SET delete_at = ?", (int(time.time()) - 2,))
+        await db.conn.commit()
+
+        dummy_bot.batch_deleted_calls.clear()
+        dummy_bot.sent_media.clear()
+        swept = await execute_due_scheduled_deletes(dummy_bot, db, limit=50)
+        assert swept >= 3
+        # Confirm 250-message job was split into chunks of <= 100 (100, 100, 50)
+        chunk_sizes_5001 = [
+            len(mids) for cid, mids in dummy_bot.batch_deleted_calls if cid == 5001
+        ]
+        assert 100 in chunk_sizes_5001 and 50 in chunk_sizes_5001
+        assert all(sz <= 100 for sz in chunk_sizes_5001)
+
+        # Confirm post-expiry notice was delivered with `💬 Contact Owner` primary button!
+        expiry_notices = [
+            m
+            for m in dummy_bot.sent_media
+            if m["type"] == "msg" and "Trial Session Ended" in m["text"]
+        ]
+        assert len(expiry_notices) >= 1
+        exp_kb = expiry_notices[-1]["reply_markup"]
+        assert exp_kb is not None
+        assert exp_kb.inline_keyboard[0][0].text == "💬 Contact Owner"
+        assert exp_kb.inline_keyboard[0][0].url == "https://t.me/AlphaSalesSupport"
+        assert exp_kb.inline_keyboard[0][0].style == "primary"
+
+        # 31. Bot API 9.4+ Polish: `<blockquote expandable>`, Message Effects, & Mobile 360px Ergonomics (<=2 btns/row, <=64B cb)
+        big_pack_det = await packs.render_pack_detail(
+            2026, big_pack["id"], db, dummy_bot  # type: ignore[arg-type]
+        )
+        assert big_pack_det is not None
+        assert "<blockquote expandable>" in big_pack_det[0]
+        assert EFFECT_PARTY in dummy_bot.effects_used
+        assert EFFECT_FIRE in dummy_bot.effects_used
+
+        # Check mobile-first max 2 buttons per row (3 allowed only for compact pagination ◀ 1/3 ▶)
+        all_kbs = [
+            home_kb,
+            kb_primary,
+            kb_manage,
+            kb_link,
+            up_kb,
+            set_kb,
+            pack_list_kb,
+            big_pack_det[1],
+            edit_drawer[1],
+        ]
+        for kb_item in all_kbs:
+            for row in kb_item.inline_keyboard:
+                is_pager = len(row) == 3 and row[1].callback_data == "noop"
+                assert is_pager or len(row) <= 2, f"Row exceeds 2 buttons on 360px screen: {[b.text for b in row]}"
+                for btn in row:
+                    if btn.callback_data:
+                        assert len(btn.callback_data.encode("utf-8")) <= 64
+
         await db.close()
-        print("ALL PRO FEATURES, SECURITY, PACKS, LOW-LATENCY & ZERO-LEAK TESTS PASSED!")
+        print("ALL PRO FEATURES, TRIAL LOCKS, BATCH APIS, BOT API 9.4 UX & ZERO-LEAK TESTS PASSED!")
 
 
 if __name__ == "__main__":

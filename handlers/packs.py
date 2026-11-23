@@ -11,11 +11,16 @@ from aiogram.types import (
     Message,
 )
 
+from config import Config
 from database import Database
 from utils.formatters import (
+    BATCH_CHUNK_SIZE,
+    EFFECT_FIRE,
+    EFFECT_PARTY,
     MEDIA_ICONS,
     back_btn,
     breadcrumb,
+    build_trial_expiry_notice_text,
     cancel_kb,
     copy_btn,
     esc,
@@ -25,8 +30,9 @@ from utils.formatters import (
     format_ttl_short,
     home_btn,
     safe_edit_or_send,
-    schedule_auto_delete,
+    schedule_persistent_auto_delete,
     send_stored_media,
+    send_with_effect,
     share_url_btn,
     tg_retry_call,
     toggle_label,
@@ -36,7 +42,7 @@ from utils.states import PackStates
 router = Router(name="packs")
 
 PACKS_PAGE_SIZE = 5
-PACK_DELIVERY_BATCH_SIZE = 20
+PACK_DELIVERY_BATCH_SIZE = 100
 PACK_ITEMS_EDIT_PAGE_SIZE = 6
 
 # Per-(chat_id, pack_id) lock to prevent duplicate overlapping deliveries on rapid clicks
@@ -53,13 +59,17 @@ async def deliver_pack_to_chat(
     force_protect: bool = False,
     start_offset: int = 0,
     count_view: bool = True,
+    dump_channel_id: Optional[int] = None,
+    contact_url: str = "",
+    celebrate: bool = False,
 ) -> int:
     """
-    Flood-safe, chunked delivery of Multi-File Packs (supports 100+ files cleanly!):
+    Ultra-fast, zero-FloodWait Pack Delivery using Telegram's native 100-in-1 `bot.copy_messages()`:
     - Prevents overlapping duplicate runs per `(chat_id, pack['id'])`.
-    - Delivers up to `PACK_DELIVERY_BATCH_SIZE` (20) files per chunk so Telegram never
-      triggers harsh 429 FloodWaits, and offers a 1-tap `📥 Send Next Batch` button!
-    - Supports `protect_content` (No-Forward) and `auto_delete_ttl` cleanup.
+    - Copies up to 100 files from `dump_channel_id` in a SINGLE Bot API call (`copy_messages`),
+      preserving `protect_content` (No-Forward / No-Save) and cutting 100 HTTP calls down to 1!
+    - Gracefully falls back to `send_stored_media` if `dump_channel_id` is unavailable or custom captions require it.
+    - Persists restart-safe `scheduled_deletes` timer + post-expiry Contact Owner notice!
     """
     delivery_key = (chat_id, int(pack["id"]))
     if delivery_key in _ACTIVE_DELIVERIES:
@@ -94,39 +104,86 @@ async def deliver_pack_to_chat(
             else ""
         )
         ttl_line = (
-            f"\n<i>⏱ Auto-deletes in {format_ttl_short(auto_delete_ttl)}</i>"
+            f"\n<i>⏱ Trial auto-deletes in {format_ttl_short(auto_delete_ttl)}</i>"
             if auto_delete_ttl > 0
             else ""
         )
 
         sent_ids: list[int] = []
-        header = await tg_retry_call(
+        header_effect = EFFECT_FIRE if (celebrate and start_offset == 0) else None
+        header = await send_with_effect(
             bot.send_message,
             chat_id=chat_id,
             text=(
-                f"📦 <b>{esc(pack['title'])}</b> · <i>{range_badge} ({format_size(pack['total_size'])})</i>"
+                f"🎒 <b>{esc(pack['title'])}</b> · <i>{range_badge} ({format_size(pack['total_size'])})</i>"
                 f"{desc_line}{ttl_line}"
             ),
             protect_content=protect,
+            message_effect_id=header_effect,
         )
         if getattr(header, "message_id", None):
             sent_ids.append(header.message_id)
 
         delivered = 0
-        for idx, f in enumerate(slice_items):
-            sent = await send_stored_media(
-                bot,
-                chat_id,
-                f,
-                protect_content=protect,
-                auto_delete_ttl=0,  # grouped cleanup below
-            )
-            if sent:
-                delivered += 1
-                if getattr(sent, "message_id", None):
-                    sent_ids.append(sent.message_id)
-            # Gentle pacing for large batches to stay well below Telegram 20-msg/sec limits
-            await asyncio.sleep(0.08 if (idx + 1) % 10 else 0.35)
+        copy_batch_fn = getattr(bot, "copy_messages", None)
+        can_batch_copy = (
+            copy_batch_fn is not None
+            and dump_channel_id is not None
+            and len(slice_items) > 1
+            and all(int(f.get("dump_message_id") or 0) > 0 for f in slice_items)
+        )
+
+        if can_batch_copy:
+            # Telegram Bot API `copy_messages` requires `message_ids` in strictly increasing order (1..100)
+            ordered = sorted(slice_items, key=lambda x: int(x["dump_message_id"]))
+            dump_ids: list[int] = []
+            prev_mid = -1
+            strictly_increasing = True
+            for it in ordered:
+                mid = int(it["dump_message_id"])
+                if mid <= prev_mid:
+                    strictly_increasing = False
+                    break
+                dump_ids.append(mid)
+                prev_mid = mid
+
+            if strictly_increasing:
+                try:
+                    for c_start in range(0, len(dump_ids), BATCH_CHUNK_SIZE):
+                        chunk_ids = dump_ids[c_start : c_start + BATCH_CHUNK_SIZE]
+                        copied_res = await tg_retry_call(
+                            copy_batch_fn,
+                            chat_id=chat_id,
+                            from_chat_id=dump_channel_id,
+                            message_ids=chunk_ids,
+                            protect_content=protect,
+                        )
+                        if copied_res:
+                            for m_obj in copied_res:
+                                mid_val = getattr(m_obj, "message_id", None) or (
+                                    m_obj if isinstance(m_obj, int) else None
+                                )
+                                if mid_val:
+                                    sent_ids.append(int(mid_val))
+                            delivered += len(copied_res)
+                except Exception:
+                    delivered = 0
+
+        if delivered == 0:
+            # Clean fallback to cached file_id delivery
+            for idx, f in enumerate(slice_items):
+                sent = await send_stored_media(
+                    bot,
+                    chat_id,
+                    f,
+                    protect_content=protect,
+                    auto_delete_ttl=0,  # grouped cleanup below
+                )
+                if sent:
+                    delivered += 1
+                    if getattr(sent, "message_id", None):
+                        sent_ids.append(sent.message_id)
+                await asyncio.sleep(0.05 if (idx + 1) % 15 else 0.25)
 
         remaining = total_items - end_idx
         if remaining > 0:
@@ -135,7 +192,7 @@ async def deliver_pack_to_chat(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text=f"📥 Send Next {nxt_count} ({end_idx + 1}–{end_idx + nxt_count} of {total_items})",
+                            text=f"📥 Next {nxt_count} ({end_idx + 1}–{end_idx + nxt_count}/{total_items})",
                             callback_data=f"pk:more:{pack['share_token']}:{end_idx}",
                             style="primary",
                         )
@@ -156,7 +213,21 @@ async def deliver_pack_to_chat(
                 sent_ids.append(footer.message_id)
 
         if auto_delete_ttl > 0 and sent_ids:
-            schedule_auto_delete(bot, chat_id, sent_ids, auto_delete_ttl)
+            resolved_contact = contact_url or await db.resolve_owner_contact_url(
+                pack["vault_id"], preferred_user_id=pack.get("creator_user_id")
+            )
+            notice = build_trial_expiry_notice_text(
+                pack.get("title") or "Pack", auto_delete_ttl
+            )
+            await schedule_persistent_auto_delete(
+                bot,
+                db,
+                chat_id,
+                sent_ids,
+                auto_delete_ttl,
+                notify_text=notice,
+                contact_url=resolved_contact,
+            )
 
         return delivered
     finally:
@@ -165,9 +236,12 @@ async def deliver_pack_to_chat(
 
 @router.callback_query(F.data.startswith("pk:more:"))
 async def cb_pack_deliver_more(
-    callback: CallbackQuery, db: Database, bot: Bot
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    config: Optional[Config] = None,
 ) -> None:
-    """Delivers the next paginated batch of files for a large Pack (e.g. 50–100+ files)."""
+    """Delivers the next paginated batch of files for a large Pack (e.g. 100+ files)."""
     if not callback.from_user or not callback.message:
         return
     parts = callback.data.split(":")
@@ -177,7 +251,7 @@ async def cb_pack_deliver_more(
     token = parts[2]
     offset = int(parts[3])
 
-    # Allow continuation even if max_views reached after initial unlock (check raw token, block only if revoked/expired/paused)
+    # Allow continuation even if max_views or 1x/user was recorded on initial unlock
     pack = await db.get_pack_by_token(token, include_unavailable=True)
     if not pack or pack["item_count"] == 0:
         await callback.answer("⚠️ Pack no longer available.", show_alert=True)
@@ -213,6 +287,7 @@ async def cb_pack_deliver_more(
         auto_delete_ttl=ttl,
         start_offset=offset,
         count_view=False,
+        dump_channel_id=config.dump_channel_id if config else None,
     )
 
 
@@ -245,9 +320,11 @@ async def render_packs_list(
             badges = ""
             if p.get("is_paused"):
                 badges += "⏸ "
+            if p.get("one_time_per_user"):
+                badges += "👤 "
             if p.get("pin_hash"):
                 badges += "🔒 "
-            lbl = f"{badges}🎒 {p['title'][:22]} ({p['item_count']}) · {format_size(p['total_size'])}"
+            lbl = f"{badges}🎒 {p['title'][:20]} ({p['item_count']}) · {format_size(p['total_size'])}"
             buttons.append(
                 [InlineKeyboardButton(text=lbl, callback_data=f"pk:open:{p['id']}")]
             )
@@ -298,38 +375,44 @@ async def render_pack_detail(
 
     max_v = int(pack.get("max_views") or 0)
     cur_v = int(pack.get("views") or 0)
+    claims_cnt = int(pack.get("unique_claims") or 0)
     sec_parts = [format_max_views_badge(cur_v, max_v)]
+    if pack.get("one_time_per_user"):
+        sec_parts.append(f"👤 1×/User ({claims_cnt})")
     if pack.get("is_paused"):
         sec_parts.append("⏸ Paused")
     if pack.get("pin_hash"):
         sec_parts.append("🔑 PIN")
     if pack.get("protect_content"):
         sec_parts.append("🛡️ No-Fwd")
-    if pack.get("expires_at"):
-        sec_parts.append(f"⏳ {format_expiry_badge(pack['expires_at'])}")
+    exp_lbl_badge = format_expiry_badge(pack.get("expires_at"))
+    sec_parts.append(f"⏳ {exp_lbl_badge}")
 
     preview_lines: list[str] = []
     if pack.get("description"):
         preview_lines.append(f"💬 <i>{esc(pack['description'][:80])}</i>")
-    for f in items[:5]:
+    for f in items[:25]:
         ic = MEDIA_ICONS.get(f["media_type"], "📦")
-        preview_lines.append(f"• {ic} {esc(f['title'][:32])}")
-    if len(items) > 5:
-        preview_lines.append(f"<i>…+{len(items) - 5} more</i>")
+        preview_lines.append(f"• {ic} {esc(f['title'][:34])}")
+    if len(items) > 25:
+        preview_lines.append(f"<i>…+{len(items) - 25} more files</i>")
     if not preview_lines:
         preview_lines.append("<i>No active files</i>")
 
+    quote_tag = "<blockquote expandable>" if len(items) > 4 else "<blockquote>"
     text = (
         f"{breadcrumb('Vault', 'Packs', esc(pack['title'][:18]))}\n"
         f"🎒 <b>{esc(pack['title'])}</b>\n"
         f"<i>{pack['item_count']} files · {format_size(pack['total_size'])} · {' · '.join(sec_parts)}</i>\n"
-        f"<blockquote>" + "\n".join(preview_lines) + "</blockquote>\n"
+        f"{quote_tag}" + "\n".join(preview_lines) + "</blockquote>\n"
         f"🔗 <code>{share_url}</code>"
     )
 
+    one_time_on = bool(pack.get("one_time_per_user"))
+    one_time_lbl = f"👤 1×/User: {'ON' if one_time_on else 'OFF'}"
     pin_lbl = "🔑 PIN: ON" if pack.get("pin_hash") else "🔑 Set PIN"
     prot_lbl = toggle_label(bool(pack.get("protect_content")), "No-Fwd")
-    exp_lbl = f"⏳ {format_expiry_badge(pack.get('expires_at'))}"
+    exp_lbl = f"⏳ {exp_lbl_badge}"
     lim_lbl = f"👁 Limit: {cur_v}/{max_v}" if max_v > 0 else "👁 Limit: ∞"
     pause_lbl = "▶️ Resume" if pack.get("is_paused") else "⏸ Pause"
 
@@ -344,15 +427,22 @@ async def render_pack_detail(
                 InlineKeyboardButton(text="🛠️ Edit Pack", callback_data=f"pk:edit:{pack_id}"),
             ],
             [
-                InlineKeyboardButton(text=pin_lbl, callback_data=f"pk:pin:{pack_id}"),
+                InlineKeyboardButton(
+                    text=one_time_lbl,
+                    callback_data=f"pk:1x:{pack_id}",
+                    style="success" if one_time_on else None,
+                ),
                 InlineKeyboardButton(text=prot_lbl, callback_data=f"pk:prot:{pack_id}"),
             ],
             [
+                InlineKeyboardButton(text=pin_lbl, callback_data=f"pk:pin:{pack_id}"),
                 InlineKeyboardButton(text=exp_lbl, callback_data=f"pk:exp:{pack_id}"),
-                InlineKeyboardButton(text=lim_lbl, callback_data=f"pk:maxv:{pack_id}"),
             ],
             [
+                InlineKeyboardButton(text=lim_lbl, callback_data=f"pk:maxv:{pack_id}"),
                 InlineKeyboardButton(text=pause_lbl, callback_data=f"pk:pause:{pack_id}"),
+            ],
+            [
                 InlineKeyboardButton(text="🔄 Reset", callback_data=f"pk:regen:{pack_id}"),
                 InlineKeyboardButton(
                     text="🗑️ Delete",
@@ -398,8 +488,10 @@ async def render_pack_edit_drawer(
                 style="primary",
             ),
             InlineKeyboardButton(text="✏️ Rename", callback_data=f"pk:ren:{pack_id}"),
-            InlineKeyboardButton(text="💬 Note", callback_data=f"pk:desc:{pack_id}"),
-        ]
+        ],
+        [
+            InlineKeyboardButton(text="💬 Welcome Note", callback_data=f"pk:desc:{pack_id}"),
+        ],
     ]
 
     for f in slice_items:
@@ -856,8 +948,12 @@ async def fsm_pack_save_title(
         message.from_user.id, pack["id"], db, bot, bot_username=bot_username
     )
     if rendered:
-        await message.answer(
-            rendered[0], reply_markup=rendered[1], disable_web_page_preview=True
+        await send_with_effect(
+            message.answer,
+            rendered[0],
+            reply_markup=rendered[1],
+            disable_web_page_preview=True,
+            message_effect_id=EFFECT_PARTY,
         )
 
 
@@ -1049,7 +1145,12 @@ async def fsm_pack_desc_save(
 
 
 @router.callback_query(F.data.startswith("pk:get:"))
-async def cb_pack_get_all(callback: CallbackQuery, db: Database, bot: Bot) -> None:
+async def cb_pack_get_all(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    config: Optional[Config] = None,
+) -> None:
     if not callback.from_user or not callback.message:
         return
     pid = int(callback.data.split(":")[2])
@@ -1066,6 +1167,7 @@ async def cb_pack_get_all(callback: CallbackQuery, db: Database, bot: Bot) -> No
         db,
         auto_delete_ttl=int(user.get("auto_delete_ttl") or 0),
         count_view=False,  # Owner testing their own pack doesn't burn max_views quota!
+        dump_channel_id=config.dump_channel_id if config else None,
     )
 
 
@@ -1126,6 +1228,34 @@ async def fsm_pack_set_pin(
         await message.answer(
             rendered[0], reply_markup=rendered[1], disable_web_page_preview=True
         )
+
+
+@router.callback_query(F.data.startswith("pk:1x:"))
+async def cb_pack_toggle_one_time(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    if not callback.from_user:
+        return
+    pid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    pack = await db.get_pack(pid)
+    if not pack or pack["vault_id"] != user["vault_id"]:
+        await callback.answer("Pack not found.", show_alert=True)
+        return
+    on = await db.toggle_pack_one_time(pid)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
+    ans = "👤 1×/User Trial Lock ON" if on else "👤 1×/User Trial Lock OFF"
+    if rendered:
+        await safe_edit_or_send(
+            callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
+        )
+    else:
+        await callback.answer(ans)
 
 
 @router.callback_query(F.data.startswith("pk:prot:"))
@@ -1260,7 +1390,7 @@ async def cb_pack_regen(
     rendered = await render_pack_detail(
         callback.from_user.id, pid, db, bot, bot_username=bot_username
     )
-    ans = "🔄 New pack link generated (views reset)"
+    ans = "🔄 New pack link generated (views & user claims reset)"
     if rendered:
         await safe_edit_or_send(
             callback, rendered[0], rendered[1], answer_text=ans, also_ack=True

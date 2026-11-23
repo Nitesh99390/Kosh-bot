@@ -52,9 +52,18 @@ TTL_LABELS = {
     300: "5m",
     900: "15m",
     3600: "1h",
+    7200: "2h",
     86400: "24h",
     604800: "7d",
 }
+
+# Official Telegram Bot API Built-in Free Full-Screen Message Effects (Private Chats)
+EFFECT_PARTY = "5046509860389126442"  # 🎉 Confetti / Party
+EFFECT_FIRE = "5104841245755180586"   # 🔥 Fire
+EFFECT_THUMBS_UP = "5107584321108051014"  # 👍 Thumbs Up
+EFFECT_HEART = "5159385139981059251"  # ❤️ Heart
+
+BATCH_CHUNK_SIZE = 100
 
 DIVIDER = "──────────────────────"
 
@@ -225,18 +234,228 @@ def back_btn(callback_data: str, label: str = "◀ Back") -> InlineKeyboardButto
     return InlineKeyboardButton(text=label, callback_data=callback_data)
 
 
-def schedule_auto_delete(
-    bot: Bot, chat_id: int, message_ids: list[int], ttl_seconds: int
+def build_contact_owner_kb(
+    contact_url: str, *, include_home: bool = False
+) -> Optional[InlineKeyboardMarkup]:
+    """Builds a sleek mobile-first keyboard with the owner's primary `💬 Contact Owner` CTA."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if contact_url:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="💬 Contact Owner",
+                    url=contact_url,
+                    style="primary",
+                )
+            ]
+        )
+    if include_home:
+        rows.append([home_btn("🏠 Vault")])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def build_trial_locked_card(
+    contact_url: str = "", *, title: str = ""
+) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """
+    Sleek, respectful Repeat-Open card shown when a visitor re-opens a 1-Time Per-User Trial link
+    (sends ZERO files and links directly to the content owner).
+    """
+    sub = f" · <i>{esc(title[:32])}</i>" if title else ""
+    text = (
+        f"🔒 <b>Trial Access Ended</b>{sub}\n"
+        f"<blockquote>You've already used your one-time trial for this content. "
+        f"Reach out to the owner below for full access.</blockquote>"
+    )
+    return text, build_contact_owner_kb(contact_url)
+
+
+def build_trial_expiry_notice_text(title: str = "", ttl_seconds: int = 0) -> str:
+    """Default sleek expiry notice sent right when a user's auto-delete trial timer ends."""
+    dur = f" ({format_ttl_short(ttl_seconds)})" if ttl_seconds > 0 else ""
+    label = f" for <b>{esc(title[:36])}</b>" if title else ""
+    return (
+        f"⏱ <b>Trial Session Ended</b>\n"
+        f"<blockquote>Your preview{label}{dur} has been cleared from chat. "
+        f"Tap below to contact the owner for full access.</blockquote>"
+    )
+
+
+async def send_with_effect(
+    sender_coro,
+    *args,
+    message_effect_id: Optional[str] = None,
+    **kwargs,
+):
+    """
+    Sends a Telegram message/media with an optional Bot API 9.4+ `message_effect_id`.
+    Automatically falls back cleanly without `message_effect_id` if the chat type
+    (e.g. groups/channels) or custom server rejects the effect ID.
+    """
+    if message_effect_id:
+        try:
+            return await tg_retry_call(
+                sender_coro, *args, message_effect_id=message_effect_id, **kwargs
+            )
+        except TypeError:
+            # Dummy/test bot or older method signature without message_effect_id
+            pass
+        except TelegramBadRequest as exc:
+            err_l = str(exc).lower()
+            if "effect" not in err_l and "message_effect_id" not in err_l:
+                raise
+    return await tg_retry_call(sender_coro, *args, **kwargs)
+
+
+async def batch_delete_chat_messages(
+    bot: Bot, chat_id: int, message_ids: list[int]
+) -> int:
+    """
+    Deletes up to N messages in chunks of <= 100 using Telegram's native `bot.delete_messages()`
+    (1 API call per 100 messages — zero FloodWait!). Falls back cleanly to per-message delete
+    if `delete_messages` is unavailable or partially rejected.
+    """
+    clean_ids = sorted({int(m) for m in message_ids if m and int(m) > 0})
+    if not clean_ids:
+        return 0
+
+    deleted_total = 0
+    batch_fn = getattr(bot, "delete_messages", None)
+
+    for idx in range(0, len(clean_ids), BATCH_CHUNK_SIZE):
+        chunk = clean_ids[idx : idx + BATCH_CHUNK_SIZE]
+        if batch_fn is not None and len(chunk) > 1:
+            try:
+                await tg_retry_call(batch_fn, chat_id=chat_id, message_ids=chunk)
+                deleted_total += len(chunk)
+                continue
+            except Exception:
+                pass
+        # Single message or fallback path
+        for mid in chunk:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=mid)
+                deleted_total += 1
+            except Exception:
+                pass
+    return deleted_total
+
+
+async def execute_due_scheduled_deletes(bot: Bot, db: Any, limit: int = 50) -> int:
+    """
+    Processes all due rows in `scheduled_deletes` (`delete_at <= now`):
+    1. Batch-deletes delivered messages in chunks of <= 100 via `bot.delete_messages()`.
+    2. Sends optional post-expiry notice card with the owner's `💬 Contact Owner` primary button.
+    Returns count of processed batch jobs.
+    """
+    due_rows = await db.pop_due_scheduled_deletes(limit=limit)
+    if not due_rows:
+        return 0
+
+    for job in due_rows:
+        chat_id = int(job["chat_id"])
+        msg_ids: list[int] = job.get("message_ids") or []
+        if msg_ids:
+            await batch_delete_chat_messages(bot, chat_id, msg_ids)
+
+        notify_text = (job.get("notify_text") or "").strip()
+        contact_url = (job.get("contact_url") or "").strip()
+        if notify_text:
+            kb = build_contact_owner_kb(contact_url)
+            try:
+                await tg_retry_call(
+                    bot.send_message,
+                    chat_id=chat_id,
+                    text=notify_text,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+    return len(due_rows)
+
+
+async def run_scheduled_deletes_sweeper(
+    bot: Bot, db: Any, interval_seconds: float = 5.0
 ) -> None:
-    """Schedules background message cleanup for delivered files/packs when Auto-Delete is enabled."""
+    """
+    Ultra-low-RAM background sweeper coroutine (zero per-delivery sleeping asyncio tasks!).
+    Survives systemd/VPS restarts and cleans up expired trials in 100-msg native batches.
+    """
+    while True:
+        try:
+            await execute_due_scheduled_deletes(bot, db, limit=50)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(interval_seconds)
+
+
+async def schedule_persistent_auto_delete(
+    bot: Bot,
+    db: Optional[Any],
+    chat_id: int,
+    message_ids: list[int],
+    ttl_seconds: int,
+    *,
+    notify_text: str = "",
+    contact_url: str = "",
+) -> int:
+    """
+    Persists an auto-delete timer into SQLite `scheduled_deletes` when `db` is provided
+    (zero RAM bloat, 100% restart-safe). Falls back to lightweight in-memory batch delete
+    if `db` is None (e.g. isolated unit calls).
+    """
+    clean_ids = sorted({int(m) for m in message_ids if m and int(m) > 0})
+    if ttl_seconds <= 0 or not clean_ids:
+        return 0
+    if db is not None and hasattr(db, "add_scheduled_delete"):
+        delete_at = int(time.time()) + int(ttl_seconds)
+        return await db.add_scheduled_delete(
+            chat_id=chat_id,
+            message_ids=clean_ids,
+            delete_at=delete_at,
+            notify_text=notify_text,
+            contact_url=contact_url,
+        )
+    schedule_auto_delete(
+        bot,
+        chat_id,
+        clean_ids,
+        ttl_seconds,
+        notify_text=notify_text,
+        contact_url=contact_url,
+    )
+    return 0
+
+
+def schedule_auto_delete(
+    bot: Bot,
+    chat_id: int,
+    message_ids: list[int],
+    ttl_seconds: int,
+    *,
+    notify_text: str = "",
+    contact_url: str = "",
+) -> None:
+    """Fallback in-memory batch cleanup using native `batch_delete_chat_messages`."""
     if ttl_seconds <= 0 or not message_ids:
         return
 
     async def _worker() -> None:
         await asyncio.sleep(ttl_seconds)
-        for mid in message_ids:
+        await batch_delete_chat_messages(bot, chat_id, message_ids)
+        if notify_text:
+            kb = build_contact_owner_kb(contact_url)
             try:
-                await bot.delete_message(chat_id=chat_id, message_id=mid)
+                await tg_retry_call(
+                    bot.send_message,
+                    chat_id=chat_id,
+                    text=notify_text,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
             except Exception:
                 pass
 
@@ -320,10 +539,15 @@ async def send_stored_media(
     *,
     protect_content: bool = False,
     auto_delete_ttl: int = 0,
+    db: Optional[Any] = None,
+    notify_text: str = "",
+    contact_url: str = "",
+    message_effect_id: Optional[str] = None,
 ) -> Optional[Message]:
     """
     Delivers any archived vault item into a chat.
-    Supports `protect_content` (no forward/save) and optional `auto_delete_ttl` timer!
+    Supports `protect_content` (no forward/save), Bot API 9.4 `message_effect_id`,
+    and restart-safe `scheduled_deletes` timer + post-expiry Contact Owner notice!
     """
     caption = (
         custom_caption
@@ -339,18 +563,20 @@ async def send_stored_media(
 
     try:
         if mtype == "sticker":
-            sent = await tg_retry_call(
+            sent = await send_with_effect(
                 bot.send_sticker,
                 chat_id=chat_id,
                 sticker=fid,
                 protect_content=protect_content,
+                message_effect_id=message_effect_id,
             )
         elif mtype == "video_note":
-            sent = await tg_retry_call(
+            sent = await send_with_effect(
                 bot.send_video_note,
                 chat_id=chat_id,
                 video_note=fid,
                 protect_content=protect_content,
+                message_effect_id=message_effect_id,
             )
         else:
             method_map = {
@@ -368,12 +594,13 @@ async def send_stored_media(
             sender = getattr(bot, method_name, None)
             if not sender:
                 return None
-            sent = await tg_retry_call(
+            sent = await send_with_effect(
                 sender,
                 chat_id=chat_id,
                 **{kwarg_name: fid},
                 caption=caption,
                 protect_content=protect_content,
+                message_effect_id=message_effect_id,
             )
     except Exception:
         return None
@@ -381,7 +608,15 @@ async def send_stored_media(
     if sent and auto_delete_ttl > 0:
         msg_id = getattr(sent, "message_id", None)
         if msg_id:
-            schedule_auto_delete(bot, chat_id, [msg_id], auto_delete_ttl)
+            await schedule_persistent_auto_delete(
+                bot,
+                db,
+                chat_id,
+                [msg_id],
+                auto_delete_ttl,
+                notify_text=notify_text,
+                contact_url=contact_url,
+            )
     return sent
 
 
@@ -446,6 +681,8 @@ def build_file_card_text(
         ]
         if file_row.get("share_paused"):
             sec_badges.append("⏸ Paused")
+        if file_row.get("share_one_time"):
+            sec_badges.append("👤 1×/User")
         if file_row.get("share_pin_hash"):
             sec_badges.append("🔑 PIN")
         if file_row.get("protect_share"):
@@ -507,20 +744,23 @@ def build_file_keyboard(
                 text="📤 Send",
                 switch_inline_query=inline_query,
             ),
+        ],
+        [
             InlineKeyboardButton(
                 text="🔗 Link",
                 callback_data=share_cb,
             ),
-        ],
-        [
             InlineKeyboardButton(
                 text=fav_label,
                 callback_data=f"ffav:{fid}:{back_cb}" if back_cb else f"f:fav:{fid}",
             ),
+        ],
+        [
             InlineKeyboardButton(
                 text="🛠️ Edit",
                 callback_data=manage_cb,
             ),
+            InlineKeyboardButton(text="📁 Folder", callback_data=f"f:move:{fid}"),
         ],
     ]
 
@@ -623,6 +863,8 @@ def build_file_link_keyboard(
         )
 
     share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
+    one_time_on = bool(file_row.get("share_one_time"))
+    one_time_lbl = f"👤 1×/User: {'ON' if one_time_on else 'OFF'}"
     pin_lbl = "🔑 PIN: ON" if file_row.get("share_pin_hash") else "🔑 Set PIN"
     prot_lbl = toggle_label(bool(file_row.get("protect_share")), "No-Fwd")
     exp_lbl = f"⏳ {format_expiry_badge(file_row.get('share_expires_at'))}"
@@ -639,15 +881,22 @@ def build_file_link_keyboard(
                 share_url_btn("↗️ Share", share_url, file_row.get("title", "")),
             ],
             [
-                InlineKeyboardButton(text=pin_lbl, callback_data=f"f:pin:{fid}"),
+                InlineKeyboardButton(
+                    text=one_time_lbl,
+                    callback_data=f"f:1x:{fid}",
+                    style="success" if one_time_on else None,
+                ),
                 InlineKeyboardButton(text=prot_lbl, callback_data=f"f:prot:{fid}"),
             ],
             [
+                InlineKeyboardButton(text=pin_lbl, callback_data=f"f:pin:{fid}"),
                 InlineKeyboardButton(text=exp_lbl, callback_data=f"f:exp:{fid}"),
-                InlineKeyboardButton(text=limit_lbl, callback_data=f"f:maxv:{fid}"),
             ],
             [
+                InlineKeyboardButton(text=limit_lbl, callback_data=f"f:maxv:{fid}"),
                 InlineKeyboardButton(text=pause_lbl, callback_data=f"f:pause:{fid}"),
+            ],
+            [
                 InlineKeyboardButton(text="🔄 Reset", callback_data=f"f:regen:{fid}"),
                 InlineKeyboardButton(
                     text="🚫 Revoke",
@@ -662,9 +911,9 @@ def build_file_link_keyboard(
 
 def build_upload_quick_keyboard(file_row: dict[str, Any]) -> InlineKeyboardMarkup:
     """
-    Ultra-short 2-row receipt keyboard shown right after uploading a file:
-    Row 1: [📤 Send] [🔗 Link] [🛠️ Edit]
-    Row 2: [📁 Folder] [📦 Files]
+    Ultra-short 2-row receipt keyboard shown right after uploading a file (max 2 btns/row for 360px):
+    Row 1: [📤 Send] [🔗 Link]
+    Row 2: [🛠️ Edit] [📁 Folder]
     """
     fid = file_row["id"]
     inline_query = (file_row.get("title") or "")[:30]
@@ -680,14 +929,13 @@ def build_upload_quick_keyboard(file_row: dict[str, Any]) -> InlineKeyboardMarku
                     text="🔗 Link",
                     callback_data=f"f:link:{fid}",
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🛠️ Edit",
                     callback_data=f"f:manage:{fid}",
                 ),
-            ],
-            [
                 InlineKeyboardButton(text="📁 Folder", callback_data=f"f:move:{fid}"),
-                InlineKeyboardButton(text="📦 Files", callback_data="br:all:def:0:0"),
             ],
         ]
     )

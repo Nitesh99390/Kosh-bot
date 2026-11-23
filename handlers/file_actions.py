@@ -267,7 +267,9 @@ def render_filter_sort_drawer(
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _render_file_link_card(file_row: dict, bot_username: str) -> str:
+def _render_file_link_card(
+    file_row: dict, bot_username: str, unique_claims: int = 0
+) -> str:
     icon = MEDIA_ICONS.get(file_row["media_type"], "📦")
     has_link = bool(file_row.get("share_token"))
     lines = [
@@ -276,21 +278,23 @@ def _render_file_link_card(file_row: dict, bot_username: str) -> str:
     ]
     if not has_link:
         lines.append(
-            "<blockquote>Create a public link with optional <b>PIN lock</b>, <b>Max Opens</b>, <b>No-Forward</b>, <b>Pause</b>, and <b>Auto-Expiry</b>.</blockquote>"
+            "<blockquote>Create a permanent group-safe link with optional <b>👤 1×/User Trial Lock</b>, <b>🔑 PIN</b>, <b>🛡️ No-Forward</b>, and <b>⏱ Auto-Delete</b>.</blockquote>"
         )
     else:
         url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
         pin_status = "ON" if file_row.get("share_pin_hash") else "Off"
         prot_status = "ON" if file_row.get("protect_share") else "Off"
+        one_time_on = bool(file_row.get("share_one_time"))
+        one_time_str = f"ON ({unique_claims})" if one_time_on else "OFF"
         exp_status = format_expiry_badge(file_row.get("share_expires_at"))
         views_badge = format_max_views_badge(
             int(file_row.get("share_views") or 0),
             int(file_row.get("share_max_views") or 0),
         )
-        state_badge = "⏸ Paused" if file_row.get("share_paused") else "🟢 Live"
+        state_badge = "⏸ Paused" if file_row.get("share_paused") else "🟢 Permanent" if not file_row.get("share_expires_at") else "🟢 Live"
         lines.append(
             f"<blockquote>{state_badge} · {views_badge} · ⏳ <b>{exp_status}</b>\n"
-            f"🔑 PIN: <b>{pin_status}</b> · 🛡️ No-Fwd: <b>{prot_status}</b></blockquote>\n"
+            f"👤 1×/User: <b>{one_time_str}</b> · 🛡️ No-Fwd: <b>{prot_status}</b> · 🔑 PIN: <b>{pin_status}</b></blockquote>\n"
             f"<code>{url}</code>"
         )
     return "\n".join(lines)
@@ -676,9 +680,10 @@ async def cb_open_file_link_panel(
         await callback.answer("File not found.", show_alert=True)
         return
     uname = bot_username or "KoshBox_Bot"
+    claims = await db.count_link_claims("file", fid)
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(f, uname),
+        _render_file_link_card(f, uname, unique_claims=claims),
         build_file_link_keyboard(f, back_cb=back_cb, bot_username=uname),
         also_ack=True,
     )
@@ -700,6 +705,7 @@ async def cb_get_file_here(callback: CallbackQuery, db: Database, bot: Bot) -> N
         f,
         protect_content=bool(user.get("protect_content")),
         auto_delete_ttl=int(user.get("auto_delete_ttl") or 0),
+        db=db,
     )
     if sent:
         await callback.answer("📥 Sent!")
@@ -763,12 +769,40 @@ async def cb_toggle_share(
         return
     token = await db.toggle_share_token(fid)
     updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname),
+        _render_file_link_card(updated, uname, unique_claims=claims),
         build_file_link_keyboard(updated, back_cb=back_cb, bot_username=uname),
-        answer_text="🔗 Link ready!" if token else "Link revoked",
+        answer_text="🔗 Permanent Link ready!" if token else "Link revoked",
+        also_ack=True,
+    )
+
+
+@router.callback_query(F.data.startswith("f:1x:"))
+async def cb_file_toggle_one_time(
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    on = await db.toggle_file_one_time(fid)
+    updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
+    uname = bot_username or "KoshBox_Bot"
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(updated, uname, unique_claims=claims),
+        build_file_link_keyboard(updated, bot_username=uname),
+        answer_text="👤 1×/User Trial Lock ON" if on else "👤 1×/User Trial Lock OFF",
         also_ack=True,
     )
 
@@ -789,10 +823,11 @@ async def cb_file_toggle_protect(
         return
     on = await db.toggle_file_protect_share(fid)
     updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname),
+        _render_file_link_card(updated, uname, unique_claims=claims),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text="🛡️ No-Forward ON" if on else "No-Forward OFF",
         also_ack=True,
@@ -815,10 +850,11 @@ async def cb_file_cycle_expiry(
         return
     new_exp = await db.cycle_file_share_expiry(fid)
     updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname),
+        _render_file_link_card(updated, uname, unique_claims=claims),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text=f"⏳ Expiry: {format_expiry_badge(new_exp)}",
         also_ack=True,
@@ -841,11 +877,12 @@ async def cb_file_cycle_max_views(
         return
     lim = await db.cycle_file_share_max_views(fid)
     updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
     uname = bot_username or "KoshBox_Bot"
     lbl = f"{lim} opens max" if lim > 0 else "Unlimited opens"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname),
+        _render_file_link_card(updated, uname, unique_claims=claims),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text=f"👁 Access Limit: {lbl}",
         also_ack=True,
@@ -868,10 +905,11 @@ async def cb_file_toggle_pause(
         return
     paused = await db.toggle_file_share_paused(fid)
     updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname),
+        _render_file_link_card(updated, uname, unique_claims=claims),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text="⏸ Link Paused" if paused else "▶️ Link Active",
         also_ack=True,
@@ -897,9 +935,9 @@ async def cb_file_regen_token(
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname),
+        _render_file_link_card(updated, uname, unique_claims=0),
         build_file_link_keyboard(updated, bot_username=uname),
-        answer_text="🔄 New file link generated (views reset)",
+        answer_text="🔄 New file link generated (views & user claims reset)",
         also_ack=True,
     )
 
@@ -950,9 +988,10 @@ async def fsm_save_file_pin(
     except Exception:
         pass
     updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
     uname = bot_username or "KoshBox_Bot"
     await message.answer(
-        _render_file_link_card(updated, uname),
+        _render_file_link_card(updated, uname, unique_claims=claims),
         reply_markup=build_file_link_keyboard(updated, bot_username=uname),
         disable_web_page_preview=True,
     )

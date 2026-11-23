@@ -174,11 +174,15 @@ async def send_banner_message(
     bot: Bot,
     db: Database,
     config: Config,
+    *,
+    message_effect_id: Optional[str] = None,
 ) -> Message:
     """
     Sends a PostBot-style visual card (cached photo from Dump Channel + HTML caption + inline keyboard).
     Gracefully falls back to clean HTML text if Dump Channel isn't reachable yet.
+    Supports optional Bot API 9.4 `message_effect_id` full-screen celebration effects!
     """
+    effect_kw = {"message_effect_id": message_effect_id} if message_effect_id else {}
     file_id = await get_or_upload_banner_file_id(asset_key, bot, db, config)
     if file_id:
         try:
@@ -186,8 +190,24 @@ async def send_banner_message(
                 photo=file_id,
                 caption=caption,
                 reply_markup=reply_markup,
+                **effect_kw,
+            )
+        except TypeError:
+            return await message.answer_photo(
+                photo=file_id,
+                caption=caption,
+                reply_markup=reply_markup,
             )
         except TelegramBadRequest as exc:
+            if message_effect_id and "effect" in str(exc).lower():
+                try:
+                    return await message.answer_photo(
+                        photo=file_id,
+                        caption=caption,
+                        reply_markup=reply_markup,
+                    )
+                except Exception:
+                    pass
             logger.warning(
                 "Cached banner file_id invalid for '%s' (%s); refreshing once from Dump Channel.",
                 asset_key,
@@ -208,11 +228,19 @@ async def send_banner_message(
         except Exception as exc:
             logger.warning("send_banner_message photo fallback (%s): %s", asset_key, exc)
 
-    return await message.answer(
-        caption,
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
-    )
+    try:
+        return await message.answer(
+            caption,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+            **effect_kw,
+        )
+    except (TypeError, TelegramBadRequest):
+        return await message.answer(
+            caption,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
 
 
 async def edit_or_send_banner(

@@ -1,6 +1,8 @@
 import hashlib
 import hmac
+import json
 import os
+import re
 import secrets
 import string
 import time
@@ -9,6 +11,44 @@ from typing import Any, Optional
 import aiosqlite
 
 from utils.cache import TTLCache
+
+TG_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+
+
+def normalize_contact_url(raw: Optional[str]) -> str:
+    """
+    Normalizes an owner's support contact handle or Telegram link into a valid https://t.me/... URL.
+    Returns '' if empty or invalid (never generates a broken URL).
+    """
+    if not raw:
+        return ""
+    val = raw.strip()
+    if not val:
+        return ""
+    if val.startswith("@"):
+        handle = val[1:].strip()
+        if TG_USERNAME_RE.match(handle):
+            return f"https://t.me/{handle}"
+        return ""
+    low = val.lower()
+    if low.startswith("http://t.me/") or low.startswith("https://t.me/") or low.startswith("http://telegram.me/") or low.startswith("https://telegram.me/"):
+        path = val.split("://", 1)[1].split("/", 1)[1].strip() if "/" in val.split("://", 1)[1] else ""
+        if not path:
+            return ""
+        clean_path = path.split("?")[0].strip("/")
+        if clean_path.startswith("+") and len(clean_path) > 2:
+            return f"https://t.me/{path}"
+        if clean_path.startswith("joinchat/") and len(clean_path) > 10:
+            return f"https://t.me/{path}"
+        first_seg = clean_path.split("/")[0]
+        if TG_USERNAME_RE.match(first_seg):
+            return f"https://t.me/{path}"
+        return ""
+    if low.startswith("t.me/") or low.startswith("telegram.me/"):
+        return normalize_contact_url(f"https://{val}")
+    if TG_USERNAME_RE.match(val):
+        return f"https://t.me/{val}"
+    return ""
 
 
 def _gen_token(length: int = 8) -> str:
@@ -30,7 +70,7 @@ def verify_pin(pin: str, stored_hash: str) -> bool:
     return hmac.compare_digest(actual, expected)
 
 
-AUTO_DELETE_CYCLE = [0, 300, 900, 3600, 86400]
+AUTO_DELETE_CYCLE = [0, 300, 900, 3600, 7200, 86400]
 SHARE_TTL_CYCLE = [0, 3600, 86400, 604800]
 MAX_VIEWS_CYCLE = [0, 1, 5, 10, 50, 100]
 
@@ -105,6 +145,8 @@ class Database:
                 default_sort TEXT DEFAULT 'new',
                 auto_delete_ttl INTEGER DEFAULT 0,
                 protect_content INTEGER DEFAULT 0,
+                default_one_time INTEGER DEFAULT 0,
+                support_contact TEXT DEFAULT '',
                 is_banned INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL,
@@ -158,6 +200,7 @@ class Database:
                 share_max_views INTEGER DEFAULT 0,
                 share_views INTEGER DEFAULT 0,
                 share_paused INTEGER DEFAULT 0,
+                share_one_time INTEGER DEFAULT 0,
                 use_count INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
@@ -216,6 +259,7 @@ class Database:
                 expires_at INTEGER DEFAULT NULL,
                 max_views INTEGER DEFAULT 0,
                 is_paused INTEGER DEFAULT 0,
+                one_time_per_user INTEGER DEFAULT 0,
                 views INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE
@@ -243,6 +287,29 @@ class Database:
                 sha256 TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS link_user_claims (
+                link_type TEXT NOT NULL,
+                link_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                claimed_at INTEGER NOT NULL,
+                PRIMARY KEY (link_type, link_id, user_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_link_claims_lookup
+                ON link_user_claims(link_type, link_id);
+
+            CREATE TABLE IF NOT EXISTS scheduled_deletes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_ids_json TEXT NOT NULL,
+                delete_at INTEGER NOT NULL,
+                notify_text TEXT DEFAULT '',
+                contact_url TEXT DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scheduled_deletes_due
+                ON scheduled_deletes(delete_at);
             """
         )
         await self.conn.commit()
@@ -271,6 +338,14 @@ class Database:
         if "is_banned" not in user_cols:
             await self.conn.execute(
                 "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0;"
+            )
+        if "default_one_time" not in user_cols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN default_one_time INTEGER DEFAULT 0;"
+            )
+        if "support_contact" not in user_cols:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN support_contact TEXT DEFAULT '';"
             )
 
         file_cols = await _table_cols("files")
@@ -306,6 +381,10 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE files ADD COLUMN share_paused INTEGER DEFAULT 0;"
             )
+        if "share_one_time" not in file_cols:
+            await self.conn.execute(
+                "ALTER TABLE files ADD COLUMN share_one_time INTEGER DEFAULT 0;"
+            )
 
         pack_cols = await _table_cols("packs")
         if "description" not in pack_cols:
@@ -320,6 +399,35 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE packs ADD COLUMN is_paused INTEGER DEFAULT 0;"
             )
+        if "one_time_per_user" not in pack_cols:
+            await self.conn.execute(
+                "ALTER TABLE packs ADD COLUMN one_time_per_user INTEGER DEFAULT 0;"
+            )
+
+        await self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS link_user_claims (
+                link_type TEXT NOT NULL,
+                link_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                claimed_at INTEGER NOT NULL,
+                PRIMARY KEY (link_type, link_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_link_claims_lookup
+                ON link_user_claims(link_type, link_id);
+
+            CREATE TABLE IF NOT EXISTS scheduled_deletes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_ids_json TEXT NOT NULL,
+                delete_at INTEGER NOT NULL,
+                notify_text TEXT DEFAULT '',
+                contact_url TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduled_deletes_due
+                ON scheduled_deletes(delete_at);
+            """
+        )
 
         await self.conn.executescript(
             """
@@ -475,6 +583,67 @@ class Database:
         await self.conn.commit()
         self._invalidate_user(user_id)
         return bool(new_val)
+
+    async def toggle_default_one_time(self, user_id: int) -> bool:
+        assert self.conn is not None
+        user = await self.get_user(user_id)
+        new_val = 0 if (user and user.get("default_one_time")) else 1
+        await self.conn.execute(
+            "UPDATE users SET default_one_time = ? WHERE user_id = ?", (new_val, user_id)
+        )
+        await self.conn.commit()
+        self._invalidate_user(user_id)
+        return bool(new_val)
+
+    async def set_support_contact(self, user_id: int, contact: str) -> str:
+        assert self.conn is not None
+        cleaned = contact.strip()[:120]
+        if cleaned == "-":
+            cleaned = ""
+        normalized = normalize_contact_url(cleaned) if cleaned else ""
+        # Store normalized URL if valid, or empty if cleared; return normalized URL
+        if cleaned and not normalized:
+            raise ValueError("Invalid @username or https://t.me/... link")
+        await self.conn.execute(
+            "UPDATE users SET support_contact = ? WHERE user_id = ?",
+            (normalized, user_id),
+        )
+        await self.conn.commit()
+        self._invalidate_user(user_id)
+        return normalized
+
+    async def resolve_owner_contact_url(
+        self, vault_id: int, preferred_user_id: Optional[int] = None
+    ) -> str:
+        """
+        Resolves the dynamic owner contact URL for a given vault/creator:
+        1. Preferred owner's or vault accounts' saved `support_contact` (normalized https://t.me/...).
+        2. Fallback to that owner's Telegram `@username` from `users` table (`https://t.me/<username>`).
+        3. Cleanly returns '' if neither exists (never generates an invalid URL).
+        """
+        assert self.conn is not None
+        accounts: list[dict[str, Any]] = []
+        if preferred_user_id:
+            pref = await self.get_user(preferred_user_id)
+            if pref:
+                accounts.append(pref)
+        vault_users = await self.get_linked_accounts(vault_id)
+        seen_uids = {u["user_id"] for u in accounts}
+        for u in vault_users:
+            if u["user_id"] not in seen_uids:
+                accounts.append(u)
+                seen_uids.add(u["user_id"])
+
+        for acc in accounts:
+            saved = normalize_contact_url(acc.get("support_contact"))
+            if saved:
+                return saved
+        for acc in accounts:
+            uname = (acc.get("username") or "").strip().lstrip("@")
+            url = normalize_contact_url(f"@{uname}") if uname else ""
+            if url:
+                return url
+        return ""
 
     async def cycle_auto_delete_ttl(self, user_id: int) -> int:
         assert self.conn is not None
@@ -1049,17 +1218,31 @@ class Database:
                 """
                 UPDATE files
                 SET share_token = NULL, share_pin_hash = '', share_expires_at = NULL,
-                    protect_share = 0, share_max_views = 0, share_views = 0, share_paused = 0
+                    protect_share = 0, share_max_views = 0, share_views = 0,
+                    share_paused = 0, share_one_time = 0
                 WHERE id = ?
                 """,
+                (db_file_id,),
+            )
+            await self.conn.execute(
+                "DELETE FROM link_user_claims WHERE link_type = 'file' AND link_id = ?",
                 (db_file_id,),
             )
             await self.conn.commit()
             return None
         token = _gen_token(10)
+        owner = await self.get_user(f["uploader_user_id"])
+        default_one_time = 1 if (owner and owner.get("default_one_time")) else 0
+        default_protect = 1 if (owner and owner.get("protect_content")) else 0
         await self.conn.execute(
-            "UPDATE files SET share_token = ?, share_views = 0, share_paused = 0 WHERE id = ?",
-            (token, db_file_id),
+            """
+            UPDATE files
+            SET share_token = ?, share_views = 0, share_paused = 0,
+                share_expires_at = NULL, share_max_views = 0,
+                share_one_time = ?, protect_share = ?
+            WHERE id = ?
+            """,
+            (token, default_one_time, default_protect, db_file_id),
         )
         await self.conn.commit()
         return token
@@ -1068,11 +1251,25 @@ class Database:
         assert self.conn is not None
         token = _gen_token(10)
         await self.conn.execute(
-            "UPDATE files SET share_token = ?, share_views = 0 WHERE id = ?",
+            "UPDATE files SET share_token = ?, share_views = 0, share_paused = 0 WHERE id = ?",
             (token, db_file_id),
+        )
+        await self.conn.execute(
+            "DELETE FROM link_user_claims WHERE link_type = 'file' AND link_id = ?",
+            (db_file_id,),
         )
         await self.conn.commit()
         return token
+
+    async def toggle_file_one_time(self, db_file_id: int) -> bool:
+        assert self.conn is not None
+        f = await self.get_file(db_file_id)
+        new_val = 0 if (f and f.get("share_one_time")) else 1
+        await self.conn.execute(
+            "UPDATE files SET share_one_time = ? WHERE id = ?", (new_val, db_file_id)
+        )
+        await self.conn.commit()
+        return bool(new_val)
 
     async def toggle_file_share_paused(self, db_file_id: int) -> bool:
         assert self.conn is not None
@@ -1172,6 +1369,10 @@ class Database:
         assert self.conn is not None
         await self.conn.execute("DELETE FROM files WHERE id = ?", (db_file_id,))
         await self.conn.execute("DELETE FROM files_fts WHERE file_id = ?", (db_file_id,))
+        await self.conn.execute(
+            "DELETE FROM link_user_claims WHERE link_type = 'file' AND link_id = ?",
+            (db_file_id,),
+        )
         await self.conn.commit()
 
     async def list_trashed_files(
@@ -1236,18 +1437,24 @@ class Database:
         protect_content: bool = False,
         ttl_seconds: int = 0,
         max_views: int = 0,
+        one_time_per_user: Optional[bool] = None,
     ) -> dict[str, Any]:
         assert self.conn is not None
         now = int(time.time())
         token = _gen_token(10)
         pin_h = hash_pin(pin) if (pin and pin.strip()) else ""
         exp = (now + ttl_seconds) if ttl_seconds > 0 else None
+        if one_time_per_user is None:
+            creator = await self.get_user(creator_user_id)
+            one_time = 1 if (creator and creator.get("default_one_time")) else 0
+        else:
+            one_time = 1 if one_time_per_user else 0
         cur = await self.conn.execute(
             """
             INSERT INTO packs (
                 vault_id, creator_user_id, title, description, share_token,
-                pin_hash, protect_content, expires_at, max_views, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                pin_hash, protect_content, expires_at, max_views, one_time_per_user, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 vault_id,
@@ -1259,6 +1466,7 @@ class Database:
                 1 if protect_content else 0,
                 exp,
                 max(0, int(max_views)),
+                one_time,
                 now,
             ),
         )
@@ -1329,7 +1537,9 @@ class Database:
                     WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS item_count,
                    (SELECT COALESCE(SUM(f.file_size), 0) FROM pack_items pi
                     JOIN files f ON f.id = pi.file_id
-                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size,
+                   (SELECT COUNT(*) FROM link_user_claims lc
+                    WHERE lc.link_type = 'pack' AND lc.link_id = p.id) AS unique_claims
             FROM packs p
             WHERE p.id = ?
             """,
@@ -1353,7 +1563,9 @@ class Database:
                     WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS item_count,
                    (SELECT COALESCE(SUM(f.file_size), 0) FROM pack_items pi
                     JOIN files f ON f.id = pi.file_id
-                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size
+                    WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size,
+                   (SELECT COUNT(*) FROM link_user_claims lc
+                    WHERE lc.link_type = 'pack' AND lc.link_id = p.id) AS unique_claims
             FROM packs p
             WHERE p.share_token = ?
             """,
@@ -1493,8 +1705,22 @@ class Database:
             "UPDATE packs SET share_token = ?, views = 0, is_paused = 0 WHERE id = ?",
             (token, pack_id),
         )
+        await self.conn.execute(
+            "DELETE FROM link_user_claims WHERE link_type = 'pack' AND link_id = ?",
+            (pack_id,),
+        )
         await self.conn.commit()
         return token
+
+    async def toggle_pack_one_time(self, pack_id: int) -> bool:
+        assert self.conn is not None
+        p = await self.get_pack(pack_id)
+        new_val = 0 if (p and p.get("one_time_per_user")) else 1
+        await self.conn.execute(
+            "UPDATE packs SET one_time_per_user = ? WHERE id = ?", (new_val, pack_id)
+        )
+        await self.conn.commit()
+        return bool(new_val)
 
     async def increment_pack_views(self, pack_id: int) -> None:
         assert self.conn is not None
@@ -1508,8 +1734,121 @@ class Database:
         cur = await self.conn.execute(
             "DELETE FROM packs WHERE id = ? AND vault_id = ?", (pack_id, vault_id)
         )
+        await self.conn.execute(
+            "DELETE FROM link_user_claims WHERE link_type = 'pack' AND link_id = ?",
+            (pack_id,),
+        )
         await self.conn.commit()
         return cur.rowcount > 0
+
+    # -------------------- 1-TIME PER-USER TRIAL CLAIMS & SCHEDULED BATCH DELETES --------------------
+
+    async def try_claim_link(
+        self, link_type: str, link_id: int, user_id: int
+    ) -> bool:
+        """
+        Atomically claims a 1-time trial slot for `(link_type, link_id, user_id)` BEFORE delivering files.
+        Returns `True` on first open (claim recorded), or `False` if already claimed (double-tap / repeat open safe).
+        """
+        assert self.conn is not None
+        now = int(time.time())
+        cur = await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO link_user_claims (link_type, link_id, user_id, claimed_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (link_type, int(link_id), int(user_id), now),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
+
+    async def has_claimed_link(
+        self, link_type: str, link_id: int, user_id: int
+    ) -> bool:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT 1 FROM link_user_claims WHERE link_type = ? AND link_id = ? AND user_id = ?",
+            (link_type, int(link_id), int(user_id)),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def count_link_claims(self, link_type: str, link_id: int) -> int:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT COUNT(*) FROM link_user_claims WHERE link_type = ? AND link_id = ?",
+            (link_type, int(link_id)),
+        )
+        return int((await cur.fetchone())[0])
+
+    async def clear_link_claims(self, link_type: str, link_id: int) -> int:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "DELETE FROM link_user_claims WHERE link_type = ? AND link_id = ?",
+            (link_type, int(link_id)),
+        )
+        await self.conn.commit()
+        return cur.rowcount
+
+    async def add_scheduled_delete(
+        self,
+        chat_id: int,
+        message_ids: list[int],
+        delete_at: int,
+        *,
+        notify_text: str = "",
+        contact_url: str = "",
+    ) -> int:
+        """Persists a restart-safe batch auto-delete job in SQLite (`scheduled_deletes`)."""
+        assert self.conn is not None
+        clean_ids = sorted({int(m) for m in message_ids if m and int(m) > 0})
+        if not clean_ids:
+            return 0
+        cur = await self.conn.execute(
+            """
+            INSERT INTO scheduled_deletes (chat_id, message_ids_json, delete_at, notify_text, contact_url)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(chat_id),
+                json.dumps(clean_ids),
+                int(delete_at),
+                notify_text or "",
+                contact_url or "",
+            ),
+        )
+        await self.conn.commit()
+        return int(cur.lastrowid or 0)
+
+    async def pop_due_scheduled_deletes(
+        self, now_ts: Optional[int] = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Fetches and atomically removes due auto-delete batches (`delete_at <= now`)."""
+        assert self.conn is not None
+        now = int(time.time()) if now_ts is None else int(now_ts)
+        cur = await self.conn.execute(
+            """
+            SELECT id, chat_id, message_ids_json, delete_at, notify_text, contact_url
+            FROM scheduled_deletes
+            WHERE delete_at <= ?
+            ORDER BY delete_at ASC
+            LIMIT ?
+            """,
+            (now, limit),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        if rows:
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" for _ in ids)
+            await self.conn.execute(
+                f"DELETE FROM scheduled_deletes WHERE id IN ({placeholders})", ids
+            )
+            await self.conn.commit()
+        for r in rows:
+            try:
+                r["message_ids"] = [int(x) for x in json.loads(r["message_ids_json"])]
+            except Exception:
+                r["message_ids"] = []
+        return rows
 
     # -------------------- INLINE & VAULT SEARCH --------------------
 

@@ -12,12 +12,15 @@ from config import Config
 from database import Database
 from handlers.packs import render_pack_detail
 from utils.formatters import (
+    EFFECT_PARTY,
+    EFFECT_THUMBS_UP,
     MEDIA_ICONS,
     breadcrumb,
     build_file_card_text,
     build_upload_quick_keyboard,
     esc,
     format_size,
+    send_with_effect,
     tg_retry_call,
 )
 from utils.states import PackStates
@@ -325,16 +328,20 @@ async def _flush_user_drop(
 
         if status == "restored":
             badge = "♻️ <b>Restored</b>"
+            eff = EFFECT_THUMBS_UP
         elif status == "dup":
             badge = "♻️ <b>Already Saved</b>"
+            eff = None
         else:
             badge = "✅ <b>Saved</b>"
+            eff = EFFECT_THUMBS_UP
 
-        await tg_retry_call(
+        await send_with_effect(
             anchor_message.reply,
             build_file_card_text(f, uname, header_badge=badge),
             reply_markup=build_upload_quick_keyboard(f),
             disable_web_page_preview=True,
+            message_effect_id=eff,
         )
         return
 
@@ -382,11 +389,12 @@ async def _flush_user_drop(
         stat_note = f"✅ <b>Auto-Packed {len(unique_files)} files</b>"
         if dup_cnt:
             stat_note += f" <i>({new_cnt} new · {dup_cnt} in vault)</i>"
-        await tg_retry_call(
+        await send_with_effect(
             anchor_message.reply,
             f"{stat_note}\n{rendered[0]}",
             reply_markup=rendered[1],
             disable_web_page_preview=True,
+            message_effect_id=EFFECT_PARTY,
         )
 
 

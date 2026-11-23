@@ -36,6 +36,10 @@ class SearchStates(StatesGroup):
     waiting_for_query = State()
 
 
+class SettingsStates(StatesGroup):
+    waiting_for_support_contact = State()
+
+
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
     waiting_for_ban_uid = State()

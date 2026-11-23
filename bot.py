@@ -14,6 +14,7 @@ from config import load_config
 from database import Database
 from handlers import accounts, admin, file_actions, groups, inline, packs, start_help, upload
 from utils.banners import warmup_banners_in_dump_channel
+from utils.formatters import run_scheduled_deletes_sweeper
 from utils.middleware import GuardAndThrottleMiddleware
 
 try:
@@ -115,12 +116,22 @@ async def main() -> None:
     banner_status = await warmup_banners_in_dump_channel(bot, db, config)
     logger.info("UI Banner cache status (Dump Channel): %s", banner_status)
 
+    # Start restart-safe, zero-RAM-bloat SQLite batch auto-delete sweeper (`bot.delete_messages()`)
+    sweeper_task = asyncio.create_task(
+        run_scheduled_deletes_sweeper(bot, db, interval_seconds=5.0)
+    )
+
     try:
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
         )
     finally:
+        sweeper_task.cancel()
+        try:
+            await sweeper_task
+        except asyncio.CancelledError:
+            pass
         await db.close()
         await bot.session.close()
 
