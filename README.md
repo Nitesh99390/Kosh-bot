@@ -10,13 +10,20 @@ Archive any file, album, or media into your private Dump Channel once — then s
 
 - **Permanent Group-Safe Trial System + 1-Time Per-User Claim Lock (`👤 1×/User`)**:
   - **Never-Expiring Group-Safe Links by Default**: File Links (`?start=file_...`) and Pack Links (`?start=pack_...`) stay active forever (`Never Expire`, `∞` total visitors) unless paused or revoked.
-  - **Atomic 1-Time Per-User Claim Lock (`link_user_claims`)**: Enable `👤 1×/User: ON` per link or globally in `/settings`. First open atomically claims the user's slot (`INSERT OR IGNORE`) before sending media. Repeat opens send **zero files** and display a sleek `🔒 Trial Access Ended` card with the owner's `💬 Contact Owner` CTA.
-  - **Owner Preview Bypass**: Link creators/vault members opening their own link are never blocked and never consume claims or quota. `🔄 Reset` clears `link_user_claims` and generates a fresh token.
+  - **Atomic 1-Time Per-User Claim Lock (`link_user_claims`)**: Enable `👤 1×/User: ON` per link or globally in `/settings`. First open atomically claims the user's slot (`INSERT OR IGNORE`) before sending media. Repeat opens send **zero files** and display a sleek `🔒 Trial Access Ended` card with 2-column `🔓 Request Full Access` + `💬 Contact Owner` CTAs.
+  - **Zero-Trial Owner Self-Retrieval Bypass**: Vault owners (including all linked secondary accounts sharing the same `vault_id`) retrieving their own files/packs via `📥 Get`, `📥 Get All`, or `?start=file_...` / `?start=pack_...` **never** trigger Trial mode, `1×/User` locks, `scheduled_deletes` auto-delete, `protect_content`, or `"Trial Session Ended"` notices (`🔓 Owner Access — permanent & unrestricted`). `🔄 Reset` clears `link_user_claims` and generates a fresh token.
+- **Professional Full Access / Paid Unlock Approval System (`link_access_grants`)**:
+  - Visitors opening a trial/protected link or seeing `⏱ Trial Session Ended` / `🔒 Trial Access Ended` get a clean 2-column CTA row: `[ 🔓 Request Full Access ]` · `[ 💬 Contact Owner ]`.
+  - Duplicate requests are rate-limited to once per 10 minutes per `(user_id, link_type, link_id)` via a bounded `TTLCache`.
+  - File/Pack owners receive an instant DM **Approval Card** with 1-tap duration grants (`✅ 1 Day`, `✅ 7 Days`, `✅ 30 Days`, `♾️ Lifetime`, `❌ Reject`, all `<= 64`-byte `callback_data`).
+  - Approved users (`link_access_grants`) automatically bypass `1×/User` trial locks, PIN gates, and auto-delete timers (and any pending trial `scheduled_deletes` for that item are cancelled immediately) while their grant is active.
 - **Dynamic Per-Owner Contact Support (`💬 Support Contact`)**:
   - Each creator sets their own `@username` or `https://t.me/...` sales/support handle in `/settings` (automatically falls back to their Telegram `@username`, or omits cleanly if unset).
   - Attached as a primary `💬 Contact Owner` button on both the **post-trial auto-delete expiry notice** and the **repeat-open (`🔒 Trial Access Ended`) card**.
-- **Restart-Safe, Zero-RAM-Bloat Batch Auto-Delete (`scheduled_deletes` + `bot.delete_messages()`)**:
-  - Optional self-destruct timer (`Off` / `5m` / `15m` / `1h` / `2h` / `24h`) persisted in SQLite (`scheduled_deletes`) and swept every 5s in 100-message native batches via `bot.delete_messages()` — zero sleeping tasks per user and 100% safe across `systemd` restarts.
+- **Restart-Safe, Zero-RAM-Bloat Batch Auto-Delete (`💣 Auto-Del` Per-Link + `/settings` Global)**:
+  - Per-link `💣 Auto-Del` button directly on every **File Share Link** card and **Pack Link** card cycling `Off` → `5m` → `15m` → `1h` → `2h` → `6h` → `24h` → `Off` (distinct from `⏳ Link: Never` Link Expiry).
+  - **Per-Link Priority Over Global `/settings`**: When a File or Pack has its own `auto_delete_ttl > 0`, it always overrides the owner's global `/settings` timer; only when per-link is `Off` (`0`) does it fall back to the link owner's global `/settings` timer (never the visitor's).
+  - Persisted in SQLite (`scheduled_deletes`) and swept every 5s in 100-message native batches via `bot.delete_messages()` — zero sleeping tasks per user and 100% safe across `systemd` restarts.
 - **Native 100-in-1 Batch Pack Delivery (`bot.copy_messages()`)**:
   - Delivers up to 100 files from `DUMP_CHANNEL_ID` in a **single Telegram API call** (`copy_messages`) with `protect_content=True` (No-Forward / No-Save) and graceful fallback, eliminating 429 FloodWaits.
 - **Telegram Bot API 9.4+ Visual Polish (360px Mobile-First)**:

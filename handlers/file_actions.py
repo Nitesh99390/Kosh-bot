@@ -27,6 +27,7 @@ from utils.formatters import (
     format_expiry_badge,
     format_max_views_badge,
     format_size,
+    format_ttl_short,
     home_btn,
     safe_edit_or_send,
     send_stored_media,
@@ -268,7 +269,10 @@ def render_filter_sort_drawer(
 
 
 def _render_file_link_card(
-    file_row: dict, bot_username: str, unique_claims: int = 0
+    file_row: dict,
+    bot_username: str,
+    unique_claims: int = 0,
+    owner_global_ttl: int = 0,
 ) -> str:
     icon = MEDIA_ICONS.get(file_row["media_type"], "📦")
     has_link = bool(file_row.get("share_token"))
@@ -278,7 +282,7 @@ def _render_file_link_card(
     ]
     if not has_link:
         lines.append(
-            "<blockquote>Create a permanent group-safe link with optional <b>👤 1×/User Trial Lock</b>, <b>🔑 PIN</b>, <b>🛡️ No-Forward</b>, and <b>⏱ Auto-Delete</b>.</blockquote>"
+            "<blockquote>Create a permanent group-safe link with optional <b>👤 1×/User Trial Lock</b>, <b>💣 Auto-Del</b>, <b>🔑 PIN</b>, and <b>🛡️ No-Forward</b>.</blockquote>"
         )
     else:
         url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
@@ -287,14 +291,22 @@ def _render_file_link_card(
         one_time_on = bool(file_row.get("share_one_time"))
         one_time_str = f"ON ({unique_claims})" if one_time_on else "OFF"
         exp_status = format_expiry_badge(file_row.get("share_expires_at"))
+        per_link_ttl = int(file_row.get("auto_delete_ttl") or 0)
+        if per_link_ttl > 0:
+            adel_status = format_ttl_short(per_link_ttl)
+        elif owner_global_ttl > 0:
+            adel_status = f"Off <i>(Global: {format_ttl_short(owner_global_ttl)})</i>"
+        else:
+            adel_status = "Off"
         views_badge = format_max_views_badge(
             int(file_row.get("share_views") or 0),
             int(file_row.get("share_max_views") or 0),
         )
         state_badge = "⏸ Paused" if file_row.get("share_paused") else "🟢 Permanent" if not file_row.get("share_expires_at") else "🟢 Live"
         lines.append(
-            f"<blockquote>{state_badge} · {views_badge} · ⏳ <b>{exp_status}</b>\n"
-            f"👤 1×/User: <b>{one_time_str}</b> · 🛡️ No-Fwd: <b>{prot_status}</b> · 🔑 PIN: <b>{pin_status}</b></blockquote>\n"
+            f"<blockquote>{state_badge} · {views_badge} · ⏳ Link: <b>{exp_status}</b>\n"
+            f"💣 Auto-Del: <b>{adel_status}</b> · 👤 1×/User: <b>{one_time_str}</b>\n"
+            f"🛡️ No-Fwd: <b>{prot_status}</b> · 🔑 PIN: <b>{pin_status}</b></blockquote>\n"
             f"<code>{url}</code>"
         )
     return "\n".join(lines)
@@ -681,9 +693,11 @@ async def cb_open_file_link_panel(
         return
     uname = bot_username or "KoshBox_Bot"
     claims = await db.count_link_claims("file", fid)
+    owner = await db.get_user(f["uploader_user_id"])
+    owner_ttl = int((owner or {}).get("auto_delete_ttl") or 0)
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(f, uname, unique_claims=claims),
+        _render_file_link_card(f, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(f, back_cb=back_cb, bot_username=uname),
         also_ack=True,
     )
@@ -696,19 +710,27 @@ async def cb_get_file_here(callback: CallbackQuery, db: Database, bot: Bot) -> N
     fid = int(callback.data.split(":")[2])
     user = await db.get_user(callback.from_user.id)
     f = await db.get_file(fid)
-    if not f or not await db.can_vault_access_file(user["vault_id"], f):
+    if not f or not user or not await db.can_vault_access_file(user["vault_id"], f):
         await callback.answer("File not found.", show_alert=True)
         return
+    is_owner = (
+        user["user_id"] == f["uploader_user_id"]
+        or user["vault_id"] == f["vault_id"]
+    )
     sent = await send_stored_media(
         bot,
         callback.message.chat.id,
         f,
-        protect_content=bool(user.get("protect_content")),
-        auto_delete_ttl=int(user.get("auto_delete_ttl") or 0),
+        protect_content=False if is_owner else bool(user.get("protect_content")),
+        auto_delete_ttl=0 if is_owner else int(user.get("auto_delete_ttl") or 0),
         db=db,
+        extra_note="🔓 Owner Access — permanent & unrestricted" if is_owner else "",
     )
     if sent:
-        await callback.answer("📥 Sent!")
+        await db.increment_use_count(fid)
+        await callback.answer(
+            "🔓 Owner Access — permanent & unrestricted" if is_owner else "📥 Sent!"
+        )
     else:
         await callback.answer("Unsupported format.", show_alert=True)
 
@@ -770,10 +792,12 @@ async def cb_toggle_share(
     token = await db.toggle_share_token(fid)
     updated = await db.get_file(fid)
     claims = await db.count_link_claims("file", fid)
+    owner = await db.get_user(updated["uploader_user_id"])
+    owner_ttl = int((owner or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname, unique_claims=claims),
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(updated, back_cb=back_cb, bot_username=uname),
         answer_text="🔗 Permanent Link ready!" if token else "Link revoked",
         also_ack=True,
@@ -797,12 +821,47 @@ async def cb_file_toggle_one_time(
     on = await db.toggle_file_one_time(fid)
     updated = await db.get_file(fid)
     claims = await db.count_link_claims("file", fid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname, unique_claims=claims),
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text="👤 1×/User Trial Lock ON" if on else "👤 1×/User Trial Lock OFF",
+        also_ack=True,
+    )
+
+
+@router.callback_query(F.data.startswith("f:adel:"))
+async def cb_file_cycle_auto_delete(
+    callback: CallbackQuery,
+    db: Database,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    if not callback.from_user:
+        return
+    fid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    f = await db.get_file(fid)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
+        return
+    new_ttl = await db.cycle_file_auto_delete_ttl(fid)
+    updated = await db.get_file(fid)
+    claims = await db.count_link_claims("file", fid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
+    uname = bot_username or "KoshBox_Bot"
+    if new_ttl > 0:
+        ans = f"💣 Chat Auto-Delete: {format_ttl_short(new_ttl)} (overrides global)"
+    elif owner_ttl > 0:
+        ans = f"💣 Per-link Off (uses global {format_ttl_short(owner_ttl)})"
+    else:
+        ans = "💣 Chat Auto-Delete: Off"
+    await safe_edit_or_send(
+        callback,
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
+        build_file_link_keyboard(updated, bot_username=uname),
+        answer_text=ans,
         also_ack=True,
     )
 
@@ -824,10 +883,11 @@ async def cb_file_toggle_protect(
     on = await db.toggle_file_protect_share(fid)
     updated = await db.get_file(fid)
     claims = await db.count_link_claims("file", fid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname, unique_claims=claims),
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text="🛡️ No-Forward ON" if on else "No-Forward OFF",
         also_ack=True,
@@ -851,12 +911,13 @@ async def cb_file_cycle_expiry(
     new_exp = await db.cycle_file_share_expiry(fid)
     updated = await db.get_file(fid)
     claims = await db.count_link_claims("file", fid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname, unique_claims=claims),
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(updated, bot_username=uname),
-        answer_text=f"⏳ Expiry: {format_expiry_badge(new_exp)}",
+        answer_text=f"⏳ Link Expiry: {format_expiry_badge(new_exp)}",
         also_ack=True,
     )
 
@@ -878,11 +939,12 @@ async def cb_file_cycle_max_views(
     lim = await db.cycle_file_share_max_views(fid)
     updated = await db.get_file(fid)
     claims = await db.count_link_claims("file", fid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     lbl = f"{lim} opens max" if lim > 0 else "Unlimited opens"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname, unique_claims=claims),
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text=f"👁 Access Limit: {lbl}",
         also_ack=True,
@@ -906,10 +968,11 @@ async def cb_file_toggle_pause(
     paused = await db.toggle_file_share_paused(fid)
     updated = await db.get_file(fid)
     claims = await db.count_link_claims("file", fid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname, unique_claims=claims),
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text="⏸ Link Paused" if paused else "▶️ Link Active",
         also_ack=True,
@@ -932,10 +995,11 @@ async def cb_file_regen_token(
         return
     await db.regenerate_file_share_token(fid)
     updated = await db.get_file(fid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     await safe_edit_or_send(
         callback,
-        _render_file_link_card(updated, uname, unique_claims=0),
+        _render_file_link_card(updated, uname, unique_claims=0, owner_global_ttl=owner_ttl),
         build_file_link_keyboard(updated, bot_username=uname),
         answer_text="🔄 New file link generated (views & user claims reset)",
         also_ack=True,
@@ -989,9 +1053,11 @@ async def fsm_save_file_pin(
         pass
     updated = await db.get_file(fid)
     claims = await db.count_link_claims("file", fid)
+    owner = await db.get_user(updated["uploader_user_id"])
+    owner_ttl = int((owner or {}).get("auto_delete_ttl") or 0)
     uname = bot_username or "KoshBox_Bot"
     await message.answer(
-        _render_file_link_card(updated, uname, unique_claims=claims),
+        _render_file_link_card(updated, uname, unique_claims=claims, owner_global_ttl=owner_ttl),
         reply_markup=build_file_link_keyboard(updated, bot_username=uname),
         disable_web_page_preview=True,
     )

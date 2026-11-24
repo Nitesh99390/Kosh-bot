@@ -8,7 +8,13 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import Config
-from database import Database, hash_pin, verify_pin
+from database import (
+    AUTO_DELETE_CYCLE,
+    Database,
+    hash_pin,
+    resolve_effective_auto_delete_ttl,
+    verify_pin,
+)
 from handlers import accounts, admin, file_actions, groups, inline, packs, start_help, upload
 from utils.cache import TTLCache
 from utils.states import PackStates
@@ -79,13 +85,24 @@ class _DummyBot:
         caption: str = "",
         disable_notification: bool = False,
         protect_content: bool = False,
+        reply_markup=None,
+        message_effect_id: str | None = None,
     ):
         self._seq += 1
+        if message_effect_id:
+            self.effects_used.append(message_effect_id)
         if not isinstance(photo, str):
             self.dump_uploads.append((chat_id, caption))
         else:
             self.sent_media.append(
-                {"type": "photo", "protect": protect_content, "caption": caption}
+                {
+                    "type": "photo",
+                    "chat_id": chat_id,
+                    "protect": protect_content,
+                    "caption": caption,
+                    "reply_markup": reply_markup,
+                    "effect": message_effect_id,
+                }
             )
         p_obj = SimpleNamespace(
             file_id=f"CACHED_TG_PHOTO_ID_{self._seq}",
@@ -99,6 +116,7 @@ class _DummyBot:
         audio: str,
         caption: str = "",
         protect_content: bool = False,
+        reply_markup=None,
         message_effect_id: str | None = None,
     ):
         self._seq += 1
@@ -111,6 +129,7 @@ class _DummyBot:
                 "file_id": audio,
                 "caption": caption,
                 "protect": protect_content,
+                "reply_markup": reply_markup,
                 "effect": message_effect_id,
             }
         )
@@ -122,6 +141,7 @@ class _DummyBot:
         document: str,
         caption: str = "",
         protect_content: bool = False,
+        reply_markup=None,
         message_effect_id: str | None = None,
     ):
         self._seq += 1
@@ -134,6 +154,7 @@ class _DummyBot:
                 "file_id": document,
                 "caption": caption,
                 "protect": protect_content,
+                "reply_markup": reply_markup,
                 "effect": message_effect_id,
             }
         )
@@ -980,6 +1001,7 @@ async def run_tests() -> None:
         assert ipv4_sess._connector_init["ttl_dns_cache"] == 300
         assert ipv4_sess._connector_init["keepalive_timeout"] == 60.0
         assert ipv4_sess._connector_init["limit"] == 64
+        await ipv4_sess.close()
 
         pragma_journal = (await (await db.conn.execute("PRAGMA journal_mode;")).fetchone())[0]
         pragma_cache = (await (await db.conn.execute("PRAGMA cache_size;")).fetchone())[0]
@@ -1179,8 +1201,9 @@ async def run_tests() -> None:
                 answer=_ans,
             )
 
-        # (a) Owner Preview: Creator opening their own 1×/User link is NEVER blocked and consumes 0 claims!
+        # (a) Owner Preview: Creator opening their own 1×/User link is NEVER blocked, NEVER protected, NEVER schedules auto-delete!
         dummy_bot.batch_copied_calls.clear()
+        dummy_bot.sent_media.clear()
         await start_help.cmd_start(
             _make_start_msg(4001, "creator_alpha", "Creator Alpha"),  # type: ignore[arg-type]
             SimpleNamespace(args=f"pack_{trial_pack['share_token']}"),  # type: ignore[arg-type]
@@ -1190,11 +1213,21 @@ async def run_tests() -> None:
             dummy_cfg,
         )
         assert len(dummy_bot.batch_copied_calls) == 1
+        assert dummy_bot.batch_copied_calls[0]["protect"] is False, "Owner self-retrieval must NEVER enforce protect_content=True!"
+        assert any(
+            m["type"] == "msg" and "Owner Access" in m["text"] and m["protect"] is False
+            for m in dummy_bot.sent_media
+        )
         assert await db.count_link_claims("pack", trial_pack["id"]) == 0
         assert (await db.get_pack(trial_pack["id"]))["views"] == 0
+        owner_sched_cnt = (
+            await (await db.conn.execute("SELECT COUNT(*) FROM scheduled_deletes WHERE chat_id = 4001")).fetchone()
+        )[0]
+        assert owner_sched_cnt == 0, "Owner self-retrieval must NEVER schedule auto-delete!"
 
-        # (b) First Open by Visitor A: Claims slot atomically, delivers protected files, schedules 2h delete
+        # (b) First Open by Visitor A: Claims slot atomically, delivers protected files + 2-column Request/Contact CTA, schedules 2h delete
         dummy_bot.batch_copied_calls.clear()
+        dummy_bot.sent_media.clear()
         start_answers.clear()
         await start_help.cmd_start(
             _make_start_msg(5001, "visitor_one", "Visitor One"),  # type: ignore[arg-type]
@@ -1208,8 +1241,15 @@ async def run_tests() -> None:
         assert dummy_bot.batch_copied_calls[0]["protect"] is True
         assert await db.count_link_claims("pack", trial_pack["id"]) == 1
         assert len(start_answers) == 0  # Delivered pack, not locked card
+        vis_header_kb = dummy_bot.sent_media[0]["reply_markup"]
+        assert vis_header_kb is not None
+        assert vis_header_kb.inline_keyboard[0][0].text == "🔓 Request Full Access"
+        assert vis_header_kb.inline_keyboard[0][0].callback_data == f"req:p:{trial_pack['id']}"
+        assert vis_header_kb.inline_keyboard[0][0].style == "primary"
+        assert vis_header_kb.inline_keyboard[0][1].text == "💬 Contact Owner"
+        assert vis_header_kb.inline_keyboard[0][1].url == "https://t.me/AlphaSalesSupport"
 
-        # (c) Repeat Open by Visitor A: Sends ZERO files, shows `🔒 Trial Access Ended` + Creator Alpha's Contact button!
+        # (c) Repeat Open by Visitor A: Sends ZERO files, shows `🔒 Trial Access Ended` + 2-column `[🔓 Request Full Access] [💬 Contact Owner]`!
         dummy_bot.batch_copied_calls.clear()
         dummy_bot.sent_media.clear()
         start_answers.clear()
@@ -1227,10 +1267,13 @@ async def run_tests() -> None:
         locked_msg_txt, locked_msg_kb = start_answers[0]
         assert "Trial Access Ended" in locked_msg_txt
         assert locked_msg_kb is not None
-        contact_btn = locked_msg_kb.inline_keyboard[0][0]
+        req_btn = locked_msg_kb.inline_keyboard[0][0]
+        contact_btn = locked_msg_kb.inline_keyboard[0][1]
+        assert req_btn.text == "🔓 Request Full Access"
+        assert req_btn.callback_data == f"req:p:{trial_pack['id']}"
+        assert req_btn.style == "primary"
         assert contact_btn.text == "💬 Contact Owner"
         assert contact_btn.url == "https://t.me/AlphaSalesSupport"
-        assert contact_btn.style == "primary"
 
         # (d) New Visitor B on the SAME permanent link: Gets fresh 1-time trial + independent timer!
         await start_help.cmd_start(
@@ -1258,6 +1301,8 @@ async def run_tests() -> None:
             delete_at=int(time.time()) - 5,  # Already due!
             notify_text=build_trial_expiry_notice_text("Flagship Masterclass Trial", 7200),
             contact_url="https://t.me/AlphaSalesSupport",
+            link_type="pack",
+            link_id=trial_pack["id"],
         )
         # Force earlier scheduled jobs to be due as well
         await db.conn.execute("UPDATE scheduled_deletes SET delete_at = ?", (int(time.time()) - 2,))
@@ -1266,7 +1311,7 @@ async def run_tests() -> None:
         dummy_bot.batch_deleted_calls.clear()
         dummy_bot.sent_media.clear()
         swept = await execute_due_scheduled_deletes(dummy_bot, db, limit=50)
-        assert swept >= 3
+        assert swept >= 2
         # Confirm 250-message job was split into chunks of <= 100 (100, 100, 50)
         chunk_sizes_5001 = [
             len(mids) for cid, mids in dummy_bot.batch_deleted_calls if cid == 5001
@@ -1274,7 +1319,7 @@ async def run_tests() -> None:
         assert 100 in chunk_sizes_5001 and 50 in chunk_sizes_5001
         assert all(sz <= 100 for sz in chunk_sizes_5001)
 
-        # Confirm post-expiry notice was delivered with `💬 Contact Owner` primary button!
+        # Confirm post-expiry notice was delivered with 2-column `[🔓 Request Full Access] [💬 Contact Owner]`!
         expiry_notices = [
             m
             for m in dummy_bot.sent_media
@@ -1283,9 +1328,11 @@ async def run_tests() -> None:
         assert len(expiry_notices) >= 1
         exp_kb = expiry_notices[-1]["reply_markup"]
         assert exp_kb is not None
-        assert exp_kb.inline_keyboard[0][0].text == "💬 Contact Owner"
-        assert exp_kb.inline_keyboard[0][0].url == "https://t.me/AlphaSalesSupport"
+        assert exp_kb.inline_keyboard[0][0].text == "🔓 Request Full Access"
+        assert exp_kb.inline_keyboard[0][0].callback_data == f"req:p:{trial_pack['id']}"
         assert exp_kb.inline_keyboard[0][0].style == "primary"
+        assert exp_kb.inline_keyboard[0][1].text == "💬 Contact Owner"
+        assert exp_kb.inline_keyboard[0][1].url == "https://t.me/AlphaSalesSupport"
 
         # 31. Bot API 9.4+ Polish: `<blockquote expandable>`, Message Effects, & Mobile 360px Ergonomics (<=2 btns/row, <=64B cb)
         big_pack_det = await packs.render_pack_detail(
@@ -1315,6 +1362,576 @@ async def run_tests() -> None:
                 for btn in row:
                     if btn.callback_data:
                         assert len(btn.callback_data.encode("utf-8")) <= 64
+
+        # 32. Per-Link `💣 Auto-Del` Priority Over Global `/settings` + Full Cycle + Visitor Execution
+        # Verify exact 7-step cycle: Off(0) -> 5m(300) -> 15m(900) -> 1h(3600) -> 2h(7200) -> 6h(21600) -> 24h(86400) -> Off(0)
+        assert AUTO_DELETE_CYCLE == [0, 300, 900, 3600, 7200, 21600, 86400]
+        assert [format_ttl_short(v) for v in AUTO_DELETE_CYCLE] == [
+            "Off",
+            "5m",
+            "15m",
+            "1h",
+            "2h",
+            "6h",
+            "24h",
+        ]
+
+        owner_p = await db.ensure_user(9101, "prio_owner", "Priority Owner")
+        await db.set_support_contact(9101, "@PriorityOwnerSupport")
+        visitor_p = await db.ensure_user(9201, "prio_visitor", "Priority Visitor")
+        # Set visitor's own `/settings` auto-delete to 15m (900s) to prove visitor's timer is NEVER used!
+        await db.set_auto_delete_ttl(9201, 900)
+
+        prio_file = await db.add_file(
+            vault_id=owner_p["vault_id"],
+            uploader_user_id=9101,
+            group_id=None,
+            media_type="document",
+            file_id="PRIO_DOC_1",
+            file_unique_id="PRIO_UNIQ_1",
+            dump_message_id=88001,
+            title="Priority_Test_Guide.pdf",
+            file_size=2_500_000,
+        )
+        prio_file_2 = await db.add_file(
+            vault_id=owner_p["vault_id"],
+            uploader_user_id=9101,
+            group_id=None,
+            media_type="document",
+            file_id="PRIO_DOC_2",
+            file_unique_id="PRIO_UNIQ_2",
+            dump_message_id=88002,
+            title="Priority_Test_Bonus.pdf",
+            file_size=1_500_000,
+        )
+        prio_ftok = await db.toggle_share_token(prio_file["id"])
+        assert prio_ftok is not None
+
+        prio_pack = await db.create_pack(
+            vault_id=owner_p["vault_id"],
+            creator_user_id=9101,
+            title="Priority Pack Bundle",
+            file_ids=[prio_file["id"], prio_file_2["id"]],
+            protect_content=True,
+        )
+        assert prio_pack["auto_delete_ttl"] == 0
+        assert (await db.get_file(prio_file["id"]))["auto_delete_ttl"] == 0
+
+        # Verify cycling through all steps on both File Share card and Pack card
+        expected_steps = [300, 900, 3600, 7200, 21600, 86400, 0]
+        for step_ttl in expected_steps:
+            assert await db.cycle_file_auto_delete_ttl(prio_file["id"]) == step_ttl
+            assert await db.cycle_pack_auto_delete_ttl(prio_pack["id"]) == step_ttl
+
+        # Verify UI button labels clearly distinguish `💣 Auto-Del: ...` vs `⏳ Link: Never`
+        await db.set_file_auto_delete_ttl(prio_file["id"], 300)
+        f_card_row = await db.get_file(prio_file["id"])
+        f_link_kb = build_file_link_keyboard(f_card_row, bot_username="KoshBox_Bot")
+        f_btn_texts = [b.text for r in f_link_kb.inline_keyboard for b in r]
+        assert "💣 Auto-Del: 5m" in f_btn_texts
+        assert "⏳ Link: Never" in f_btn_texts
+
+        await db.set_pack_auto_delete_ttl(prio_pack["id"], 21600)
+        p_det_rendered = await packs.render_pack_detail(
+            9101, prio_pack["id"], db, dummy_bot  # type: ignore[arg-type]
+        )
+        assert p_det_rendered is not None
+        p_btn_texts = [b.text for r in p_det_rendered[1].inline_keyboard for b in r]
+        assert "💣 Auto-Del: 6h" in p_btn_texts
+        assert "⏳ Link: Never" in p_btn_texts
+
+        # Clean scheduled_deletes table before testing the 4 exact priority cases end-to-end
+        await db.conn.execute("DELETE FROM scheduled_deletes")
+        await db.conn.commit()
+
+        async def _fetch_scheduled_rows() -> list[dict]:
+            cur = await db.conn.execute(
+                "SELECT id, chat_id, message_ids_json, delete_at, notify_text, contact_url FROM scheduled_deletes ORDER BY id ASC"
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+        # Case (a): File `5m` (300s) + Global `1h` (3600s) -> MUST resolve to `5m` (300s)
+        await db.set_file_auto_delete_ttl(prio_file["id"], 300)
+        await db.set_auto_delete_ttl(9101, 3600)
+        assert resolve_effective_auto_delete_ttl(300, 3600) == 300
+        assert await db.resolve_file_auto_delete_ttl(await db.get_file(prio_file["id"])) == 300
+
+        t_before = int(time.time())
+        dummy_bot.sent_media.clear()
+        await start_help.cmd_start(
+            _make_start_msg(9201, "prio_visitor", "Priority Visitor"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"file_{prio_ftok}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        t_after = int(time.time())
+        sched_a = await _fetch_scheduled_rows()
+        assert len(sched_a) == 1
+        assert t_before + 300 <= sched_a[0]["delete_at"] <= t_after + 300
+        assert "(5m)" in sched_a[0]["notify_text"]
+        assert sched_a[0]["contact_url"] == "https://t.me/PriorityOwnerSupport"
+        assert "Auto-deletes in 5m" in dummy_bot.sent_media[-1]["caption"]
+        await db.conn.execute("DELETE FROM scheduled_deletes")
+        await db.conn.commit()
+
+        # Also verify Case (a) on Pack (`5m` Pack + `1h` Global -> `5m`, saves header + all `copy_messages` IDs)
+        await db.set_pack_auto_delete_ttl(prio_pack["id"], 300)
+        assert await db.resolve_pack_auto_delete_ttl(await db.get_pack(prio_pack["id"])) == 300
+        dummy_bot.sent_media.clear()
+        dummy_bot.batch_copied_calls.clear()
+        t_before = int(time.time())
+        await start_help.cmd_start(
+            _make_start_msg(9201, "prio_visitor", "Priority Visitor"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{prio_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        t_after = int(time.time())
+        sched_ap = await _fetch_scheduled_rows()
+        assert len(sched_ap) == 1
+        assert t_before + 300 <= sched_ap[0]["delete_at"] <= t_after + 300
+        assert "(5m)" in sched_ap[0]["notify_text"]
+        assert sched_ap[0]["contact_url"] == "https://t.me/PriorityOwnerSupport"
+        import json as _json
+
+        saved_pack_mids = _json.loads(sched_ap[0]["message_ids_json"])
+        assert len(saved_pack_mids) == 3  # 1 pack header + 2 `copy_messages` batch items!
+        # Execute due sweeper and verify all 3 messages are deleted via `bot.delete_messages` + Contact Owner sent
+        await db.conn.execute("UPDATE scheduled_deletes SET delete_at = ?", (int(time.time()) - 1,))
+        await db.conn.commit()
+        dummy_bot.batch_deleted_calls.clear()
+        dummy_bot.sent_media.clear()
+        assert await execute_due_scheduled_deletes(dummy_bot, db) == 1
+        assert dummy_bot.batch_deleted_calls == [(9201, sorted(saved_pack_mids))]
+        exp_row_ap = dummy_bot.sent_media[-1]["reply_markup"].inline_keyboard[0]
+        assert exp_row_ap[0].text == "🔓 Request Full Access"
+        assert exp_row_ap[0].callback_data == f"req:p:{prio_pack['id']}"
+        assert exp_row_ap[1].text == "💬 Contact Owner"
+        assert exp_row_ap[1].url == "https://t.me/PriorityOwnerSupport"
+
+        # Case (b): File `Off` (0) + Global `1h` (3600s) -> MUST fall back to owner's Global `1h` (3600s)
+        await db.set_file_auto_delete_ttl(prio_file["id"], 0)
+        await db.set_auto_delete_ttl(9101, 3600)
+        assert resolve_effective_auto_delete_ttl(0, 3600) == 3600
+        assert await db.resolve_file_auto_delete_ttl(await db.get_file(prio_file["id"])) == 3600
+
+        t_before = int(time.time())
+        dummy_bot.sent_media.clear()
+        await start_help.cmd_start(
+            _make_start_msg(9201, "prio_visitor", "Priority Visitor"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"file_{prio_ftok}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        t_after = int(time.time())
+        sched_b = await _fetch_scheduled_rows()
+        assert len(sched_b) == 1
+        assert t_before + 3600 <= sched_b[0]["delete_at"] <= t_after + 3600
+        assert "(1h)" in sched_b[0]["notify_text"]
+        assert "Auto-deletes in 1h" in dummy_bot.sent_media[-1]["caption"]
+        await db.conn.execute("DELETE FROM scheduled_deletes")
+        await db.conn.commit()
+
+        # Case (c): File `2h` (7200s) + Global `Off` (0) -> MUST use File's `2h` (7200s)
+        await db.set_file_auto_delete_ttl(prio_file["id"], 7200)
+        await db.set_auto_delete_ttl(9101, 0)
+        assert resolve_effective_auto_delete_ttl(7200, 0) == 7200
+        assert await db.resolve_file_auto_delete_ttl(await db.get_file(prio_file["id"])) == 7200
+
+        t_before = int(time.time())
+        dummy_bot.sent_media.clear()
+        await start_help.cmd_start(
+            _make_start_msg(9201, "prio_visitor", "Priority Visitor"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"file_{prio_ftok}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        t_after = int(time.time())
+        sched_c = await _fetch_scheduled_rows()
+        assert len(sched_c) == 1
+        assert t_before + 7200 <= sched_c[0]["delete_at"] <= t_after + 7200
+        assert "(2h)" in sched_c[0]["notify_text"]
+        assert "Auto-deletes in 2h" in dummy_bot.sent_media[-1]["caption"]
+        await db.conn.execute("DELETE FROM scheduled_deletes")
+        await db.conn.commit()
+
+        # Case (d): File `Off` (0) + Global `Off` (0) -> NO auto-delete (even though visitor has 15m in their own `/settings`!)
+        await db.set_file_auto_delete_ttl(prio_file["id"], 0)
+        await db.set_pack_auto_delete_ttl(prio_pack["id"], 0)
+        await db.set_auto_delete_ttl(9101, 0)
+        assert (await db.get_user(9201))["auto_delete_ttl"] == 900  # Visitor's own setting is 15m
+        assert resolve_effective_auto_delete_ttl(0, 0) == 0
+        assert await db.resolve_file_auto_delete_ttl(await db.get_file(prio_file["id"])) == 0
+        assert await db.resolve_pack_auto_delete_ttl(await db.get_pack(prio_pack["id"])) == 0
+
+        dummy_bot.sent_media.clear()
+        await start_help.cmd_start(
+            _make_start_msg(9201, "prio_visitor", "Priority Visitor"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"file_{prio_ftok}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        await start_help.cmd_start(
+            _make_start_msg(9201, "prio_visitor", "Priority Visitor"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{prio_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        sched_d = await _fetch_scheduled_rows()
+        assert len(sched_d) == 0, "Neither file nor pack should schedule auto-delete when both per-link and owner global are Off!"
+
+        # Verify SQLite auto-migration on legacy DB lacking `auto_delete_ttl` on `files` & `packs`
+        legacy_db_path = os.path.join(tmpdir, "legacy_upgrade.db")
+        import aiosqlite as _aiosqlite
+
+        async with _aiosqlite.connect(legacy_db_path) as raw_conn:
+            await raw_conn.executescript(
+                """
+                CREATE TABLE vaults (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL);
+                CREATE TABLE users (user_id INTEGER PRIMARY KEY, vault_id INTEGER NOT NULL, created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+                CREATE TABLE files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER NOT NULL,
+                    uploader_user_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT NOT NULL,
+                    dump_message_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE packs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER NOT NULL,
+                    creator_user_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    share_token TEXT UNIQUE NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                """
+            )
+            await raw_conn.commit()
+        migrated_db = Database(legacy_db_path)
+        await migrated_db.connect()
+        f_cols = {
+            r["name"]
+            for r in await (await migrated_db.conn.execute("PRAGMA table_info(files);")).fetchall()
+        }
+        p_cols = {
+            r["name"]
+            for r in await (await migrated_db.conn.execute("PRAGMA table_info(packs);")).fetchall()
+        }
+        g_cols = {
+            r["name"]
+            for r in await (await migrated_db.conn.execute("PRAGMA table_info(link_access_grants);")).fetchall()
+        }
+        assert "auto_delete_ttl" in f_cols and "auto_delete_ttl" in p_cols
+        assert {"link_type", "link_id", "user_id", "granted_by", "expires_at", "created_at"} <= g_cols
+        await migrated_db.close()
+
+        # 33. Owner Self-Retrieval Bug Fix (Primary + Linked Secondary Account across Get File, Get All, Share Links)
+        owner_main = await db.ensure_user(9501, "owner_main", "Owner Main")
+        owner_alt = await db.ensure_user(9502, "owner_alt", "Owner Linked Alt")
+        # Link `owner_alt` (9502) into `owner_main` (9501) vault
+        lreq = await db.create_link_request(9501, owner_main["vault_id"], 600)
+        await db.attach_requester_to_link(lreq["code"], 9502, "Owner Linked Alt", "owner_alt")
+        await db.approve_link_request(lreq["code"], 9501)
+        assert (await db.get_user(9502))["vault_id"] == owner_main["vault_id"]
+
+        # Enable strict settings on owner (5m auto-delete, protect_content=True, 1x/User=True)
+        await db.set_auto_delete_ttl(9501, 300)
+        await db.set_auto_delete_ttl(9502, 300)
+        await db.toggle_protect_content(9501)
+        await db.toggle_default_one_time(9501)
+        await db.set_support_contact(9501, "@OwnerSalesDesk")
+
+        own_file = await db.add_file(
+            vault_id=owner_main["vault_id"],
+            uploader_user_id=9501,
+            group_id=None,
+            media_type="document",
+            file_id="OWN_DOC_1",
+            file_unique_id="OWN_UNIQ_1",
+            dump_message_id=95001,
+            title="2001_471_Chapter_1.pdf",
+            file_size=4_000_000,
+        )
+        own_file_2 = await db.add_file(
+            vault_id=owner_main["vault_id"],
+            uploader_user_id=9501,
+            group_id=None,
+            media_type="audio",
+            file_id="OWN_AUD_2",
+            file_unique_id="OWN_UNIQ_2",
+            dump_message_id=95002,
+            title="Little_Monkey_Ep_2.mp3",
+            file_size=5_000_000,
+        )
+        own_ftok = await db.toggle_share_token(own_file["id"])
+        assert own_ftok is not None
+        await db.set_file_auto_delete_ttl(own_file["id"], 300)
+        await db.set_file_share_pin(own_file["id"], "9999")
+
+        own_pack = await db.create_pack(
+            vault_id=owner_main["vault_id"],
+            creator_user_id=9501,
+            title="Little monkey (5)",
+            file_ids=[own_file["id"], own_file_2["id"]],
+            pin="8888",
+            protect_content=True,
+            one_time_per_user=True,
+            auto_delete_ttl=300,
+            max_views=1,
+        )
+
+        await db.conn.execute("DELETE FROM scheduled_deletes")
+        await db.conn.commit()
+        dummy_bot.sent_media.clear()
+        dummy_bot.batch_copied_calls.clear()
+
+        def _make_cb(uid: int, uname: str, fname: str, data_str: str):
+            cb_acks: list[tuple] = []
+            msg_edits: list[tuple] = []
+            msg_answers: list[tuple] = []
+
+            async def _cb_ans(txt=None, show_alert=False):
+                cb_acks.append((txt, show_alert))
+
+            async def _m_edit(txt, reply_markup=None, disable_web_page_preview=False):
+                msg_edits.append((txt, reply_markup))
+
+            async def _m_ans(txt, reply_markup=None, disable_web_page_preview=False):
+                msg_answers.append((txt, reply_markup))
+                return SimpleNamespace(message_id=96000 + len(msg_answers))
+
+            cb_obj = SimpleNamespace(
+                data=data_str,
+                from_user=SimpleNamespace(id=uid, username=uname, full_name=fname, first_name=fname),
+                message=SimpleNamespace(
+                    message_id=95500,
+                    chat=SimpleNamespace(id=uid, type="private"),
+                    photo=None,
+                    text="card",
+                    edit_text=_m_edit,
+                    answer=_m_ans,
+                ),
+                answer=_cb_ans,
+            )
+            return cb_obj, cb_acks, msg_edits, msg_answers
+
+        # (33a) `📥 Get File` (`f:get:<fid>`) by primary AND linked owner -> ZERO scheduled_deletes, protect_content=False
+        cb_fget, fget_acks, _, _ = _make_cb(9502, "owner_alt", "Owner Linked Alt", f"f:get:{own_file['id']}")
+        await file_actions.cb_get_file_here(cb_fget, db, dummy_bot)  # type: ignore[arg-type]
+        assert len(dummy_bot.sent_media) == 1
+        assert dummy_bot.sent_media[-1]["protect"] is False
+        assert "Owner Access" in dummy_bot.sent_media[-1]["caption"]
+        assert "Auto-deletes" not in dummy_bot.sent_media[-1]["caption"]
+        assert "Owner Access" in (fget_acks[-1][0] or "")
+
+        # (33b) `📥 Get All` (`pk:get:<pid>`) by primary AND linked owner -> ZERO scheduled_deletes, protect_content=False
+        dummy_bot.sent_media.clear()
+        dummy_bot.batch_copied_calls.clear()
+        cb_pget, pget_acks, _, _ = _make_cb(9501, "owner_main", "Owner Main", f"pk:get:{own_pack['id']}")
+        await packs.cb_pack_get_all(cb_pget, db, dummy_bot, dummy_cfg)  # type: ignore[arg-type]
+        assert len(dummy_bot.batch_copied_calls) == 1
+        assert dummy_bot.batch_copied_calls[0]["protect"] is False
+        assert "Owner Access" in dummy_bot.sent_media[0]["text"]
+        assert "Trial auto-deletes" not in dummy_bot.sent_media[0]["text"]
+
+        # (33c) Linked secondary account opening `?start=file_...` & `?start=pack_...` (even with PIN, 1x/User, paused/limit)
+        await start_help.cmd_start(
+            _make_start_msg(9502, "owner_alt", "Owner Linked Alt"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"file_{own_ftok}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        await start_help.cmd_start(
+            _make_start_msg(9502, "owner_alt", "Owner Linked Alt"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{own_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert await db.count_link_claims("file", own_file["id"]) == 0
+        assert await db.count_link_claims("pack", own_pack["id"]) == 0
+        assert len(await _fetch_scheduled_rows()) == 0, "Owner & linked account must NEVER have scheduled_deletes!"
+
+        # 34. Full Access / Paid Unlock Approval System (Visitor Request -> 10m Rate Limit -> Owner Approval Card -> 1d/7d/30d/Lifetime/Reject)
+        start_help.reset_access_request_cooldowns()
+        buyer_uid = 9601
+        await db.ensure_user(buyer_uid, "paid_buyer", "Paid Buyer")
+
+        # Remove PIN on `own_pack` & raise `max_views` so buyer can take 1-time trial first
+        await db.set_pack_pin(own_pack["id"], None)
+        await db.conn.execute("UPDATE packs SET max_views = 0 WHERE id = ?", (own_pack["id"],))
+        await db.conn.commit()
+
+        # Step 1: Buyer opens pack -> gets 5m trial + 2-column CTA `[🔓 Request Full Access] [💬 Contact Owner]`
+        dummy_bot.sent_media.clear()
+        dummy_bot.batch_copied_calls.clear()
+        await start_help.cmd_start(
+            _make_start_msg(buyer_uid, "paid_buyer", "Paid Buyer"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{own_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert len(dummy_bot.batch_copied_calls) == 1
+        assert await db.count_link_claims("pack", own_pack["id"]) == 1
+        assert len(await _fetch_scheduled_rows()) == 1  # Trial auto-delete scheduled for buyer
+
+        # Step 2: Buyer taps `🔓 Request Full Access` (`req:p:<pack_id>`)
+        dummy_bot.sent_media.clear()
+        req_cb_obj, req_acks, _, req_visitor_msgs = _make_cb(
+            buyer_uid, "paid_buyer", "Paid Buyer", f"req:p:{own_pack['id']}"
+        )
+        await start_help.cb_request_full_access(req_cb_obj, db, dummy_bot)  # type: ignore[arg-type]
+        assert len(req_visitor_msgs) == 1
+        assert "Full access request sent to the owner" in req_visitor_msgs[0][0]
+        assert req_visitor_msgs[0][1].inline_keyboard[0][0].text == "💬 Contact Owner"
+        assert req_visitor_msgs[0][1].inline_keyboard[0][0].url == "https://t.me/OwnerSalesDesk"
+
+        # Both linked owner accounts (9501 & 9502) receive the sleek Approval Card in DM!
+        owner_dms = [
+            m for m in dummy_bot.sent_media
+            if m["type"] == "msg" and m["chat_id"] in (9501, 9502) and "Full Access Request" in m["text"]
+        ]
+        assert {m["chat_id"] for m in owner_dms} == {9501, 9502}
+        app_card = owner_dms[0]
+        assert "Paid Buyer" in app_card["text"]
+        assert "@paid_buyer" in app_card["text"]
+        assert str(buyer_uid) in app_card["text"]
+        assert "Little monkey (5)" in app_card["text"]
+        app_kb = app_card["reply_markup"]
+        assert len(app_kb.inline_keyboard) == 3
+        assert [b.text for b in app_kb.inline_keyboard[0]] == ["✅ 1 Day", "✅ 7 Days"]
+        assert [b.style for b in app_kb.inline_keyboard[0]] == ["success", "success"]
+        assert [b.text for b in app_kb.inline_keyboard[1]] == ["✅ 30 Days", "♾️ Lifetime"]
+        assert [b.style for b in app_kb.inline_keyboard[1]] == ["success", "primary"]
+        assert [b.text for b in app_kb.inline_keyboard[2]] == ["❌ Reject"]
+        assert [b.style for b in app_kb.inline_keyboard[2]] == ["danger"]
+        for r in app_kb.inline_keyboard:
+            for b in r:
+                assert len(b.callback_data.encode("utf-8")) <= 64
+
+        # Step 3: Duplicate request within 10m is rate-limited via bounded TTLCache (zero owner spam!)
+        dummy_bot.sent_media.clear()
+        dup_cb_obj, dup_acks, _, dup_visitor_msgs = _make_cb(
+            buyer_uid, "paid_buyer", "Paid Buyer", f"req:p:{own_pack['id']}"
+        )
+        await start_help.cb_request_full_access(dup_cb_obj, db, dummy_bot)  # type: ignore[arg-type]
+        assert len(dup_visitor_msgs) == 0
+        assert len(dummy_bot.sent_media) == 0
+        assert dup_acks and dup_acks[0][1] is True and "already sent" in (dup_acks[0][0] or "").lower()
+
+        # Step 4: Owner taps `[ ✅ 30 Days ]` (`gr:p:<pack_id>:<buyer_uid>:30`)
+        dummy_bot.sent_media.clear()
+        grant_cb_str = app_kb.inline_keyboard[1][0].callback_data
+        assert grant_cb_str == f"gr:p:{own_pack['id']}:{buyer_uid}:30"
+        gr_cb_obj, gr_acks, gr_edits, _ = _make_cb(
+            9501, "owner_main", "Owner Main", grant_cb_str
+        )
+        await start_help.cb_owner_grant_or_reject_access(
+            gr_cb_obj, db, dummy_bot, bot_username="KoshBox_Bot"  # type: ignore[arg-type]
+        )
+        assert len(gr_edits) == 1 and "Full Access Granted (30 Days)" in gr_edits[0][0]
+        assert await db.has_active_access_grant("pack", own_pack["id"], buyer_uid) is True
+        # Pending trial scheduled_delete for buyer + pack was automatically cancelled!
+        assert len(await _fetch_scheduled_rows()) == 0
+        # Visitor immediately received DM unlock notice with `📥 Open Unlocked Content` deep-link button
+        buyer_unlock_dms = [
+            m for m in dummy_bot.sent_media
+            if m["type"] == "msg" and m["chat_id"] == buyer_uid and "Full Access Unlocked" in m["text"]
+        ]
+        assert len(buyer_unlock_dms) == 1
+        unlock_btn = buyer_unlock_dms[0]["reply_markup"].inline_keyboard[0][0]
+        assert unlock_btn.text == "📥 Open Unlocked Content"
+        assert unlock_btn.url == f"https://t.me/KoshBox_Bot?start=pack_{own_pack['share_token']}"
+
+        # Step 5: Buyer re-opens the 1x/User pack multiple times -> ALWAYS delivered in full, ZERO auto-delete, ZERO Trial Locked card!
+        for _ in range(2):
+            dummy_bot.batch_copied_calls.clear()
+            start_answers.clear()
+            await start_help.cmd_start(
+                _make_start_msg(buyer_uid, "paid_buyer", "Paid Buyer"),  # type: ignore[arg-type]
+                SimpleNamespace(args=f"pack_{own_pack['share_token']}"),  # type: ignore[arg-type]
+                _DummyFSM(None),  # type: ignore[arg-type]
+                db,
+                dummy_bot,  # type: ignore[arg-type]
+                dummy_cfg,
+            )
+            assert len(dummy_bot.batch_copied_calls) == 1
+            assert len(start_answers) == 0
+            assert len(await _fetch_scheduled_rows()) == 0
+
+        # Step 6: Grant expiry -> once `expires_at <= now`, grant becomes inactive and 1x/User lock resumes
+        await db.conn.execute(
+            "UPDATE link_access_grants SET expires_at = ? WHERE link_type = 'pack' AND link_id = ? AND user_id = ?",
+            (int(time.time()) - 10, own_pack["id"], buyer_uid),
+        )
+        await db.conn.commit()
+        assert await db.has_active_access_grant("pack", own_pack["id"], buyer_uid) is False
+        dummy_bot.batch_copied_calls.clear()
+        start_answers.clear()
+        await start_help.cmd_start(
+            _make_start_msg(buyer_uid, "paid_buyer", "Paid Buyer"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"pack_{own_pack['share_token']}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert len(dummy_bot.batch_copied_calls) == 0
+        assert len(start_answers) == 1 and "Trial Access Ended" in start_answers[0][0]
+
+        # Step 7: Lifetime grant (`0`) & Reject (`-1`) flow on File link (`gr:f:<fid>:<uid>:0` & `-1`)
+        lf_cb_obj, _, lf_edits, _ = _make_cb(
+            9502, "owner_alt", "Owner Linked Alt", f"gr:f:{own_file['id']}:{buyer_uid}:0"
+        )
+        await start_help.cb_owner_grant_or_reject_access(
+            lf_cb_obj, db, dummy_bot, bot_username="KoshBox_Bot"  # type: ignore[arg-type]
+        )
+        grant_f = await db.get_active_access_grant("file", own_file["id"], buyer_uid)
+        assert grant_f is not None and grant_f["expires_at"] == 0
+        # Buyer bypasses PIN & 1x/User & 5m auto-delete on unlocked file!
+        dummy_bot.sent_media.clear()
+        await start_help.cmd_start(
+            _make_start_msg(buyer_uid, "paid_buyer", "Paid Buyer"),  # type: ignore[arg-type]
+            SimpleNamespace(args=f"file_{own_ftok}"),  # type: ignore[arg-type]
+            _DummyFSM(None),  # type: ignore[arg-type]
+            db,
+            dummy_bot,  # type: ignore[arg-type]
+            dummy_cfg,
+        )
+        assert any(m["type"] == "document" and "Lifetime Full Access" in m["caption"] for m in dummy_bot.sent_media)
+        assert len(await _fetch_scheduled_rows()) == 0
+
+        # Reject / Revoke (`-1`) removes active grant and notifies visitor
+        dummy_bot.sent_media.clear()
+        rej_cb_obj, _, rej_edits, _ = _make_cb(
+            9501, "owner_main", "Owner Main", f"gr:f:{own_file['id']}:{buyer_uid}:-1"
+        )
+        await start_help.cb_owner_grant_or_reject_access(
+            rej_cb_obj, db, dummy_bot, bot_username="KoshBox_Bot"  # type: ignore[arg-type]
+        )
+        assert await db.has_active_access_grant("file", own_file["id"], buyer_uid) is False
+        assert len(rej_edits) == 1 and "Declined" in rej_edits[0][0]
+        assert any(m["type"] == "msg" and m["chat_id"] == buyer_uid and "Declined" in m["text"] for m in dummy_bot.sent_media)
 
         await db.close()
         print("ALL PRO FEATURES, TRIAL LOCKS, BATCH APIS, BOT API 9.4 UX & ZERO-LEAK TESTS PASSED!")

@@ -26,6 +26,7 @@ from utils.formatters import (
     SORT_LABELS,
     back_btn,
     breadcrumb,
+    build_contact_owner_kb,
     build_file_card_text,
     build_file_keyboard,
     build_file_link_keyboard,
@@ -34,6 +35,7 @@ from utils.formatters import (
     build_trial_locked_card,
     cancel_kb,
     esc,
+    format_grant_badge,
     format_size,
     format_ttl_short,
     home_btn,
@@ -42,6 +44,7 @@ from utils.formatters import (
     safe_edit_or_send,
     send_stored_media,
     send_with_effect,
+    tg_retry_call,
     toggle_label,
 )
 from utils.middleware import check_force_sub, invalidate_force_sub_cache
@@ -55,6 +58,38 @@ PIN_LOCKOUT_SECONDS = 300
 _PIN_FAIL_TRACKER: TTLCache[tuple[int, str], dict[str, float]] = TTLCache(
     maxsize=4096, ttl=float(PIN_LOCKOUT_SECONDS * 2)
 )
+
+# Bounded duplicate Full Access Request cooldown: (user_id, link_type, link_id) -> monotonic timestamp
+ACCESS_REQUEST_COOLDOWN_SECONDS = 600.0  # 10 minutes
+_ACCESS_REQUEST_COOLDOWN: TTLCache[tuple[int, str, int], float] = TTLCache(
+    maxsize=4096, ttl=ACCESS_REQUEST_COOLDOWN_SECONDS
+)
+
+
+def reset_access_request_cooldowns() -> None:
+    """Clears in-memory Full Access request rate-limit entries (useful in unit tests)."""
+    _ACCESS_REQUEST_COOLDOWN.clear()
+
+
+def _check_access_request_cooldown(user_id: int, link_type: str, link_id: int) -> int:
+    """
+    Returns remaining cooldown seconds (> 0) if `(user_id, link_type, link_id)` already sent
+    a Full Access request within the last 10 minutes; returns 0 if allowed.
+    """
+    key = (int(user_id), link_type, int(link_id))
+    sent_mono = _ACCESS_REQUEST_COOLDOWN.get(key)
+    if sent_mono is None:
+        return 0
+    elapsed = time.monotonic() - sent_mono
+    rem = int(ACCESS_REQUEST_COOLDOWN_SECONDS - elapsed)
+    return max(1, rem) if elapsed < ACCESS_REQUEST_COOLDOWN_SECONDS else 0
+
+
+def _mark_access_request_sent(user_id: int, link_type: str, link_id: int) -> None:
+    key = (int(user_id), link_type, int(link_id))
+    _ACCESS_REQUEST_COOLDOWN.set(
+        key, time.monotonic(), ttl=ACCESS_REQUEST_COOLDOWN_SECONDS
+    )
 
 
 def _check_pin_lockout(user_id: int, token: str) -> int:
@@ -475,9 +510,10 @@ async def _deliver_shared_file_with_claim_check(
 ) -> None:
     """
     Delivers a shared single file with:
-    - Owner preview bypass (never blocked, never consumes a claim or view)
-    - Atomic 1-Time Per-User Trial Claim Lock (`INSERT OR IGNORE` BEFORE sending)
-    - Dynamic Per-Owner `💬 Contact Owner` CTA on Repeat-Open & Auto-Delete Expiry Notice
+    - Owner self-retrieval bypass: ZERO trial/claim lock, ZERO auto-delete, ZERO `protect_content`, ZERO trial alerts
+    - Full Access Grant bypass (`link_access_grants`): skips 1x/User lock & auto-delete timer, unlimited opens while valid
+    - Atomic 1-Time Per-User Trial Claim Lock (`INSERT OR IGNORE` BEFORE sending) for regular trial visitors
+    - 2-column `🔓 Request Full Access` + `💬 Contact Owner` CTA on Trial Delivery, Repeat-Open & Expiry Notice
     - Restart-safe `scheduled_deletes` timer
     """
     owner = await db.get_user(file_row["uploader_user_id"])
@@ -485,27 +521,61 @@ async def _deliver_shared_file_with_claim_check(
         visitor["user_id"] == file_row["uploader_user_id"]
         or visitor["vault_id"] == file_row["vault_id"]
     )
+
+    if is_owner:
+        sent_owner = await send_stored_media(
+            bot,
+            message.chat.id,
+            file_row,
+            protect_content=False,
+            auto_delete_ttl=0,
+            db=db,
+            extra_note="🔓 Owner Access — permanent & unrestricted",
+        )
+        if sent_owner:
+            await db.increment_use_count(file_row["id"])
+        else:
+            await message.answer("⚠️ Unsupported media format.")
+        return
+
+    grant = await db.get_active_access_grant("file", file_row["id"], visitor["user_id"])
+    has_full_access = grant is not None
     contact_url = await db.resolve_owner_contact_url(
         file_row["vault_id"], preferred_user_id=file_row["uploader_user_id"]
     )
+    req_cb = f"req:f:{file_row['id']}"
 
-    if not is_owner and file_row.get("share_one_time"):
+    if not has_full_access and file_row.get("share_one_time"):
         claimed_now = await db.try_claim_link("file", file_row["id"], visitor["user_id"])
         if not claimed_now:
             locked_txt, locked_kb = build_trial_locked_card(
-                contact_url, title=file_row.get("title") or ""
+                contact_url,
+                title=file_row.get("title") or "",
+                request_access_cb=req_cb,
             )
             await message.answer(
                 locked_txt, reply_markup=locked_kb, disable_web_page_preview=True
             )
             return
 
-    ttl = int((owner or {}).get("auto_delete_ttl") or visitor.get("auto_delete_ttl") or 0)
+    raw_ttl = await db.resolve_file_auto_delete_ttl(file_row)
+    ttl = 0 if has_full_access else raw_ttl
     protect = bool(file_row.get("protect_share")) or bool((owner or {}).get("protect_content"))
+    is_trial_or_protected = (not has_full_access) and (
+        ttl > 0 or bool(file_row.get("share_one_time")) or protect
+    )
+    visitor_cta_kb = (
+        build_contact_owner_kb(contact_url, request_access_cb=req_cb)
+        if is_trial_or_protected
+        else None
+    )
     expiry_notice = (
         build_trial_expiry_notice_text(file_row.get("title") or "File", ttl)
-        if (ttl > 0 and not is_owner)
+        if ttl > 0
         else ""
+    )
+    grant_note = (
+        f"🔓 {format_grant_badge(grant['expires_at'])}" if grant else ""
     )
 
     sent = await send_stored_media(
@@ -517,13 +587,14 @@ async def _deliver_shared_file_with_claim_check(
         db=db,
         notify_text=expiry_notice,
         contact_url=contact_url,
-        message_effect_id=EFFECT_FIRE if not is_owner else None,
+        message_effect_id=EFFECT_FIRE,
+        reply_markup=visitor_cta_kb,
+        extra_note=grant_note,
+        link_type="file",
+        link_id=int(file_row["id"]),
     )
     if sent:
-        if is_owner:
-            await db.increment_use_count(file_row["id"])
-        else:
-            await db.increment_file_share_views(file_row["id"])
+        await db.increment_file_share_views(file_row["id"])
     else:
         await message.answer("⚠️ Unsupported media format.")
 
@@ -538,42 +609,76 @@ async def _deliver_shared_pack_with_claim_check(
 ) -> None:
     """
     Delivers a shared multi-file Pack with:
-    - Owner preview bypass (never blocked, never consumes a claim or view)
-    - Atomic 1-Time Per-User Trial Claim Lock (`INSERT OR IGNORE` BEFORE sending)
-    - Dynamic Per-Owner `💬 Contact Owner` CTA on Repeat-Open & Auto-Delete Expiry Notice
+    - Owner self-retrieval bypass: ZERO trial/claim lock, ZERO auto-delete, ZERO `protect_content`, ZERO trial alerts
+    - Full Access Grant bypass (`link_access_grants`): skips 1x/User lock & auto-delete timer, unlimited opens while valid
+    - Atomic 1-Time Per-User Trial Claim Lock (`INSERT OR IGNORE` BEFORE sending) for regular trial visitors
+    - 2-column `🔓 Request Full Access` + `💬 Contact Owner` CTA on Trial Delivery, Repeat-Open & Expiry Notice
     - Native 100-in-1 `copy_messages` batch delivery + restart-safe `scheduled_deletes`
     """
-    creator = await db.get_user(pack["creator_user_id"])
     is_owner = (
         visitor["user_id"] == pack["creator_user_id"]
         or visitor["vault_id"] == pack["vault_id"]
     )
+    if is_owner:
+        await deliver_pack_to_chat(
+            bot,
+            message.chat.id,
+            pack,
+            db,
+            auto_delete_ttl=0,
+            force_protect=False,
+            is_owner=True,
+            count_view=False,
+            dump_channel_id=config.dump_channel_id if config else None,
+            celebrate=False,
+        )
+        return
+
+    grant = await db.get_active_access_grant("pack", pack["id"], visitor["user_id"])
+    has_full_access = grant is not None
+    creator = await db.get_user(pack["creator_user_id"])
     contact_url = await db.resolve_owner_contact_url(
         pack["vault_id"], preferred_user_id=pack["creator_user_id"]
     )
+    req_cb = f"req:p:{pack['id']}"
 
-    if not is_owner and pack.get("one_time_per_user"):
+    if not has_full_access and pack.get("one_time_per_user"):
         claimed_now = await db.try_claim_link("pack", pack["id"], visitor["user_id"])
         if not claimed_now:
             locked_txt, locked_kb = build_trial_locked_card(
-                contact_url, title=pack.get("title") or ""
+                contact_url,
+                title=pack.get("title") or "",
+                request_access_cb=req_cb,
             )
             await message.answer(
                 locked_txt, reply_markup=locked_kb, disable_web_page_preview=True
             )
             return
 
-    ttl = int((creator or {}).get("auto_delete_ttl") or visitor.get("auto_delete_ttl") or 0)
+    raw_ttl = await db.resolve_pack_auto_delete_ttl(pack)
+    ttl = 0 if has_full_access else raw_ttl
+    force_protect = bool((creator or {}).get("protect_content"))
+    is_trial_or_protected = (not has_full_access) and (
+        ttl > 0
+        or bool(pack.get("one_time_per_user"))
+        or bool(pack.get("protect_content"))
+        or force_protect
+    )
     await deliver_pack_to_chat(
         bot,
         message.chat.id,
         pack,
         db,
         auto_delete_ttl=ttl,
-        count_view=not is_owner,
+        force_protect=force_protect,
+        is_owner=False,
+        has_full_access=has_full_access,
+        access_badge=format_grant_badge(grant["expires_at"]) if grant else "",
+        show_request_cta=is_trial_or_protected,
+        count_view=True,
         dump_channel_id=config.dump_channel_id if config else None,
         contact_url=contact_url,
-        celebrate=not is_owner,
+        celebrate=True,
     )
 
 
@@ -599,23 +704,51 @@ async def cmd_start(
     )
     args = (command.args or "").strip()
 
-    # Deep-link: shared single file (Permanent Group-Safe Trial + 1x/User Claim Lock + PIN + No-Fwd + Auto-Delete)
+    # Deep-link: shared single file (Owner Bypass + Full Access Grant + 1x/User Claim Lock + PIN + No-Fwd + Auto-Delete)
     if args.startswith("file_"):
         token = args[5:].strip()
-        file_row = await db.get_file_by_share_token(token)
-        if not file_row:
-            raw_file = await db.get_file_by_share_token(token, include_unavailable=True)
-            hdr, reason = _diagnose_file_unavailable(raw_file)
+        raw_file = await db.get_file_by_share_token(token, include_unavailable=True)
+        if not raw_file:
+            hdr, reason = _diagnose_file_unavailable(None)
             await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
             return
 
         is_owner = (
-            user["user_id"] == file_row["uploader_user_id"]
-            or user["vault_id"] == file_row["vault_id"]
+            user["user_id"] == raw_file["uploader_user_id"]
+            or user["vault_id"] == raw_file["vault_id"]
         )
-        # Pre-check 1x/User claim BEFORE asking for PIN so repeat visitors aren't prompted unnecessarily
+        has_full_access = (
+            False
+            if is_owner
+            else await db.has_active_access_grant("file", raw_file["id"], user["user_id"])
+        )
+
+        # Owner & approved Full Access users can always retrieve their unlocked content;
+        # regular visitors must pass paused/expiry/max_views link checks
+        file_row = (
+            raw_file
+            if (is_owner or has_full_access)
+            else await db.get_file_by_share_token(token)
+        )
+        if not file_row:
+            hdr, reason = _diagnose_file_unavailable(raw_file)
+            contact_url = await db.resolve_owner_contact_url(
+                raw_file["vault_id"], preferred_user_id=raw_file["uploader_user_id"]
+            )
+            unavail_kb = build_contact_owner_kb(
+                contact_url, request_access_cb=f"req:f:{raw_file['id']}"
+            )
+            await message.answer(
+                f"{hdr}\n<blockquote>{reason}</blockquote>",
+                reply_markup=unavail_kb,
+                disable_web_page_preview=True,
+            )
+            return
+
+        # Pre-check 1x/User claim BEFORE asking for PIN so repeat trial visitors aren't prompted unnecessarily
         if (
             not is_owner
+            and not has_full_access
             and file_row.get("share_one_time")
             and await db.has_claimed_link("file", file_row["id"], user["user_id"])
         ):
@@ -623,14 +756,16 @@ async def cmd_start(
                 file_row["vault_id"], preferred_user_id=file_row["uploader_user_id"]
             )
             locked_txt, locked_kb = build_trial_locked_card(
-                contact_url, title=file_row.get("title") or ""
+                contact_url,
+                title=file_row.get("title") or "",
+                request_access_cb=f"req:f:{file_row['id']}",
             )
             await message.answer(
                 locked_txt, reply_markup=locked_kb, disable_web_page_preview=True
             )
             return
 
-        if file_row.get("share_pin_hash") and not is_owner:
+        if file_row.get("share_pin_hash") and not is_owner and not has_full_access:
             lock_rem = _check_pin_lockout(message.from_user.id, f"f:{token}")
             if lock_rem > 0:
                 await message.answer(
@@ -650,22 +785,48 @@ async def cmd_start(
         await _deliver_shared_file_with_claim_check(message, user, file_row, db, bot)
         return
 
-    # Deep-link: shared multi-file Pack (Permanent Group-Safe Trial + 1x/User Claim Lock + 100-in-1 Batch Delivery)
+    # Deep-link: shared multi-file Pack (Owner Bypass + Full Access Grant + 1x/User Claim Lock + 100-in-1 Batch Delivery)
     if args.startswith("pack_"):
         token = args[5:].strip()
-        pack = await db.get_pack_by_token(token)
-        if not pack or pack["item_count"] == 0:
-            raw_pack = await db.get_pack_by_token(token, include_unavailable=True)
+        raw_pack = await db.get_pack_by_token(token, include_unavailable=True)
+        if not raw_pack or raw_pack.get("item_count", 0) == 0:
             hdr, reason = _diagnose_pack_unavailable(raw_pack)
             await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
             return
 
         is_owner = (
-            user["user_id"] == pack["creator_user_id"]
-            or user["vault_id"] == pack["vault_id"]
+            user["user_id"] == raw_pack["creator_user_id"]
+            or user["vault_id"] == raw_pack["vault_id"]
         )
+        has_full_access = (
+            False
+            if is_owner
+            else await db.has_active_access_grant("pack", raw_pack["id"], user["user_id"])
+        )
+
+        pack = (
+            raw_pack
+            if (is_owner or has_full_access)
+            else await db.get_pack_by_token(token)
+        )
+        if not pack or pack["item_count"] == 0:
+            hdr, reason = _diagnose_pack_unavailable(raw_pack)
+            contact_url = await db.resolve_owner_contact_url(
+                raw_pack["vault_id"], preferred_user_id=raw_pack["creator_user_id"]
+            )
+            unavail_kb = build_contact_owner_kb(
+                contact_url, request_access_cb=f"req:p:{raw_pack['id']}"
+            )
+            await message.answer(
+                f"{hdr}\n<blockquote>{reason}</blockquote>",
+                reply_markup=unavail_kb,
+                disable_web_page_preview=True,
+            )
+            return
+
         if (
             not is_owner
+            and not has_full_access
             and pack.get("one_time_per_user")
             and await db.has_claimed_link("pack", pack["id"], user["user_id"])
         ):
@@ -673,14 +834,16 @@ async def cmd_start(
                 pack["vault_id"], preferred_user_id=pack["creator_user_id"]
             )
             locked_txt, locked_kb = build_trial_locked_card(
-                contact_url, title=pack.get("title") or ""
+                contact_url,
+                title=pack.get("title") or "",
+                request_access_cb=f"req:p:{pack['id']}",
             )
             await message.answer(
                 locked_txt, reply_markup=locked_kb, disable_web_page_preview=True
             )
             return
 
-        if pack.get("pin_hash") and not is_owner:
+        if pack.get("pin_hash") and not is_owner and not has_full_access:
             lock_rem = _check_pin_lockout(message.from_user.id, f"p:{token}")
             if lock_rem > 0:
                 await message.answer(
@@ -1127,9 +1290,13 @@ async def cb_fsm_cancel(
             from handlers.file_actions import _render_file_link_card
 
             claims = await db.count_link_claims("file", fid)
+            owner = await db.get_user(f["uploader_user_id"])
+            owner_ttl = int((owner or {}).get("auto_delete_ttl") or 0)
             await safe_edit_or_send(
                 callback,
-                _render_file_link_card(f, uname, unique_claims=claims),
+                _render_file_link_card(
+                    f, uname, unique_claims=claims, owner_global_ttl=owner_ttl
+                ),
                 build_file_link_keyboard(f, bot_username=uname),
                 answer_text="Cancelled",
                 also_ack=True,
@@ -1422,3 +1589,384 @@ async def cb_settings_clear_grp(callback: CallbackQuery, db: Database) -> None:
     await safe_edit_or_send(
         callback, text, kb, answer_text="Target reset", also_ack=True
     )
+
+
+# -------------------- FULL ACCESS / PAID UNLOCK REQUEST & OWNER APPROVAL SYSTEM --------------------
+
+
+def _build_owner_approval_keyboard(
+    short_type: str, item_id: int, visitor_uid: int
+) -> InlineKeyboardMarkup:
+    """
+    2-column 1-tap Approval Card keyboard for the owner (`callback_data <= 64` bytes):
+    Row 1: [ ✅ 1 Day ] · [ ✅ 7 Days ]
+    Row 2: [ ✅ 30 Days ] · [ ♾️ Lifetime ]
+    Row 3: [ ❌ Reject ]
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ 1 Day",
+                    callback_data=f"gr:{short_type}:{item_id}:{visitor_uid}:1",
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="✅ 7 Days",
+                    callback_data=f"gr:{short_type}:{item_id}:{visitor_uid}:7",
+                    style="success",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ 30 Days",
+                    callback_data=f"gr:{short_type}:{item_id}:{visitor_uid}:30",
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="♾️ Lifetime",
+                    callback_data=f"gr:{short_type}:{item_id}:{visitor_uid}:0",
+                    style="primary",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Reject",
+                    callback_data=f"gr:{short_type}:{item_id}:{visitor_uid}:-1",
+                    style="danger",
+                )
+            ],
+        ]
+    )
+
+
+def _format_grant_duration_label(days: int) -> str:
+    if days == 0:
+        return "♾️ Lifetime"
+    if days == 1:
+        return "1 Day"
+    return f"{days} Days"
+
+
+@router.callback_query(F.data.startswith("req:"))
+async def cb_request_full_access(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+) -> None:
+    """
+    Visitor taps `🔓 Request Full Access` (`req:<f|p>:<id>`):
+    - Bounded 10m TTLCache rate-limit per `(user_id, link_type, link_id)` to prevent owner spam.
+    - Sends a sleek 1-tap Approval Card to all linked accounts of the owner's `vault_id`.
+    - Confirms to the visitor with `💬 Contact Owner` CTA.
+    """
+    if not callback.from_user:
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in ("f", "p") or not parts[2].isdigit():
+        await callback.answer("Invalid request.", show_alert=True)
+        return
+
+    short_type = parts[1]
+    link_type = "file" if short_type == "f" else "pack"
+    item_id = int(parts[2])
+
+    visitor = await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
+
+    if link_type == "file":
+        item = await db.get_file(item_id)
+        if not item or item.get("is_trashed") or not item.get("share_token"):
+            await callback.answer("⚠️ This file link is no longer active.", show_alert=True)
+            return
+        owner_vault_id = int(item["vault_id"])
+        preferred_owner_uid = int(item["uploader_user_id"])
+        item_title = item.get("title") or "Shared File"
+        kind_badge = f"{MEDIA_ICONS.get(item['media_type'], '📦')} File"
+    else:
+        item = await db.get_pack(item_id)
+        if not item or item.get("item_count", 0) == 0:
+            await callback.answer("⚠️ This pack link is no longer active.", show_alert=True)
+            return
+        owner_vault_id = int(item["vault_id"])
+        preferred_owner_uid = int(item["creator_user_id"])
+        item_title = item.get("title") or "Shared Pack"
+        kind_badge = f"🎒 Pack ({item['item_count']} files)"
+
+    # Owners never need to request access to their own vault content
+    if (
+        visitor["user_id"] == preferred_owner_uid
+        or visitor["vault_id"] == owner_vault_id
+    ):
+        await callback.answer(
+            "🔓 You own this content — permanent & unrestricted!", show_alert=True
+        )
+        return
+
+    # If visitor already holds an active Full Access Grant, let them know immediately
+    existing_grant = await db.get_active_access_grant(
+        link_type, item_id, visitor["user_id"]
+    )
+    if existing_grant is not None:
+        badge = format_grant_badge(existing_grant["expires_at"])
+        await callback.answer(f"✅ You already have {badge}!", show_alert=True)
+        return
+
+    # 10-minute bounded TTLCache rate-limit per (user_id, link_type, link_id)
+    cooldown_rem = _check_access_request_cooldown(
+        visitor["user_id"], link_type, item_id
+    )
+    if cooldown_rem > 0:
+        mins = max(1, (cooldown_rem + 59) // 60)
+        await callback.answer(
+            f"⏳ Request already sent! Please wait ~{mins}m or message the owner directly.",
+            show_alert=True,
+        )
+        return
+
+    _mark_access_request_sent(visitor["user_id"], link_type, item_id)
+
+    contact_url = await db.resolve_owner_contact_url(
+        owner_vault_id, preferred_user_id=preferred_owner_uid
+    )
+
+    visitor_name = esc(
+        (callback.from_user.full_name or visitor.get("full_name") or "Telegram User")[:48]
+    )
+    raw_uname = (callback.from_user.username or visitor.get("username") or "").strip().lstrip("@")
+    uname_display = f"@{esc(raw_uname)}" if raw_uname else "<i>none</i>"
+
+    approval_text = (
+        f"🔓 <b>Full Access Request</b>\n"
+        f"<blockquote>"
+        f"👤 <b>Visitor:</b> {visitor_name} ({uname_display})\n"
+        f"🆔 <b>User ID:</b> <code>{visitor['user_id']}</code>\n"
+        f"📦 <b>{kind_badge}:</b> <b>{esc(item_title[:48])}</b>"
+        f"</blockquote>\n"
+        f"<i>Tap a duration below to grant full non-trial access in 1 tap:</i>"
+    )
+    approval_kb = _build_owner_approval_keyboard(
+        short_type, item_id, int(visitor["user_id"])
+    )
+
+    # Deliver Approval Card to all linked owner accounts in `owner_vault_id` (ensuring preferred uploader/creator is included)
+    owner_accounts = await db.get_linked_accounts(owner_vault_id)
+    recipient_uids: list[int] = []
+    if preferred_owner_uid:
+        recipient_uids.append(preferred_owner_uid)
+    for acc in owner_accounts:
+        uid = int(acc["user_id"])
+        if uid not in recipient_uids:
+            recipient_uids.append(uid)
+
+    for owner_uid in recipient_uids:
+        try:
+            await tg_retry_call(
+                bot.send_message,
+                chat_id=owner_uid,
+                text=approval_text,
+                reply_markup=approval_kb,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+    confirm_text = (
+        "📩 <b>Full access request sent to the owner!</b>\n"
+        "<blockquote>You can also message them directly to complete your purchase.</blockquote>"
+    )
+    confirm_kb = build_contact_owner_kb(contact_url)
+
+    await callback.answer("📩 Full access request sent!")
+    if callback.message:
+        await callback.message.answer(
+            confirm_text,
+            reply_markup=confirm_kb,
+            disable_web_page_preview=True,
+        )
+
+
+@router.callback_query(F.data.startswith("gr:"))
+async def cb_owner_grant_or_reject_access(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    """
+    Owner taps an Approval Card action (`gr:<f|p>:<item_id>:<uid>:<days>`):
+    - `days` in `{1, 7, 30, 0}` -> grants persistent Full Access in `link_access_grants`
+      (`0` = Lifetime), cancels any pending trial auto-delete for that user + item, updates the
+      owner's card in-place, and DMs the visitor with an instant `📥 Open Unlocked Content` deep-link button!
+    - `days == -1` -> rejects the request, updates the owner's card, and politely notifies the visitor.
+    """
+    if not callback.from_user:
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 5 or parts[1] not in ("f", "p"):
+        await callback.answer("Invalid approval action.", show_alert=True)
+        return
+    try:
+        short_type = parts[1]
+        item_id = int(parts[2])
+        visitor_uid = int(parts[3])
+        days = int(parts[4])
+    except ValueError:
+        await callback.answer("Invalid approval payload.", show_alert=True)
+        return
+
+    if days not in (-1, 0, 1, 7, 30):
+        await callback.answer("Unsupported duration.", show_alert=True)
+        return
+
+    approver = await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
+    link_type = "file" if short_type == "f" else "pack"
+    uname = bot_username or "KoshBox_Bot"
+
+    if link_type == "file":
+        item = await db.get_file(item_id)
+        if not item or item.get("is_trashed"):
+            await callback.answer("File no longer exists.", show_alert=True)
+            return
+        if approver["vault_id"] != item["vault_id"] and approver["user_id"] != item["uploader_user_id"]:
+            await callback.answer("Owner only.", show_alert=True)
+            return
+        item_title = item.get("title") or "Shared File"
+        share_token = item.get("share_token") or ""
+        open_url = f"https://t.me/{uname}?start=file_{share_token}" if share_token else ""
+        owner_vault_id = int(item["vault_id"])
+        preferred_owner_uid = int(item["uploader_user_id"])
+    else:
+        item = await db.get_pack(item_id)
+        if not item:
+            await callback.answer("Pack no longer exists.", show_alert=True)
+            return
+        if approver["vault_id"] != item["vault_id"] and approver["user_id"] != item["creator_user_id"]:
+            await callback.answer("Owner only.", show_alert=True)
+            return
+        item_title = item.get("title") or "Shared Pack"
+        share_token = item.get("share_token") or ""
+        open_url = f"https://t.me/{uname}?start=pack_{share_token}" if share_token else ""
+        owner_vault_id = int(item["vault_id"])
+        preferred_owner_uid = int(item["creator_user_id"])
+
+    visitor_row = await db.get_user(visitor_uid)
+    visitor_label = esc(
+        ((visitor_row or {}).get("full_name") or f"User {visitor_uid}")[:42]
+    )
+    v_uname = ((visitor_row or {}).get("username") or "").strip().lstrip("@")
+    visitor_tag = f"{visitor_label} (@{esc(v_uname)})" if v_uname else f"{visitor_label} (<code>{visitor_uid}</code>)"
+
+    if days == -1:
+        await db.revoke_link_access(link_type, item_id, visitor_uid)
+        contact_url = await db.resolve_owner_contact_url(
+            owner_vault_id, preferred_user_id=preferred_owner_uid
+        )
+        owner_done_text = (
+            f"❌ <b>Full Access Request Declined</b>\n"
+            f"<blockquote>"
+            f"👤 <b>Visitor:</b> {visitor_tag}\n"
+            f"📦 <b>Content:</b> <b>{esc(item_title[:48])}</b>"
+            f"</blockquote>"
+        )
+        await safe_edit_or_send(
+            callback,
+            owner_done_text,
+            None,
+            answer_text="❌ Request declined",
+            also_ack=True,
+        )
+        try:
+            await tg_retry_call(
+                bot.send_message,
+                chat_id=visitor_uid,
+                text=(
+                    f"❌ <b>Full Access Request Declined</b>\n"
+                    f"<blockquote>Your request for <b>{esc(item_title[:44])}</b> was not approved. "
+                    f"Message the owner below if you need assistance.</blockquote>"
+                ),
+                reply_markup=build_contact_owner_kb(contact_url),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        return
+
+    await db.grant_link_access(
+        link_type,
+        item_id,
+        visitor_uid,
+        approver["user_id"],
+        days=days,
+    )
+    dur_lbl = _format_grant_duration_label(days)
+
+    owner_approved_text = (
+        f"✅ <b>Full Access Granted ({dur_lbl})</b>\n"
+        f"<blockquote>"
+        f"👤 <b>Visitor:</b> {visitor_tag}\n"
+        f"🆔 <b>User ID:</b> <code>{visitor_uid}</code>\n"
+        f"📦 <b>Content:</b> <b>{esc(item_title[:48])}</b>\n"
+        f"⏳ <b>Access:</b> <b>{dur_lbl}</b> (No Trial / Auto-Delete)"
+        f"</blockquote>"
+    )
+    owner_revoke_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🚫 Revoke Access",
+                    callback_data=f"gr:{short_type}:{item_id}:{visitor_uid}:-1",
+                    style="danger",
+                )
+            ]
+        ]
+    )
+    await safe_edit_or_send(
+        callback,
+        owner_approved_text,
+        owner_revoke_kb,
+        answer_text=f"✅ Granted {dur_lbl}!",
+        also_ack=True,
+    )
+
+    visitor_kb_rows: list[list[InlineKeyboardButton]] = []
+    if open_url:
+        visitor_kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📥 Open Unlocked Content",
+                    url=open_url,
+                    style="primary",
+                )
+            ]
+        )
+    visitor_kb = (
+        InlineKeyboardMarkup(inline_keyboard=visitor_kb_rows)
+        if visitor_kb_rows
+        else None
+    )
+    try:
+        await send_with_effect(
+            bot.send_message,
+            chat_id=visitor_uid,
+            text=(
+                f"🎉 <b>Full Access Unlocked!</b>\n"
+                f"<blockquote>"
+                f"📦 <b>{esc(item_title[:48])}</b>\n"
+                f"✅ <b>Access:</b> {dur_lbl} · Zero Trial Timer"
+                f"</blockquote>\n"
+                f"<i>Tap below anytime to retrieve your unlocked content:</i>"
+            ),
+            reply_markup=visitor_kb,
+            disable_web_page_preview=True,
+            message_effect_id=EFFECT_PARTY,
+        )
+    except Exception:
+        pass

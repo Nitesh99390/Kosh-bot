@@ -53,6 +53,7 @@ TTL_LABELS = {
     900: "15m",
     3600: "1h",
     7200: "2h",
+    21600: "6h",
     86400: "24h",
     604800: "7d",
 }
@@ -235,39 +236,61 @@ def back_btn(callback_data: str, label: str = "◀ Back") -> InlineKeyboardButto
 
 
 def build_contact_owner_kb(
-    contact_url: str, *, include_home: bool = False
+    contact_url: str = "",
+    *,
+    include_home: bool = False,
+    request_access_cb: Optional[str] = None,
 ) -> Optional[InlineKeyboardMarkup]:
-    """Builds a sleek mobile-first keyboard with the owner's primary `💬 Contact Owner` CTA."""
+    """
+    Builds a sleek mobile-first CTA keyboard:
+    - When `request_access_cb` is provided -> 2-column row `[🔓 Request Full Access] [💬 Contact Owner]`
+      (or 1-button `[🔓 Request Full Access]` if owner has no contact URL).
+    - Otherwise -> single `[💬 Contact Owner]` primary button if `contact_url` exists.
+    """
     rows: list[list[InlineKeyboardButton]] = []
-    if contact_url:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="💬 Contact Owner",
-                    url=contact_url,
-                    style="primary",
-                )
-            ]
+    cta_row: list[InlineKeyboardButton] = []
+    if request_access_cb:
+        cta_row.append(
+            InlineKeyboardButton(
+                text="🔓 Request Full Access",
+                callback_data=request_access_cb,
+                style="primary",
+            )
         )
+    if contact_url:
+        cta_row.append(
+            InlineKeyboardButton(
+                text="💬 Contact Owner",
+                url=contact_url,
+                style=None if request_access_cb else "primary",
+            )
+        )
+    if cta_row:
+        rows.append(cta_row)
     if include_home:
         rows.append([home_btn("🏠 Vault")])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 def build_trial_locked_card(
-    contact_url: str = "", *, title: str = ""
+    contact_url: str = "",
+    *,
+    title: str = "",
+    request_access_cb: Optional[str] = None,
 ) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     """
     Sleek, respectful Repeat-Open card shown when a visitor re-opens a 1-Time Per-User Trial link
-    (sends ZERO files and links directly to the content owner).
+    (sends ZERO files and offers 1-tap `🔓 Request Full Access` + `💬 Contact Owner`).
     """
     sub = f" · <i>{esc(title[:32])}</i>" if title else ""
     text = (
         f"🔒 <b>Trial Access Ended</b>{sub}\n"
         f"<blockquote>You've already used your one-time trial for this content. "
-        f"Reach out to the owner below for full access.</blockquote>"
+        f"Tap below to request full access or message the owner directly.</blockquote>"
     )
-    return text, build_contact_owner_kb(contact_url)
+    return text, build_contact_owner_kb(
+        contact_url, request_access_cb=request_access_cb
+    )
 
 
 def build_trial_expiry_notice_text(title: str = "", ttl_seconds: int = 0) -> str:
@@ -277,8 +300,25 @@ def build_trial_expiry_notice_text(title: str = "", ttl_seconds: int = 0) -> str
     return (
         f"⏱ <b>Trial Session Ended</b>\n"
         f"<blockquote>Your preview{label}{dur} has been cleared from chat. "
-        f"Tap below to contact the owner for full access.</blockquote>"
+        f"Tap below to request full access or contact the owner.</blockquote>"
     )
+
+
+def format_grant_badge(expires_at: Optional[int]) -> str:
+    """Formats a Full Access Grant duration badge (`Lifetime` vs remaining days/hours)."""
+    if expires_at is None:
+        return ""
+    exp = int(expires_at)
+    if exp == 0:
+        return "♾️ Lifetime Full Access"
+    rem = max(0, exp - int(time.time()))
+    if rem <= 0:
+        return "Expired"
+    if rem < 3600:
+        return f"Full Access · {max(1, rem // 60)}m left"
+    if rem < 86400:
+        return f"Full Access · {round(rem / 3600)}h left"
+    return f"Full Access · {max(1, round(rem / 86400))}d left"
 
 
 async def send_with_effect(
@@ -355,13 +395,29 @@ async def execute_due_scheduled_deletes(bot: Bot, db: Any, limit: int = 50) -> i
     for job in due_rows:
         chat_id = int(job["chat_id"])
         msg_ids: list[int] = job.get("message_ids") or []
+        notify_text = (job.get("notify_text") or "").strip()
+        contact_url = (job.get("contact_url") or "").strip()
+        ltype = (job.get("link_type") or "").strip()
+        lid = int(job.get("link_id") or 0)
+
+        # Safety guard: if visitor received a Full Access Grant before timer fired, skip trial wipe & notice
+        if ltype in ("file", "pack") and lid > 0 and hasattr(db, "has_active_access_grant"):
+            try:
+                if await db.has_active_access_grant(ltype, lid, chat_id):
+                    continue
+            except Exception:
+                pass
+
         if msg_ids:
             await batch_delete_chat_messages(bot, chat_id, msg_ids)
 
-        notify_text = (job.get("notify_text") or "").strip()
-        contact_url = (job.get("contact_url") or "").strip()
         if notify_text:
-            kb = build_contact_owner_kb(contact_url)
+            req_cb: Optional[str] = None
+            if ltype == "file" and lid > 0:
+                req_cb = f"req:f:{lid}"
+            elif ltype == "pack" and lid > 0:
+                req_cb = f"req:p:{lid}"
+            kb = build_contact_owner_kb(contact_url, request_access_cb=req_cb)
             try:
                 await tg_retry_call(
                     bot.send_message,
@@ -401,6 +457,8 @@ async def schedule_persistent_auto_delete(
     *,
     notify_text: str = "",
     contact_url: str = "",
+    link_type: str = "",
+    link_id: int = 0,
 ) -> int:
     """
     Persists an auto-delete timer into SQLite `scheduled_deletes` when `db` is provided
@@ -418,7 +476,14 @@ async def schedule_persistent_auto_delete(
             delete_at=delete_at,
             notify_text=notify_text,
             contact_url=contact_url,
+            link_type=link_type,
+            link_id=link_id,
         )
+    req_cb: Optional[str] = None
+    if link_type == "file" and link_id > 0:
+        req_cb = f"req:f:{link_id}"
+    elif link_type == "pack" and link_id > 0:
+        req_cb = f"req:p:{link_id}"
     schedule_auto_delete(
         bot,
         chat_id,
@@ -426,6 +491,7 @@ async def schedule_persistent_auto_delete(
         ttl_seconds,
         notify_text=notify_text,
         contact_url=contact_url,
+        request_access_cb=req_cb,
     )
     return 0
 
@@ -438,6 +504,7 @@ def schedule_auto_delete(
     *,
     notify_text: str = "",
     contact_url: str = "",
+    request_access_cb: Optional[str] = None,
 ) -> None:
     """Fallback in-memory batch cleanup using native `batch_delete_chat_messages`."""
     if ttl_seconds <= 0 or not message_ids:
@@ -447,7 +514,9 @@ def schedule_auto_delete(
         await asyncio.sleep(ttl_seconds)
         await batch_delete_chat_messages(bot, chat_id, message_ids)
         if notify_text:
-            kb = build_contact_owner_kb(contact_url)
+            kb = build_contact_owner_kb(
+                contact_url, request_access_cb=request_access_cb
+            )
             try:
                 await tg_retry_call(
                     bot.send_message,
@@ -543,23 +612,30 @@ async def send_stored_media(
     notify_text: str = "",
     contact_url: str = "",
     message_effect_id: Optional[str] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    extra_note: str = "",
+    link_type: str = "",
+    link_id: int = 0,
 ) -> Optional[Message]:
     """
     Delivers any archived vault item into a chat.
     Supports `protect_content` (no forward/save), Bot API 9.4 `message_effect_id`,
-    and restart-safe `scheduled_deletes` timer + post-expiry Contact Owner notice!
+    inline CTA `reply_markup`, and restart-safe `scheduled_deletes` timer + post-expiry notice!
     """
     caption = (
         custom_caption
         if custom_caption is not None
         else (file_row.get("caption") or f"📦 <b>{esc(file_row['title'])}</b>")
     )
+    if extra_note and file_row["media_type"] not in ("sticker", "video_note"):
+        caption = f"{caption}\n<i>{extra_note}</i>"
     if auto_delete_ttl > 0 and file_row["media_type"] not in ("sticker", "video_note"):
         caption = f"{caption}\n<i>⏱ Auto-deletes in {format_ttl_short(auto_delete_ttl)}</i>"
 
     mtype = file_row["media_type"]
     fid = file_row["file_id"]
     sent: Optional[Message] = None
+    rm_kwargs: dict[str, Any] = {"reply_markup": reply_markup} if reply_markup else {}
 
     try:
         if mtype == "sticker":
@@ -569,6 +645,7 @@ async def send_stored_media(
                 sticker=fid,
                 protect_content=protect_content,
                 message_effect_id=message_effect_id,
+                **rm_kwargs,
             )
         elif mtype == "video_note":
             sent = await send_with_effect(
@@ -577,6 +654,7 @@ async def send_stored_media(
                 video_note=fid,
                 protect_content=protect_content,
                 message_effect_id=message_effect_id,
+                **rm_kwargs,
             )
         else:
             method_map = {
@@ -601,6 +679,7 @@ async def send_stored_media(
                 caption=caption,
                 protect_content=protect_content,
                 message_effect_id=message_effect_id,
+                **rm_kwargs,
             )
     except Exception:
         return None
@@ -616,6 +695,8 @@ async def send_stored_media(
                 auto_delete_ttl,
                 notify_text=notify_text,
                 contact_url=contact_url,
+                link_type=link_type,
+                link_id=link_id,
             )
     return sent
 
@@ -687,8 +768,10 @@ def build_file_card_text(
             sec_badges.append("🔑 PIN")
         if file_row.get("protect_share"):
             sec_badges.append("🛡️ No-Fwd")
+        if int(file_row.get("auto_delete_ttl") or 0) > 0:
+            sec_badges.append(f"💣 {format_ttl_short(int(file_row['auto_delete_ttl']))}")
         if file_row.get("share_expires_at"):
-            sec_badges.append(f"⏳ {format_expiry_badge(file_row['share_expires_at'])}")
+            sec_badges.append(f"⏳ Link: {format_expiry_badge(file_row['share_expires_at'])}")
         sec_str = f" <i>({' · '.join(sec_badges)})</i>" if sec_badges else ""
         lines.append(f"🔗 <code>{share_url}</code>{sec_str}")
 
@@ -867,7 +950,9 @@ def build_file_link_keyboard(
     one_time_lbl = f"👤 1×/User: {'ON' if one_time_on else 'OFF'}"
     pin_lbl = "🔑 PIN: ON" if file_row.get("share_pin_hash") else "🔑 Set PIN"
     prot_lbl = toggle_label(bool(file_row.get("protect_share")), "No-Fwd")
-    exp_lbl = f"⏳ {format_expiry_badge(file_row.get('share_expires_at'))}"
+    adel_val = int(file_row.get("auto_delete_ttl") or 0)
+    adel_lbl = f"💣 Auto-Del: {format_ttl_short(adel_val)}"
+    exp_lbl = f"⏳ Link: {format_expiry_badge(file_row.get('share_expires_at'))}"
     max_v = int(file_row.get("share_max_views") or 0)
     cur_v = int(file_row.get("share_views") or 0)
     limit_lbl = f"👁 Limit: {cur_v}/{max_v}" if max_v > 0 else "👁 Limit: ∞"
@@ -889,22 +974,29 @@ def build_file_link_keyboard(
                 InlineKeyboardButton(text=prot_lbl, callback_data=f"f:prot:{fid}"),
             ],
             [
-                InlineKeyboardButton(text=pin_lbl, callback_data=f"f:pin:{fid}"),
+                InlineKeyboardButton(
+                    text=adel_lbl,
+                    callback_data=f"f:adel:{fid}",
+                    style="success" if adel_val > 0 else None,
+                ),
                 InlineKeyboardButton(text=exp_lbl, callback_data=f"f:exp:{fid}"),
             ],
             [
+                InlineKeyboardButton(text=pin_lbl, callback_data=f"f:pin:{fid}"),
                 InlineKeyboardButton(text=limit_lbl, callback_data=f"f:maxv:{fid}"),
-                InlineKeyboardButton(text=pause_lbl, callback_data=f"f:pause:{fid}"),
             ],
             [
+                InlineKeyboardButton(text=pause_lbl, callback_data=f"f:pause:{fid}"),
                 InlineKeyboardButton(text="🔄 Reset", callback_data=f"f:regen:{fid}"),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🚫 Revoke",
                     callback_data=f"fsh:{fid}:{back_cb}" if back_cb else f"f:share:{fid}",
                     style="danger",
                 ),
+                back_btn(return_to_card, "◀ File"),
             ],
-            [back_btn(return_to_card, "◀ File")],
         ]
     )
 

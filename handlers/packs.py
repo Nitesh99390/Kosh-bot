@@ -20,11 +20,13 @@ from utils.formatters import (
     MEDIA_ICONS,
     back_btn,
     breadcrumb,
+    build_contact_owner_kb,
     build_trial_expiry_notice_text,
     cancel_kb,
     copy_btn,
     esc,
     format_expiry_badge,
+    format_grant_badge,
     format_max_views_badge,
     format_size,
     format_ttl_short,
@@ -57,6 +59,10 @@ async def deliver_pack_to_chat(
     *,
     auto_delete_ttl: int = 0,
     force_protect: bool = False,
+    is_owner: bool = False,
+    has_full_access: bool = False,
+    access_badge: str = "",
+    show_request_cta: bool = False,
     start_offset: int = 0,
     count_view: bool = True,
     dump_channel_id: Optional[int] = None,
@@ -66,10 +72,12 @@ async def deliver_pack_to_chat(
     """
     Ultra-fast, zero-FloodWait Pack Delivery using Telegram's native 100-in-1 `bot.copy_messages()`:
     - Prevents overlapping duplicate runs per `(chat_id, pack['id'])`.
+    - Owner self-retrieval (`is_owner=True`): ZERO auto-delete, ZERO `protect_content`, ZERO trial notice.
+    - Full Access Grant (`has_full_access=True`): ZERO auto-delete, ZERO trial notice (respects `protect_content` if set).
     - Copies up to 100 files from `dump_channel_id` in a SINGLE Bot API call (`copy_messages`),
       preserving `protect_content` (No-Forward / No-Save) and cutting 100 HTTP calls down to 1!
     - Gracefully falls back to `send_stored_media` if `dump_channel_id` is unavailable or custom captions require it.
-    - Persists restart-safe `scheduled_deletes` timer + post-expiry Contact Owner notice!
+    - Persists restart-safe `scheduled_deletes` timer + post-expiry `🔓 Request Full Access` & `💬 Contact Owner` notice!
     """
     delivery_key = (chat_id, int(pack["id"]))
     if delivery_key in _ACTIVE_DELIVERIES:
@@ -88,10 +96,11 @@ async def deliver_pack_to_chat(
         if not slice_items:
             return 0
 
-        if count_view and start_offset == 0:
+        if count_view and start_offset == 0 and not is_owner:
             await db.increment_pack_views(pack["id"])
 
-        protect = bool(pack.get("protect_content")) or force_protect
+        effective_ttl = 0 if (is_owner or has_full_access) else max(0, int(auto_delete_ttl or 0))
+        protect = False if is_owner else (bool(pack.get("protect_content")) or force_protect)
         end_idx = start_offset + len(slice_items)
         range_badge = (
             f"{start_offset + 1}–{end_idx} of {total_items}"
@@ -103,23 +112,47 @@ async def deliver_pack_to_chat(
             if (start_offset == 0 and pack.get("description"))
             else ""
         )
+        status_note = ""
+        if start_offset == 0:
+            if is_owner:
+                status_note = "\n<i>🔓 Owner Access — permanent &amp; unrestricted</i>"
+            elif access_badge:
+                status_note = f"\n<i>🔓 {esc(access_badge)}</i>"
         ttl_line = (
-            f"\n<i>⏱ Trial auto-deletes in {format_ttl_short(auto_delete_ttl)}</i>"
-            if auto_delete_ttl > 0
+            f"\n<i>⏱ Trial auto-deletes in {format_ttl_short(effective_ttl)}</i>"
+            if effective_ttl > 0
             else ""
         )
 
+        resolved_contact = contact_url
+        if (show_request_cta or effective_ttl > 0) and not resolved_contact:
+            resolved_contact = await db.resolve_owner_contact_url(
+                pack["vault_id"], preferred_user_id=pack.get("creator_user_id")
+            )
+
+        header_kb: Optional[InlineKeyboardMarkup] = None
+        if show_request_cta and not is_owner and not has_full_access and start_offset == 0:
+            header_kb = build_contact_owner_kb(
+                resolved_contact,
+                request_access_cb=f"req:p:{pack['id']}",
+            )
+
         sent_ids: list[int] = []
-        header_effect = EFFECT_FIRE if (celebrate and start_offset == 0) else None
+        header_effect = EFFECT_FIRE if (celebrate and start_offset == 0 and not is_owner) else None
+        header_kwargs: dict[str, Any] = {}
+        if header_kb:
+            header_kwargs["reply_markup"] = header_kb
         header = await send_with_effect(
             bot.send_message,
             chat_id=chat_id,
             text=(
                 f"🎒 <b>{esc(pack['title'])}</b> · <i>{range_badge} ({format_size(pack['total_size'])})</i>"
-                f"{desc_line}{ttl_line}"
+                f"{desc_line}{status_note}{ttl_line}"
             ),
             protect_content=protect,
             message_effect_id=header_effect,
+            disable_web_page_preview=True,
+            **header_kwargs,
         )
         if getattr(header, "message_id", None):
             sent_ids.append(header.message_id)
@@ -134,7 +167,8 @@ async def deliver_pack_to_chat(
         )
 
         if can_batch_copy:
-            # Telegram Bot API `copy_messages` requires `message_ids` in strictly increasing order (1..100)
+            # Telegram Bot API `copy_messages` requires `message_ids` in strictly increasing order (1..100).
+            # We copy the sorted dump IDs in one native API call while preserving every returned message ID!
             ordered = sorted(slice_items, key=lambda x: int(x["dump_message_id"]))
             dump_ids: list[int] = []
             prev_mid = -1
@@ -160,14 +194,17 @@ async def deliver_pack_to_chat(
                         )
                         if copied_res:
                             for m_obj in copied_res:
-                                mid_val = getattr(m_obj, "message_id", None) or (
-                                    m_obj if isinstance(m_obj, int) else None
-                                )
+                                mid_val = getattr(m_obj, "message_id", None)
+                                if mid_val is None and isinstance(m_obj, dict):
+                                    mid_val = m_obj.get("message_id")
+                                if mid_val is None and isinstance(m_obj, int):
+                                    mid_val = m_obj
                                 if mid_val:
                                     sent_ids.append(int(mid_val))
                             delivered += len(copied_res)
                 except Exception:
-                    delivered = 0
+                    if delivered == 0:
+                        delivered = 0
 
         if delivered == 0:
             # Clean fallback to cached file_id delivery
@@ -212,21 +249,20 @@ async def deliver_pack_to_chat(
             if getattr(footer, "message_id", None):
                 sent_ids.append(footer.message_id)
 
-        if auto_delete_ttl > 0 and sent_ids:
-            resolved_contact = contact_url or await db.resolve_owner_contact_url(
-                pack["vault_id"], preferred_user_id=pack.get("creator_user_id")
-            )
+        if effective_ttl > 0 and sent_ids and not is_owner and not has_full_access:
             notice = build_trial_expiry_notice_text(
-                pack.get("title") or "Pack", auto_delete_ttl
+                pack.get("title") or "Pack", effective_ttl
             )
             await schedule_persistent_auto_delete(
                 bot,
                 db,
                 chat_id,
                 sent_ids,
-                auto_delete_ttl,
+                effective_ttl,
                 notify_text=notice,
                 contact_url=resolved_contact,
+                link_type="pack",
+                link_id=int(pack["id"]),
             )
 
         return delivered
@@ -256,21 +292,50 @@ async def cb_pack_deliver_more(
     if not pack or pack["item_count"] == 0:
         await callback.answer("⚠️ Pack no longer available.", show_alert=True)
         return
-    if pack.get("is_paused"):
-        await callback.answer("⏸ This pack link was paused by the owner.", show_alert=True)
-        return
-    import time as _time
 
-    if pack.get("expires_at") and int(pack["expires_at"]) < int(_time.time()):
-        await callback.answer("⏳ This pack link has expired.", show_alert=True)
-        return
+    visitor = await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
+    is_owner = (
+        visitor["user_id"] == pack["creator_user_id"]
+        or visitor["vault_id"] == pack["vault_id"]
+    )
+    grant = (
+        None
+        if is_owner
+        else await db.get_active_access_grant("pack", pack["id"], visitor["user_id"])
+    )
+    has_full_access = grant is not None
 
+    if not is_owner and not has_full_access:
+        if pack.get("is_paused"):
+            await callback.answer("⏸ This pack link was paused by the owner.", show_alert=True)
+            return
+        import time as _time
+
+        if pack.get("expires_at") and int(pack["expires_at"]) < int(_time.time()):
+            await callback.answer("⏳ This pack link has expired.", show_alert=True)
+            return
+
+    ttl = (
+        0
+        if (is_owner or has_full_access)
+        else await db.resolve_pack_auto_delete_ttl(pack)
+    )
     creator = await db.get_user(pack["creator_user_id"])
-    visitor = await db.get_user(callback.from_user.id)
-    ttl = int(
-        (creator or {}).get("auto_delete_ttl")
-        or (visitor or {}).get("auto_delete_ttl")
-        or 0
+    force_protect = (
+        False
+        if is_owner
+        else bool((creator or {}).get("protect_content"))
+    )
+    contact_url = (
+        ""
+        if is_owner
+        else await db.resolve_owner_contact_url(
+            pack["vault_id"], preferred_user_id=pack["creator_user_id"]
+        )
     )
 
     await callback.answer("📥 Sending next batch…")
@@ -285,9 +350,14 @@ async def cb_pack_deliver_more(
         pack,
         db,
         auto_delete_ttl=ttl,
+        force_protect=force_protect,
+        is_owner=is_owner,
+        has_full_access=has_full_access,
+        access_badge=format_grant_badge(grant["expires_at"]) if grant else "",
         start_offset=offset,
         count_view=False,
         dump_channel_id=config.dump_channel_id if config else None,
+        contact_url=contact_url,
     )
 
 
@@ -322,6 +392,8 @@ async def render_packs_list(
                 badges += "⏸ "
             if p.get("one_time_per_user"):
                 badges += "👤 "
+            if int(p.get("auto_delete_ttl") or 0) > 0:
+                badges += "💣 "
             if p.get("pin_hash"):
                 badges += "🔒 "
             lbl = f"{badges}🎒 {p['title'][:20]} ({p['item_count']}) · {format_size(p['total_size'])}"
@@ -376,6 +448,15 @@ async def render_pack_detail(
     max_v = int(pack.get("max_views") or 0)
     cur_v = int(pack.get("views") or 0)
     claims_cnt = int(pack.get("unique_claims") or 0)
+    adel_val = int(pack.get("auto_delete_ttl") or 0)
+    owner_global_ttl = int((user or {}).get("auto_delete_ttl") or 0)
+    if adel_val > 0:
+        adel_badge = f"💣 Auto-Del: {format_ttl_short(adel_val)}"
+    elif owner_global_ttl > 0:
+        adel_badge = f"💣 Auto-Del: Off (Global {format_ttl_short(owner_global_ttl)})"
+    else:
+        adel_badge = "💣 Auto-Del: Off"
+
     sec_parts = [format_max_views_badge(cur_v, max_v)]
     if pack.get("one_time_per_user"):
         sec_parts.append(f"👤 1×/User ({claims_cnt})")
@@ -385,8 +466,9 @@ async def render_pack_detail(
         sec_parts.append("🔑 PIN")
     if pack.get("protect_content"):
         sec_parts.append("🛡️ No-Fwd")
+    sec_parts.append(adel_badge)
     exp_lbl_badge = format_expiry_badge(pack.get("expires_at"))
-    sec_parts.append(f"⏳ {exp_lbl_badge}")
+    sec_parts.append(f"⏳ Link: {exp_lbl_badge}")
 
     preview_lines: list[str] = []
     if pack.get("description"):
@@ -412,7 +494,8 @@ async def render_pack_detail(
     one_time_lbl = f"👤 1×/User: {'ON' if one_time_on else 'OFF'}"
     pin_lbl = "🔑 PIN: ON" if pack.get("pin_hash") else "🔑 Set PIN"
     prot_lbl = toggle_label(bool(pack.get("protect_content")), "No-Fwd")
-    exp_lbl = f"⏳ {exp_lbl_badge}"
+    adel_lbl = f"💣 Auto-Del: {format_ttl_short(adel_val)}"
+    exp_lbl = f"⏳ Link: {exp_lbl_badge}"
     lim_lbl = f"👁 Limit: {cur_v}/{max_v}" if max_v > 0 else "👁 Limit: ∞"
     pause_lbl = "▶️ Resume" if pack.get("is_paused") else "⏸ Pause"
 
@@ -435,22 +518,29 @@ async def render_pack_detail(
                 InlineKeyboardButton(text=prot_lbl, callback_data=f"pk:prot:{pack_id}"),
             ],
             [
-                InlineKeyboardButton(text=pin_lbl, callback_data=f"pk:pin:{pack_id}"),
+                InlineKeyboardButton(
+                    text=adel_lbl,
+                    callback_data=f"pk:adel:{pack_id}",
+                    style="success" if adel_val > 0 else None,
+                ),
                 InlineKeyboardButton(text=exp_lbl, callback_data=f"pk:exp:{pack_id}"),
             ],
             [
+                InlineKeyboardButton(text=pin_lbl, callback_data=f"pk:pin:{pack_id}"),
                 InlineKeyboardButton(text=lim_lbl, callback_data=f"pk:maxv:{pack_id}"),
-                InlineKeyboardButton(text=pause_lbl, callback_data=f"pk:pause:{pack_id}"),
             ],
             [
+                InlineKeyboardButton(text=pause_lbl, callback_data=f"pk:pause:{pack_id}"),
                 InlineKeyboardButton(text="🔄 Reset", callback_data=f"pk:regen:{pack_id}"),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🗑️ Delete",
                     callback_data=f"pk:del_ask:{pack_id}",
                     style="danger",
                 ),
+                back_btn("pk:list:0", "◀ Packs"),
             ],
-            [back_btn("pk:list:0", "◀ Packs"), home_btn()],
         ]
     )
     return text, kb
@@ -1156,17 +1246,19 @@ async def cb_pack_get_all(
     pid = int(callback.data.split(":")[2])
     user = await db.get_user(callback.from_user.id)
     pack = await db.get_pack(pid)
-    if not pack or pack["vault_id"] != user["vault_id"]:
+    if not pack or not user or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
-    await callback.answer("📥 Sending pack…")
+    await callback.answer("🔓 Owner Access — permanent & unrestricted")
     await deliver_pack_to_chat(
         bot,
         callback.message.chat.id,
         pack,
         db,
-        auto_delete_ttl=int(user.get("auto_delete_ttl") or 0),
-        count_view=False,  # Owner testing their own pack doesn't burn max_views quota!
+        auto_delete_ttl=0,
+        force_protect=False,
+        is_owner=True,
+        count_view=False,  # Owner retrieving their own pack never burns max_views or triggers trial!
         dump_channel_id=config.dump_channel_id if config else None,
     )
 
@@ -1286,6 +1378,40 @@ async def cb_pack_toggle_prot(
         await callback.answer(ans)
 
 
+@router.callback_query(F.data.startswith("pk:adel:"))
+async def cb_pack_cycle_auto_delete(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    if not callback.from_user:
+        return
+    pid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    pack = await db.get_pack(pid)
+    if not pack or pack["vault_id"] != user["vault_id"]:
+        await callback.answer("Pack not found.", show_alert=True)
+        return
+    new_ttl = await db.cycle_pack_auto_delete_ttl(pid)
+    owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username
+    )
+    if new_ttl > 0:
+        ans = f"💣 Chat Auto-Delete: {format_ttl_short(new_ttl)} (overrides global)"
+    elif owner_ttl > 0:
+        ans = f"💣 Per-link Off (uses global {format_ttl_short(owner_ttl)})"
+    else:
+        ans = "💣 Chat Auto-Delete: Off"
+    if rendered:
+        await safe_edit_or_send(
+            callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
+        )
+    else:
+        await callback.answer(ans)
+
+
 @router.callback_query(F.data.startswith("pk:exp:"))
 async def cb_pack_cycle_exp(
     callback: CallbackQuery,
@@ -1305,7 +1431,7 @@ async def cb_pack_cycle_exp(
     rendered = await render_pack_detail(
         callback.from_user.id, pid, db, bot, bot_username=bot_username
     )
-    ans = f"⏳ Expiry: {format_expiry_badge(new_exp)}"
+    ans = f"⏳ Link Expiry: {format_expiry_badge(new_exp)}"
     if rendered:
         await safe_edit_or_send(
             callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
