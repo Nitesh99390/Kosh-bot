@@ -406,10 +406,7 @@ async def cb_pack_deliver_more(
         return
 
     visitor = await _ensure_cb_user(callback, db)
-    is_owner = (
-        visitor["user_id"] == pack["creator_user_id"]
-        or visitor["vault_id"] == pack["vault_id"]
-    )
+    is_owner = visitor["vault_id"] == pack["vault_id"]
     grant = (
         None
         if is_owner

@@ -328,6 +328,19 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_link_claims_lookup
                 ON link_user_claims(link_type, link_id);
 
+            CREATE TABLE IF NOT EXISTS access_request_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link_type TEXT NOT NULL,
+                link_id INTEGER NOT NULL,
+                visitor_user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(link_type, link_id, visitor_user_id, chat_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_access_req_msgs_lookup
+                ON access_request_messages(link_type, link_id, visitor_user_id);
+
             CREATE TABLE IF NOT EXISTS link_access_grants (
                 link_type TEXT NOT NULL,
                 link_id INTEGER NOT NULL,
@@ -739,22 +752,44 @@ class Database:
         assert self.conn is not None
         user = await self.get_user(user_id)
         new_val = 0 if (user and user.get("protect_content")) else 1
-        await self.conn.execute(
-            "UPDATE users SET protect_content = ? WHERE user_id = ?", (new_val, user_id)
-        )
-        await self.conn.commit()
-        self._invalidate_user(user_id)
+        async with self._write_lock:
+            if user and user.get("vault_id"):
+                await self.conn.execute(
+                    "UPDATE users SET protect_content = ? WHERE vault_id = ?",
+                    (new_val, user["vault_id"]),
+                )
+            else:
+                await self.conn.execute(
+                    "UPDATE users SET protect_content = ? WHERE user_id = ?",
+                    (new_val, user_id),
+                )
+            await self.conn.commit()
+        if user and user.get("vault_id"):
+            self._invalidate_vault_users(user["vault_id"])
+        else:
+            self._invalidate_user(user_id)
         return bool(new_val)
 
     async def toggle_default_one_time(self, user_id: int) -> bool:
         assert self.conn is not None
         user = await self.get_user(user_id)
         new_val = 0 if (user and user.get("default_one_time")) else 1
-        await self.conn.execute(
-            "UPDATE users SET default_one_time = ? WHERE user_id = ?", (new_val, user_id)
-        )
-        await self.conn.commit()
-        self._invalidate_user(user_id)
+        async with self._write_lock:
+            if user and user.get("vault_id"):
+                await self.conn.execute(
+                    "UPDATE users SET default_one_time = ? WHERE vault_id = ?",
+                    (new_val, user["vault_id"]),
+                )
+            else:
+                await self.conn.execute(
+                    "UPDATE users SET default_one_time = ? WHERE user_id = ?",
+                    (new_val, user_id),
+                )
+            await self.conn.commit()
+        if user and user.get("vault_id"):
+            self._invalidate_vault_users(user["vault_id"])
+        else:
+            self._invalidate_user(user_id)
         return bool(new_val)
 
     async def set_support_contact(self, user_id: int, contact: str) -> str:
@@ -766,12 +801,23 @@ class Database:
         # Store normalized URL if valid, or empty if cleared; return normalized URL
         if cleaned and not normalized:
             raise ValueError("Invalid @username or https://t.me/... link")
-        await self.conn.execute(
-            "UPDATE users SET support_contact = ? WHERE user_id = ?",
-            (normalized, user_id),
-        )
-        await self.conn.commit()
-        self._invalidate_user(user_id)
+        user = await self.get_user(user_id)
+        async with self._write_lock:
+            if user and user.get("vault_id"):
+                await self.conn.execute(
+                    "UPDATE users SET support_contact = ? WHERE vault_id = ?",
+                    (normalized, user["vault_id"]),
+                )
+            else:
+                await self.conn.execute(
+                    "UPDATE users SET support_contact = ? WHERE user_id = ?",
+                    (normalized, user_id),
+                )
+            await self.conn.commit()
+        if user and user.get("vault_id"):
+            self._invalidate_vault_users(user["vault_id"])
+        else:
+            self._invalidate_user(user_id)
         return normalized
 
     async def resolve_owner_contact_url(
@@ -815,21 +861,44 @@ class Database:
             nxt = AUTO_DELETE_CYCLE[(AUTO_DELETE_CYCLE.index(cur_val) + 1) % len(AUTO_DELETE_CYCLE)]
         else:
             nxt = 0
-        await self.conn.execute(
-            "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?", (nxt, user_id)
-        )
-        await self.conn.commit()
-        self._invalidate_user(user_id)
+        async with self._write_lock:
+            if user and user.get("vault_id"):
+                await self.conn.execute(
+                    "UPDATE users SET auto_delete_ttl = ? WHERE vault_id = ?",
+                    (nxt, user["vault_id"]),
+                )
+            else:
+                await self.conn.execute(
+                    "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?",
+                    (nxt, user_id),
+                )
+            await self.conn.commit()
+        if user and user.get("vault_id"):
+            self._invalidate_vault_users(user["vault_id"])
+        else:
+            self._invalidate_user(user_id)
         return nxt
 
     async def set_auto_delete_ttl(self, user_id: int, ttl_seconds: int) -> int:
         assert self.conn is not None
         val = max(0, int(ttl_seconds))
-        await self.conn.execute(
-            "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?", (val, user_id)
-        )
-        await self.conn.commit()
-        self._invalidate_user(user_id)
+        user = await self.get_user(user_id)
+        async with self._write_lock:
+            if user and user.get("vault_id"):
+                await self.conn.execute(
+                    "UPDATE users SET auto_delete_ttl = ? WHERE vault_id = ?",
+                    (val, user["vault_id"]),
+                )
+            else:
+                await self.conn.execute(
+                    "UPDATE users SET auto_delete_ttl = ? WHERE user_id = ?",
+                    (val, user_id),
+                )
+            await self.conn.commit()
+        if user and user.get("vault_id"):
+            self._invalidate_vault_users(user["vault_id"])
+        else:
+            self._invalidate_user(user_id)
         return val
 
     async def set_user_banned(self, user_id: int, banned: bool) -> bool:
@@ -1056,8 +1125,23 @@ class Database:
                         "DELETE FROM group_members WHERE vault_id = ?", (old_vault_id,)
                     )
                     await self.conn.execute(
-                        "UPDATE users SET vault_id = ? WHERE vault_id = ?",
-                        (target_vault_id, old_vault_id),
+                        """
+                        UPDATE users
+                        SET vault_id = ?,
+                            protect_content = ?,
+                            default_one_time = ?,
+                            auto_delete_ttl = ?,
+                            support_contact = ?
+                        WHERE vault_id = ?
+                        """,
+                        (
+                            target_vault_id,
+                            int(approver.get("protect_content") or 0),
+                            int(approver.get("default_one_time") or 0),
+                            int(approver.get("auto_delete_ttl") or 0),
+                            approver.get("support_contact") or "",
+                            old_vault_id,
+                        ),
                     )
                     self._invalidate_vault_users(old_vault_id)
                     self._invalidate_vault_users(target_vault_id)
@@ -2329,6 +2413,62 @@ class Database:
         return cur.rowcount
 
     # -------------------- FULL ACCESS / PAID UNLOCK GRANTS --------------------
+
+    async def record_access_request_message(
+        self,
+        link_type: str,
+        link_id: int,
+        visitor_user_id: int,
+        chat_id: int,
+        message_id: int,
+    ) -> None:
+        assert self.conn is not None
+        now = int(time.time())
+        async with self._write_lock:
+            await self.conn.execute(
+                """
+                INSERT OR IGNORE INTO access_request_messages
+                    (link_type, link_id, visitor_user_id, chat_id, message_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (link_type, int(link_id), int(visitor_user_id), int(chat_id), int(message_id), now),
+            )
+            await self.conn.commit()
+
+    async def get_access_request_messages(
+        self,
+        link_type: str,
+        link_id: int,
+        visitor_user_id: int,
+    ) -> list[tuple[int, int]]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            """
+            SELECT chat_id, message_id
+            FROM access_request_messages
+            WHERE link_type = ? AND link_id = ? AND visitor_user_id = ?
+            """,
+            (link_type, int(link_id), int(visitor_user_id)),
+        )
+        return [(int(r["chat_id"]), int(r["message_id"])) for r in await cur.fetchall()]
+
+    async def delete_access_request_messages(
+        self,
+        link_type: str,
+        link_id: int,
+        visitor_user_id: int,
+    ) -> int:
+        assert self.conn is not None
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                """
+                DELETE FROM access_request_messages
+                WHERE link_type = ? AND link_id = ? AND visitor_user_id = ?
+                """,
+                (link_type, int(link_id), int(visitor_user_id)),
+            )
+            await self.conn.commit()
+            return cur.rowcount
 
     async def grant_link_access(
         self,

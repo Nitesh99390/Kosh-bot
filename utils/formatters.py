@@ -351,7 +351,7 @@ def build_trial_locked_card(
     """
     sub = f"\n📄 <b>{esc(title[:40])}</b>" if title else ""
     text = (
-        f"🔒 <b>Free Preview Already Used</b>{sub}\n"
+        f"🔒 <b>Trial Access Ended</b>{sub}\n"
         f"<blockquote>This link allows <b>1 preview per person</b>.\n"
         f"Tap <b>🔓 Request Full Access</b> below for permanent, unrestricted access.</blockquote>"
     )
@@ -365,7 +365,7 @@ def build_trial_expiry_notice_text(title: str = "", ttl_seconds: int = 0) -> str
     dur = f" ({format_ttl_short(ttl_seconds)})" if ttl_seconds > 0 else ""
     label = f" for <b>{esc(title[:36])}</b>" if title else ""
     return (
-        f"⏱ <b>Preview Timer Ended</b>\n"
+        f"⏱ <b>Trial Session Ended</b>\n"
         f"<blockquote>Your temporary preview{label}{dur} was automatically cleared.\n"
         f"Want permanent access? Tap below to unlock or message the owner.</blockquote>"
     )

@@ -210,7 +210,7 @@ async def render_home_dashboard(
         mode_badges.append(f"⏱ Auto-Del {format_ttl_short(user['auto_delete_ttl'])}")
     if user.get("bulk_mode"):
         mode_badges.append("⚡ Quiet Mode")
-    mode_str = " · ".join(mode_badges) if mode_badges else "Standard (No extra locks)"
+    mode_str = " · ".join(mode_badges) if mode_badges else "Standard"
 
     total_files = stats["total_files"]
     total_size = format_size(stats["total_size"])
@@ -256,7 +256,7 @@ async def render_home_dashboard(
                 ],
                 [
                     InlineKeyboardButton(
-                        text="⚙️ Settings &amp; Locks",
+                        text="⚙️ Settings & Locks",
                         callback_data="nav:settings",
                     ),
                 ],
@@ -267,11 +267,10 @@ async def render_home_dashboard(
     text = (
         f"✨ <b>KoshBox</b> · {greeting}\n"
         f"<blockquote>"
-        f"📦 <b>{total_files}</b> Files <i>({total_size})</i>  •  🎒 <b>{packs_cnt}</b> Packs\n"
-        f"📥 <b>Auto-Save:</b> {esc(active_folder)}\n"
-        f"🛡️ <b>Defaults:</b> {mode_str}"
+        f"📦 <b>{total_files}</b> Files ({total_size})  •  🎒 <b>{packs_cnt}</b> Packs\n"
+        f"📥 <b>Save:</b> {esc(active_folder)}  •  {mode_str}"
         f"</blockquote>\n"
-        f"💡 <i>Drop any file to save it, or send 2+ files together to auto-pack:</i>"
+        f"💡 <i>Drop 1 file to save, or 2+ together to auto-pack:</i>"
     )
 
     kb = InlineKeyboardMarkup(
@@ -649,10 +648,7 @@ async def _deliver_shared_file_with_claim_check(
     bot: Bot,
 ) -> None:
     owner = await db.get_user(file_row["uploader_user_id"])
-    is_owner = (
-        visitor["user_id"] == file_row["uploader_user_id"]
-        or visitor["vault_id"] == file_row["vault_id"]
-    )
+    is_owner = visitor["vault_id"] == file_row["vault_id"]
 
     if is_owner:
         sent_owner = await send_stored_media(
@@ -757,10 +753,7 @@ async def _deliver_shared_pack_with_claim_check(
     bot: Bot,
     config: Optional[Config] = None,
 ) -> None:
-    is_owner = (
-        visitor["user_id"] == pack["creator_user_id"]
-        or visitor["vault_id"] == pack["vault_id"]
-    )
+    is_owner = visitor["vault_id"] == pack["vault_id"]
     if is_owner:
         await deliver_pack_to_chat(
             bot,
@@ -1992,10 +1985,7 @@ async def cb_request_full_access(
         item_title = item.get("title") or "Shared Pack"
         kind_badge = f"🎒 Pack ({item['item_count']} files)"
 
-    if (
-        visitor["user_id"] == preferred_owner_uid
-        or visitor["vault_id"] == owner_vault_id
-    ):
+    if visitor["vault_id"] == owner_vault_id:
         await callback.answer(
             "🔓 You own this content — permanent & unrestricted!", show_alert=True
         )
@@ -2046,23 +2036,28 @@ async def cb_request_full_access(
     )
 
     owner_accounts = await db.get_linked_accounts(owner_vault_id)
+    vault_uids = [int(acc["user_id"]) for acc in owner_accounts]
     recipient_uids: list[int] = []
-    if preferred_owner_uid:
+    if preferred_owner_uid and preferred_owner_uid in vault_uids:
         recipient_uids.append(preferred_owner_uid)
-    for acc in owner_accounts:
-        uid = int(acc["user_id"])
+    for uid in vault_uids:
         if uid not in recipient_uids:
             recipient_uids.append(uid)
 
     for owner_uid in recipient_uids:
         try:
-            await tg_retry_call(
+            sent_card = await tg_retry_call(
                 bot.send_message,
                 chat_id=owner_uid,
                 text=approval_text,
                 reply_markup=approval_kb,
                 disable_web_page_preview=True,
             )
+            sent_mid = getattr(sent_card, "message_id", None)
+            if sent_mid:
+                await db.record_access_request_message(
+                    link_type, item_id, int(visitor["user_id"]), owner_uid, int(sent_mid)
+                )
         except Exception:
             pass
 
@@ -2072,13 +2067,53 @@ async def cb_request_full_access(
     )
     confirm_kb = build_contact_owner_kb(contact_url)
 
-    await callback.answer("📩 Full access request sent!")
-    if callback.message:
-        await callback.message.answer(
-            confirm_text,
-            reply_markup=confirm_kb,
-            disable_web_page_preview=True,
-        )
+    try:
+        await callback.answer("📩 Full access request sent!")
+    except Exception:
+        pass
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.answer(
+                confirm_text,
+                reply_markup=confirm_kb,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+
+async def _sync_access_request_cards(
+    bot: Bot,
+    db: Database,
+    link_type: str,
+    item_id: int,
+    visitor_uid: int,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    *,
+    skip_chat_id: Optional[int] = None,
+    skip_message_id: Optional[int] = None,
+    clear_records: bool = False,
+) -> None:
+    """Keeps Full Access Request / Granted / Revoked cards in sync across all linked owner accounts."""
+    tracked = await db.get_access_request_messages(link_type, item_id, visitor_uid)
+    for chat_id, msg_id in tracked:
+        if skip_chat_id is not None and skip_message_id is not None:
+            if chat_id == skip_chat_id and msg_id == skip_message_id:
+                continue
+        try:
+            await tg_retry_call(
+                bot.edit_message_text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+    if clear_records:
+        await db.delete_access_request_messages(link_type, item_id, visitor_uid)
 
 
 @router.callback_query(F.data.startswith("gr:"))
@@ -2120,7 +2155,7 @@ async def cb_owner_grant_or_reject_access(
         if not item or item.get("is_trashed"):
             await callback.answer("File no longer exists.", show_alert=True)
             return
-        if approver["vault_id"] != item["vault_id"] and approver["user_id"] != item["uploader_user_id"]:
+        if approver["vault_id"] != item["vault_id"]:
             await callback.answer("Owner only.", show_alert=True)
             return
         item_title = item.get("title") or "Shared File"
@@ -2133,7 +2168,7 @@ async def cb_owner_grant_or_reject_access(
         if not item:
             await callback.answer("Pack no longer exists.", show_alert=True)
             return
-        if approver["vault_id"] != item["vault_id"] and approver["user_id"] != item["creator_user_id"]:
+        if approver["vault_id"] != item["vault_id"]:
             await callback.answer("Owner only.", show_alert=True)
             return
         item_title = item.get("title") or "Shared Pack"
@@ -2149,33 +2184,60 @@ async def cb_owner_grant_or_reject_access(
     v_uname = ((visitor_row or {}).get("username") or "").strip().lstrip("@")
     visitor_tag = f"{visitor_label} (@{esc(v_uname)})" if v_uname else f"{visitor_label} (<code>{visitor_uid}</code>)"
 
+    cur_chat_id = callback.message.chat.id if isinstance(callback.message, Message) else None
+    cur_msg_id = callback.message.message_id if isinstance(callback.message, Message) else None
+
     if days == -1:
-        await db.revoke_link_access(link_type, item_id, visitor_uid)
+        was_revoked = await db.revoke_link_access(link_type, item_id, visitor_uid)
         contact_url = await db.resolve_owner_contact_url(
             owner_vault_id, preferred_user_id=preferred_owner_uid
         )
+        approver_lbl = esc((callback.from_user.full_name or approver.get("full_name") or "Owner")[:32])
+        done_hdr = "🚫 <b>Full Access Revoked</b>" if was_revoked else "❌ <b>Full Access Request Declined</b>"
+        ack_lbl = "🚫 Access revoked" if was_revoked else "❌ Request declined"
         owner_done_text = (
-            f"❌ <b>Full Access Request Declined</b>\n"
+            f"{done_hdr}\n"
             f"<blockquote>"
             f"👤 <b>Visitor:</b> {visitor_tag}\n"
-            f"📦 <b>Content:</b> <b>{esc(item_title[:48])}</b>"
+            f"📦 <b>Content:</b> <b>{esc(item_title[:48])}</b>\n"
+            f"🛠️ <b>Handled by:</b> {approver_lbl}"
             f"</blockquote>"
         )
         await safe_edit_or_send(
             callback,
             owner_done_text,
             None,
-            answer_text="❌ Request declined",
+            answer_text=ack_lbl,
             also_ack=True,
+        )
+        await _sync_access_request_cards(
+            bot,
+            db,
+            link_type,
+            item_id,
+            visitor_uid,
+            owner_done_text,
+            None,
+            skip_chat_id=cur_chat_id,
+            skip_message_id=cur_msg_id,
+            clear_records=True,
         )
         try:
             await tg_retry_call(
                 bot.send_message,
                 chat_id=visitor_uid,
                 text=(
-                    f"❌ <b>Full Access Request Declined</b>\n"
-                    f"<blockquote>Your request for <b>{esc(item_title[:44])}</b> was not approved. "
-                    f"Message the owner below if you need assistance.</blockquote>"
+                    (
+                        f"🚫 <b>Full Access Revoked</b>\n"
+                        f"<blockquote>Your full access to <b>{esc(item_title[:44])}</b> was revoked by the owner. "
+                        f"Message the owner below if you need assistance.</blockquote>"
+                    )
+                    if was_revoked
+                    else (
+                        f"❌ <b>Full Access Request Declined</b>\n"
+                        f"<blockquote>Your request for <b>{esc(item_title[:44])}</b> was not approved. "
+                        f"Message the owner below if you need assistance.</blockquote>"
+                    )
                 ),
                 reply_markup=build_contact_owner_kb(contact_url),
                 disable_web_page_preview=True,
@@ -2193,13 +2255,15 @@ async def cb_owner_grant_or_reject_access(
     )
     dur_lbl = _format_grant_duration_label(days)
 
+    approver_lbl = esc((callback.from_user.full_name or approver.get("full_name") or "Owner")[:32])
     owner_approved_text = (
         f"✅ <b>Full Access Granted ({dur_lbl})</b>\n"
         f"<blockquote>"
         f"👤 <b>Visitor:</b> {visitor_tag}\n"
         f"🆔 <b>User ID:</b> <code>{visitor_uid}</code>\n"
         f"📦 <b>Content:</b> <b>{esc(item_title[:48])}</b>\n"
-        f"⏳ <b>Access:</b> <b>{dur_lbl}</b> (No Trial / Auto-Delete)"
+        f"⏳ <b>Access:</b> <b>{dur_lbl}</b> (No Trial / Auto-Delete)\n"
+        f"🛠️ <b>Approved by:</b> {approver_lbl}"
         f"</blockquote>"
     )
     owner_revoke_kb = InlineKeyboardMarkup(
@@ -2219,6 +2283,22 @@ async def cb_owner_grant_or_reject_access(
         owner_revoke_kb,
         answer_text=f"✅ Granted {dur_lbl}!",
         also_ack=True,
+    )
+    if cur_chat_id is not None and cur_msg_id is not None:
+        await db.record_access_request_message(
+            link_type, item_id, visitor_uid, cur_chat_id, cur_msg_id
+        )
+    await _sync_access_request_cards(
+        bot,
+        db,
+        link_type,
+        item_id,
+        visitor_uid,
+        owner_approved_text,
+        owner_revoke_kb,
+        skip_chat_id=cur_chat_id,
+        skip_message_id=cur_msg_id,
+        clear_records=False,
     )
 
     visitor_kb_rows: list[list[InlineKeyboardButton]] = []

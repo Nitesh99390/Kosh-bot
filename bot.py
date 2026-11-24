@@ -8,7 +8,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, ErrorEvent
 
 from config import load_config
 from database import Database
@@ -98,6 +98,19 @@ async def main() -> None:
         dp["db"] = db
         dp["config"] = config
         dp["bot_username"] = bot_username
+
+        @dp.errors()
+        async def _global_error_handler(event: ErrorEvent) -> bool:
+            logger.exception("Unhandled error while processing update: %s", event.exception)
+            upd = event.update
+            if upd and getattr(upd, "callback_query", None):
+                try:
+                    await upd.callback_query.answer(
+                        "⚠️ Something went wrong. Please try again.", show_alert=False
+                    )
+                except Exception:
+                    pass
+            return True
 
         # Outer Guard & Anti-Flood Middleware (Ban check, Force-Sub gate, Rate-Limiting)
         guard = GuardAndThrottleMiddleware(rate_limit=config.rate_limit_interval)
