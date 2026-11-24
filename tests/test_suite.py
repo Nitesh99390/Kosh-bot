@@ -12,6 +12,7 @@ from database import (
     AUTO_DELETE_CYCLE,
     Database,
     hash_pin,
+    natural_sort_key,
     resolve_effective_auto_delete_ttl,
     verify_pin,
 )
@@ -67,6 +68,7 @@ class _DummyBot:
         self.sent_media: list[dict] = []
         self.edited_messages: list[dict] = []
         self.forwarded_messages: list[tuple[int, int, int]] = []
+        self.batch_forwarded_calls: list[dict] = []
         self.deleted_messages: list[tuple[int, int]] = []
         self.batch_deleted_calls: list[tuple[int, list[int]]] = []
         self.batch_copied_calls: list[dict] = []
@@ -229,6 +231,33 @@ class _DummyBot:
             caption="",
         )
 
+    async def forward_messages(
+        self,
+        chat_id: int,
+        from_chat_id: int,
+        message_ids: list[int],
+        disable_notification: bool = False,
+        protect_content: bool = False,
+    ):
+        assert len(message_ids) <= 100, "forward_messages must chunk <= 100 IDs"
+        assert all(
+            message_ids[i] < message_ids[i + 1] for i in range(len(message_ids) - 1)
+        ), "forward_messages requires strictly increasing message_ids!"
+        self.batch_forwarded_calls.append(
+            {
+                "chat_id": chat_id,
+                "from_chat_id": from_chat_id,
+                "message_ids": list(message_ids),
+                "disable_notification": disable_notification,
+            }
+        )
+        out = []
+        for mid in message_ids:
+            self._seq += 1
+            self.forwarded_messages.append((chat_id, from_chat_id, mid))
+            out.append(SimpleNamespace(message_id=10000 + self._seq))
+        return out
+
     async def delete_message(self, chat_id: int, message_id: int):
         self.deleted_messages.append((chat_id, message_id))
 
@@ -246,6 +275,9 @@ class _DummyBot:
         protect_content: bool = False,
     ):
         assert len(message_ids) <= 100, "copy_messages must chunk <= 100 IDs"
+        assert all(
+            message_ids[i] < message_ids[i + 1] for i in range(len(message_ids) - 1)
+        ), "copy_messages requires strictly increasing message_ids!"
         self.batch_copied_calls.append(
             {
                 "chat_id": chat_id,
@@ -674,8 +706,8 @@ async def run_tests() -> None:
                 dummy_cfg,
             )
 
-        # Wait for sliding-window debounce to flush
-        await asyncio.sleep(0.30)
+        # Wait for sliding-window debounce + sequential/batch archive to flush
+        await asyncio.sleep(0.45)
         assert len(replies_received) == 1, (
             f"Expected 1 consolidated Auto-Pack message for 100 files, got {len(replies_received)}"
         )
@@ -1932,6 +1964,344 @@ async def run_tests() -> None:
         assert await db.has_active_access_grant("file", own_file["id"], buyer_uid) is False
         assert len(rej_edits) == 1 and "Declined" in rej_edits[0][0]
         assert any(m["type"] == "msg" and m["chat_id"] == buyer_uid and "Declined" in m["text"] for m in dummy_bot.sent_media)
+
+        # 34. Pack File Ordering Bug Regression Suite:
+        #     (a) Out-of-order incoming messages `[msg_id=103, msg_id=101, msg_id=102]` -> archived & packed in strict `[101, 102, 103]`!
+        #     (b) Delivery of non-ascending `dump_message_id`s `[502, 501, 505]` -> preserves exact `position` order (`502` then `501` then `505`)!
+        #     (c) Natural numeric sort (`🔢 Sort 1→N`) -> orders `Part 1`, `Part 2`, `Part 10`, `Part 28`, `Part 62` accurately!
+        u_ord = await db.ensure_user(9801, "audiobook_owner", "Audiobook Owner")
+        ord_replies: list[tuple[str, object]] = []
+
+        def _make_ordered_audio_msg(msg_id_val: int, part_num: int, uid: int = 9801):
+            async def _ord_reply(
+                txt: str,
+                reply_markup=None,
+                disable_web_page_preview: bool = False,
+                message_effect_id: str | None = None,
+            ):
+                ord_replies.append((txt, reply_markup))
+                return SimpleNamespace(message_id=75000 + len(ord_replies))
+
+            caption_str = f"🎧 I Opened a Medical Center in the Abyss World [hi] — Part {part_num} of 62"
+            return SimpleNamespace(
+                message_id=msg_id_val,
+                chat=SimpleNamespace(id=uid, type="private"),
+                from_user=SimpleNamespace(
+                    id=uid, username="audiobook_owner", full_name="Audiobook Owner"
+                ),
+                media_group_id=None,
+                caption=caption_str,
+                audio=SimpleNamespace(
+                    file_id=f"AB_SRC_{msg_id_val}",
+                    file_unique_id=f"AB_UNIQ_{msg_id_val}",
+                    title=f"I Opened a Medical Center — Part {part_num}",
+                    performer="ModuBot Text-to-Voice",
+                    file_name=f"Abyss_Part_{part_num}.mp3",
+                    mime_type="audio/mpeg",
+                    file_size=40_000_000,
+                    duration=1800,
+                ),
+                document=None,
+                video=None,
+                video_note=None,
+                voice=None,
+                photo=None,
+                animation=None,
+                sticker=None,
+                reply=_ord_reply,
+            )
+
+        # (a1) Multi-Drop Auto-Pack: arrive out of order [103 (Part 3), 101 (Part 1), 102 (Part 2)]
+        dummy_bot.forwarded_messages.clear()
+        dummy_bot.batch_forwarded_calls.clear()
+        ord_fsm = _DummyFSM(None)
+        for mid_in, pt_in in [(103, 3), (101, 1), (102, 2)]:
+            await upload.handle_media_upload(
+                _make_ordered_audio_msg(mid_in, pt_in),  # type: ignore[arg-type]
+                ord_fsm,  # type: ignore[arg-type]
+                dummy_bot,  # type: ignore[arg-type]
+                db,
+                dummy_cfg,
+            )
+
+        # Before sliding window flushes, ZERO messages should be forwarded to dump channel!
+        assert len(dummy_bot.forwarded_messages) == 0, (
+            "Multi-drop must buffer BEFORE forwarding so concurrent handlers never race forward_message!"
+        )
+
+        await asyncio.sleep(0.35)
+        assert len(ord_replies) == 1 and "Auto-Packed 3 files" in ord_replies[0][0]
+        # Verify batch forward_messages received strictly sorted [101, 102, 103]
+        assert len(dummy_bot.batch_forwarded_calls) == 1
+        assert dummy_bot.batch_forwarded_calls[0]["message_ids"] == [101, 102, 103]
+        assert [m[2] for m in dummy_bot.forwarded_messages] == [101, 102, 103]
+
+        ord_packs = await db.list_vault_packs(u_ord["vault_id"])
+        assert len(ord_packs) == 1
+        ord_pack = ord_packs[0]
+        ord_pack_files = await db.get_pack_files(ord_pack["id"])
+        assert [f["title"] for f in ord_pack_files] == [
+            "I Opened a Medical Center — Part 1",
+            "I Opened a Medical Center — Part 2",
+            "I Opened a Medical Center — Part 3",
+        ]
+        assert [f["pack_position"] for f in ord_pack_files] == [1, 2, 3]
+        assert ord_pack_files[0]["dump_message_id"] < ord_pack_files[1]["dump_message_id"] < ord_pack_files[2]["dump_message_id"]
+
+        # (a2) Interactive `/batch` Pack Builder + >60 files (62-part audiobook arriving scrambled!)
+        dummy_bot.forwarded_messages.clear()
+        dummy_bot.batch_forwarded_calls.clear()
+        builder_62_fsm = _DummyFSM(
+            PackStates.collecting_items.state,
+            {
+                "pack_file_ids": [],
+                "pack_total_size": 0,
+                "pack_recent_titles": [],
+                "pack_status_msg_id": 89999,
+                "append_pack_id": None,
+            },
+        )
+        # Simulate scrambled arrival order of 62 forwarded parts (msg_id 2001..2062)
+        scrambled_62 = (
+            [2, 1, 28, 60, 61, 62]
+            + [i for i in range(3, 60) if i != 28]
+        )
+        assert len(scrambled_62) == 62 and sorted(scrambled_62) == list(range(1, 63))
+        for p_no in scrambled_62:
+            await upload.handle_media_upload(
+                _make_ordered_audio_msg(2000 + p_no, p_no),  # type: ignore[arg-type]
+                builder_62_fsm,  # type: ignore[arg-type]
+                dummy_bot,  # type: ignore[arg-type]
+                db,
+                dummy_cfg,
+            )
+        await asyncio.sleep(0.30)
+        assert [m[2] for m in dummy_bot.forwarded_messages] == list(range(2001, 2063))
+        b62_data = await builder_62_fsm.get_data()
+        b62_pack = await db.create_pack(
+            vault_id=u_ord["vault_id"],
+            creator_user_id=9801,
+            title="Abyss Medical Center (62)",
+            file_ids=b62_data["pack_file_ids"],
+        )
+        b62_files = await db.get_pack_files(b62_pack["id"])
+        assert len(b62_files) == 62
+        assert [f["pack_position"] for f in b62_files] == list(range(1, 63))
+        assert [f["title"] for f in b62_files] == [
+            f"I Opened a Medical Center — Part {i}" for i in range(1, 63)
+        ]
+
+        # (b) Pack Delivery Order Preservation when `dump_message_id`s are NOT strictly ascending `[502, 501, 505]`:
+        #     MUST deliver `502` FIRST, then `501`, then `505` (NEVER scramble via `sorted(dump_ids)` -> `[501, 502, 505]`)!
+        delivery_trace: list[tuple[str, object]] = []
+
+        class _OrderTracingBot(_DummyBot):
+            async def copy_messages(
+                self,
+                chat_id: int,
+                from_chat_id: int,
+                message_ids: list[int],
+                protect_content: bool = False,
+            ):
+                res = await super().copy_messages(
+                    chat_id=chat_id,
+                    from_chat_id=from_chat_id,
+                    message_ids=message_ids,
+                    protect_content=protect_content,
+                )
+                for mid in message_ids:
+                    delivery_trace.append(("copy", mid))
+                return res
+
+            async def send_audio(
+                self,
+                chat_id: int,
+                audio: str,
+                caption: str = "",
+                protect_content: bool = False,
+                reply_markup=None,
+                message_effect_id: str | None = None,
+            ):
+                res = await super().send_audio(
+                    chat_id=chat_id,
+                    audio=audio,
+                    caption=caption,
+                    protect_content=protect_content,
+                    reply_markup=reply_markup,
+                    message_effect_id=message_effect_id,
+                )
+                delivery_trace.append(("audio", audio))
+                return res
+
+        trace_bot = _OrderTracingBot()
+        f_d502 = await db.add_file(
+            vault_id=u_ord["vault_id"],
+            uploader_user_id=9801,
+            group_id=None,
+            media_type="audio",
+            file_id="FID_FOR_502",
+            file_unique_id="UNIQ_D502",
+            dump_message_id=502,
+            title="Track Pos 1 (dump 502)",
+        )
+        f_d501 = await db.add_file(
+            vault_id=u_ord["vault_id"],
+            uploader_user_id=9801,
+            group_id=None,
+            media_type="audio",
+            file_id="FID_FOR_501",
+            file_unique_id="UNIQ_D501",
+            dump_message_id=501,
+            title="Track Pos 2 (dump 501)",
+        )
+        f_d505 = await db.add_file(
+            vault_id=u_ord["vault_id"],
+            uploader_user_id=9801,
+            group_id=None,
+            media_type="audio",
+            file_id="FID_FOR_505",
+            file_unique_id="UNIQ_D505",
+            dump_message_id=505,
+            title="Track Pos 3 (dump 505)",
+        )
+        non_asc_pack = await db.create_pack(
+            vault_id=u_ord["vault_id"],
+            creator_user_id=9801,
+            title="Non-Ascending Dump IDs Pack",
+            file_ids=[f_d502["id"], f_d501["id"], f_d505["id"]],
+        )
+        deliv_non_asc = await packs.deliver_pack_to_chat(
+            trace_bot,  # type: ignore[arg-type]
+            9901,
+            non_asc_pack,
+            db,
+            is_owner=True,
+            count_view=False,
+            dump_channel_id=dummy_cfg.dump_channel_id,
+        )
+        assert deliv_non_asc == 3
+        # Map each trace item back to its dump_message_id to verify exact [502, 501, 505] sequence!
+        fid_to_dump = {"FID_FOR_502": 502, "FID_FOR_501": 501, "FID_FOR_505": 505}
+        delivered_dump_sequence = [
+            val if kind == "copy" else fid_to_dump[str(val)]
+            for kind, val in delivery_trace
+        ]
+        assert delivered_dump_sequence == [502, 501, 505], (
+            f"Expected exact position order [502, 501, 505], got {delivered_dump_sequence}"
+        )
+        # Specifically: singleton 502 sent via send_stored_media, ascending run [501, 505] batched via copy_messages!
+        assert delivery_trace == [
+            ("audio", "FID_FOR_502"),
+            ("copy", 501),
+            ("copy", 505),
+        ]
+
+        # (c) 1-Tap `🔢 Sort 1→N` Natural Numeric Sort in `🛠️ Edit Pack`:
+        #     Verify `Part 1`, `Part 2`, `Part 9`, `Part 10`, `Part 28`, `Part 62` sort naturally (NOT `Part 1, Part 10, Part 2`)!
+        raw_labels = [
+            "🎧 Abyss World — Part 28 of 62",
+            "🎧 Abyss World — Part 2 of 62",
+            "🎧 Abyss World — Part 10 of 62",
+            "🎧 Abyss World — Part 1 of 62",
+            "🎧 Abyss World — Part 62 of 62",
+            "🎧 Abyss World — Part 9 of 62",
+        ]
+        assert sorted(raw_labels, key=natural_sort_key) == [
+            "🎧 Abyss World — Part 1 of 62",
+            "🎧 Abyss World — Part 2 of 62",
+            "🎧 Abyss World — Part 9 of 62",
+            "🎧 Abyss World — Part 10 of 62",
+            "🎧 Abyss World — Part 28 of 62",
+            "🎧 Abyss World — Part 62 of 62",
+        ]
+
+        messy_fids: list[int] = []
+        for idx_m, lbl in enumerate(raw_labels, start=1):
+            mf = await db.add_file(
+                vault_id=u_ord["vault_id"],
+                uploader_user_id=9801,
+                group_id=None,
+                media_type="audio",
+                file_id=f"MESSY_FID_{idx_m}",
+                file_unique_id=f"MESSY_UNIQ_{idx_m}",
+                dump_message_id=9500 + idx_m,
+                title=lbl,
+                caption=lbl,
+            )
+            messy_fids.append(mf["id"])
+
+        messy_pack = await db.create_pack(
+            vault_id=u_ord["vault_id"],
+            creator_user_id=9801,
+            title="Scrambled Audiobook Pack",
+            file_ids=messy_fids,
+        )
+
+        # Verify `🔢 Sort 1→N` button appears in `🛠️ Edit Pack` and obeys <=2 btns/row & <=64B callback_data
+        messy_drawer = await packs.render_pack_edit_drawer(9801, messy_pack["id"], db, page=0)
+        assert messy_drawer is not None
+        sort_btns = [
+            b
+            for r in messy_drawer[1].inline_keyboard
+            for b in r
+            if b.callback_data == f"pk:sort:{messy_pack['id']}"
+        ]
+        assert len(sort_btns) == 1 and sort_btns[0].text == "🔢 Sort 1→N"
+        for r in messy_drawer[1].inline_keyboard:
+            is_pgr = len(r) == 3 and r[1].callback_data == "noop"
+            assert is_pgr or len(r) <= 2
+            for b in r:
+                if b.callback_data:
+                    assert len(b.callback_data.encode("utf-8")) <= 64
+
+        # Invoke the actual `cb_pack_natural_sort` callback handler (simulating owner tapping `🔢 Sort 1→N`)
+        sort_cb_obj, sort_acks, sort_edits, _ = _make_cb(
+            9801, "audiobook_owner", "Audiobook Owner", f"pk:sort:{messy_pack['id']}"
+        )
+        await packs.cb_pack_natural_sort(sort_cb_obj, db)  # type: ignore[arg-type]
+        assert sort_acks and "Sorted 6 files" in (sort_acks[0][0] or "")
+        assert len(sort_edits) == 1
+
+        fixed_files = await db.get_pack_files(messy_pack["id"])
+        assert [f["caption"] for f in fixed_files] == [
+            "🎧 Abyss World — Part 1 of 62",
+            "🎧 Abyss World — Part 2 of 62",
+            "🎧 Abyss World — Part 9 of 62",
+            "🎧 Abyss World — Part 10 of 62",
+            "🎧 Abyss World — Part 28 of 62",
+            "🎧 Abyss World — Part 62 of 62",
+        ]
+        assert [f["pack_position"] for f in fixed_files] == [1, 2, 3, 4, 5, 6]
+
+        # Also verify delivering the newly sorted pack sends Parts 1, 2, 9, 10, 28, 62 in exact sorted order!
+        delivery_trace.clear()
+        await packs.deliver_pack_to_chat(
+            trace_bot,  # type: ignore[arg-type]
+            9902,
+            messy_pack,
+            db,
+            is_owner=True,
+            count_view=False,
+            dump_channel_id=dummy_cfg.dump_channel_id,
+        )
+        messy_fid_to_lbl = {
+            f"MESSY_FID_{idx_m}": lbl for idx_m, lbl in enumerate(raw_labels, start=1)
+        }
+        messy_dump_to_lbl = {
+            9500 + idx_m: lbl for idx_m, lbl in enumerate(raw_labels, start=1)
+        }
+        delivered_labels = [
+            messy_dump_to_lbl[int(val)] if kind == "copy" else messy_fid_to_lbl[str(val)]
+            for kind, val in delivery_trace
+        ]
+        assert delivered_labels == [
+            "🎧 Abyss World — Part 1 of 62",
+            "🎧 Abyss World — Part 2 of 62",
+            "🎧 Abyss World — Part 9 of 62",
+            "🎧 Abyss World — Part 10 of 62",
+            "🎧 Abyss World — Part 28 of 62",
+            "🎧 Abyss World — Part 62 of 62",
+        ]
 
         await db.close()
         print("ALL PRO FEATURES, TRIAL LOCKS, BATCH APIS, BOT API 9.4 UX & ZERO-LEAK TESTS PASSED!")

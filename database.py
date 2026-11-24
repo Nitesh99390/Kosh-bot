@@ -100,6 +100,22 @@ SORT_CLAUSES = {
 }
 
 
+_NATURAL_SORT_RE = re.compile(r"(\d+)")
+
+
+def natural_sort_key(text: Optional[str]) -> list[tuple[int, int | str]]:
+    """
+    Natural numeric sort key (`re.split(r'(\\d+)', text.lower())` converting digit tokens to `int`),
+    wrapped as `(0, int(tok))` vs `(1, tok)` so Python 3 never raises TypeError when comparing
+    mixed numeric and string segments (e.g. `Part 1`, `Part 2`, ..., `Part 10`, ..., `Part 62`).
+    """
+    raw = (text or "").strip().lower()
+    return [
+        (0, int(tok)) if tok.isdigit() else (1, tok)
+        for tok in _NATURAL_SORT_RE.split(raw)
+    ]
+
+
 LAST_SEEN_WRITE_THROTTLE_SECONDS = 90.0
 
 
@@ -123,17 +139,22 @@ class Database:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self.conn = await aiosqlite.connect(self.db_path)
-        self.conn.row_factory = aiosqlite.Row
-        await self.conn.execute("PRAGMA journal_mode=WAL;")
-        await self.conn.execute("PRAGMA synchronous=NORMAL;")
-        await self.conn.execute("PRAGMA temp_store=MEMORY;")
-        await self.conn.execute("PRAGMA cache_size=-16000;")
-        await self.conn.execute("PRAGMA mmap_size=67108864;")
-        await self.conn.execute("PRAGMA wal_autocheckpoint=1000;")
-        await self.conn.execute("PRAGMA busy_timeout=5000;")
-        await self.conn.execute("PRAGMA foreign_keys=ON;")
-        await self._init_schema()
-        await self._run_migrations()
+        try:
+            self.conn.row_factory = aiosqlite.Row
+            await self.conn.execute("PRAGMA journal_mode=WAL;")
+            await self.conn.execute("PRAGMA synchronous=NORMAL;")
+            await self.conn.execute("PRAGMA temp_store=MEMORY;")
+            await self.conn.execute("PRAGMA cache_size=-16000;")
+            await self.conn.execute("PRAGMA mmap_size=67108864;")
+            await self.conn.execute("PRAGMA wal_autocheckpoint=1000;")
+            await self.conn.execute("PRAGMA busy_timeout=5000;")
+            await self.conn.execute("PRAGMA foreign_keys=ON;")
+            await self._init_schema()
+            await self._run_migrations()
+        except Exception:
+            await self.conn.close()
+            self.conn = None
+            raise
 
     async def close(self) -> None:
         self._user_cache.clear()
@@ -269,10 +290,12 @@ class Database:
             );
 
             CREATE TABLE IF NOT EXISTS pack_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pack_id INTEGER NOT NULL,
                 file_id INTEGER NOT NULL,
-                pos INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (pack_id, file_id),
+                position INTEGER NOT NULL DEFAULT 1,
+                pos INTEGER NOT NULL DEFAULT 1,
+                UNIQUE (pack_id, file_id),
                 FOREIGN KEY (pack_id) REFERENCES packs(id) ON DELETE CASCADE,
                 FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
             );
@@ -449,6 +472,34 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE packs ADD COLUMN auto_delete_ttl INTEGER DEFAULT 0;"
             )
+
+        pack_item_cols = await _table_cols("pack_items")
+        if "id" not in pack_item_cols or "position" not in pack_item_cols:
+            pos_expr = "COALESCE(position, pos + 1, 1)" if "position" in pack_item_cols else "COALESCE(pos + 1, 1)"
+            pos_legacy_expr = "COALESCE(pos, position, 1)" if "position" in pack_item_cols else "COALESCE(pos, 0)"
+            await self.conn.executescript(
+                f"""
+                CREATE TABLE IF NOT EXISTS pack_items_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pack_id INTEGER NOT NULL,
+                    file_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 1,
+                    pos INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE (pack_id, file_id),
+                    FOREIGN KEY (pack_id) REFERENCES packs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+                );
+                INSERT OR IGNORE INTO pack_items_v2 (pack_id, file_id, position, pos)
+                SELECT pack_id, file_id, {pos_expr}, {pos_legacy_expr}
+                FROM pack_items
+                ORDER BY pack_id ASC, {pos_legacy_expr} ASC, rowid ASC;
+                DROP TABLE pack_items;
+                ALTER TABLE pack_items_v2 RENAME TO pack_items;
+                """
+            )
+        await self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pack_items_order ON pack_items(pack_id, position ASC, id ASC);"
+        )
 
         await self.conn.executescript(
             """
@@ -1592,13 +1643,15 @@ class Database:
         )
         pack_id = cur.lastrowid
         seen: set[int] = set()
-        for idx, fid in enumerate(file_ids):
+        pos_val = 0
+        for fid in file_ids:
             if fid in seen:
                 continue
             seen.add(fid)
+            pos_val += 1
             await self.conn.execute(
-                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, pos) VALUES (?, ?, ?)",
-                (pack_id, fid, idx),
+                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, position, pos) VALUES (?, ?, ?, ?)",
+                (pack_id, fid, pos_val, pos_val),
             )
         await self.conn.commit()
         res = await self.get_pack(pack_id)
@@ -1610,17 +1663,57 @@ class Database:
     ) -> Optional[dict[str, Any]]:
         assert self.conn is not None
         cur = await self.conn.execute(
-            "SELECT COALESCE(MAX(pos), -1) FROM pack_items WHERE pack_id = ?",
+            "SELECT COALESCE(MAX(position), 0) FROM pack_items WHERE pack_id = ?",
             (pack_id,),
         )
-        base_pos = int((await cur.fetchone())[0]) + 1
-        for offset, fid in enumerate(file_ids):
+        next_pos = int((await cur.fetchone())[0])
+        seen: set[int] = set()
+        for fid in file_ids:
+            if fid in seen:
+                continue
+            seen.add(fid)
+            next_pos += 1
             await self.conn.execute(
-                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, pos) VALUES (?, ?, ?)",
-                (pack_id, fid, base_pos + offset),
+                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, position, pos) VALUES (?, ?, ?, ?)",
+                (pack_id, fid, next_pos, next_pos),
             )
         await self.conn.commit()
         return await self.get_pack(pack_id)
+
+    async def natural_sort_pack_items(self, pack_id: int) -> int:
+        """
+        Reorders all items in `pack_id` using natural numeric sorting on `(caption or title)`
+        so `Part 1`, `Part 2`, ..., `Part 9`, `Part 10`, ..., `Part 62` are ordered 1 -> N
+        in SQLite (`pack_items.position = 1, 2, ..., N`).
+        Returns the number of sorted items.
+        """
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            """
+            SELECT pi.id AS item_id, pi.file_id, pi.position, f.caption, f.title, f.file_name
+            FROM pack_items pi
+            JOIN files f ON f.id = pi.file_id
+            WHERE pi.pack_id = ?
+            ORDER BY pi.position ASC, pi.id ASC
+            """,
+            (pack_id,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        if not rows:
+            return 0
+
+        def _row_sort_key(r: dict[str, Any]):
+            label = (r.get("caption") or "").strip() or (r.get("title") or "").strip() or (r.get("file_name") or "").strip()
+            return (natural_sort_key(label), int(r["position"]), int(r["item_id"]))
+
+        sorted_rows = sorted(rows, key=_row_sort_key)
+        for new_pos, r in enumerate(sorted_rows, start=1):
+            await self.conn.execute(
+                "UPDATE pack_items SET position = ?, pos = ? WHERE id = ?",
+                (new_pos, new_pos, r["item_id"]),
+            )
+        await self.conn.commit()
+        return len(sorted_rows)
 
     async def remove_file_from_pack(self, pack_id: int, file_id: int) -> bool:
         assert self.conn is not None
@@ -1712,12 +1805,12 @@ class Database:
         assert self.conn is not None
         cur = await self.conn.execute(
             """
-            SELECT f.*, COALESCE(g.name, '') AS group_name
+            SELECT f.*, pi.position AS pack_position, COALESCE(g.name, '') AS group_name
             FROM pack_items pi
             JOIN files f ON f.id = pi.file_id
             LEFT JOIN groups g ON g.id = f.group_id
             WHERE pi.pack_id = ? AND COALESCE(f.is_trashed, 0) = 0
-            ORDER BY pi.pos ASC, f.id ASC
+            ORDER BY pi.position ASC, pi.id ASC
             """,
             (pack_id,),
         )

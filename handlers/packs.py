@@ -166,22 +166,31 @@ async def deliver_pack_to_chat(
             and all(int(f.get("dump_message_id") or 0) > 0 for f in slice_items)
         )
 
-        if can_batch_copy:
-            # Telegram Bot API `copy_messages` requires `message_ids` in strictly increasing order (1..100).
-            # We copy the sorted dump IDs in one native API call while preserving every returned message ID!
-            ordered = sorted(slice_items, key=lambda x: int(x["dump_message_id"]))
-            dump_ids: list[int] = []
-            prev_mid = -1
-            strictly_increasing = True
-            for it in ordered:
-                mid = int(it["dump_message_id"])
-                if mid <= prev_mid:
-                    strictly_increasing = False
-                    break
-                dump_ids.append(mid)
-                prev_mid = mid
+        def _collect_copied_ids(copied_res: Any) -> int:
+            added = 0
+            if not copied_res:
+                return 0
+            for m_obj in copied_res:
+                mid_val = getattr(m_obj, "message_id", None)
+                if mid_val is None and isinstance(m_obj, dict):
+                    mid_val = m_obj.get("message_id")
+                if mid_val is None and isinstance(m_obj, int):
+                    mid_val = m_obj
+                if mid_val:
+                    sent_ids.append(int(mid_val))
+                added += 1
+            return added
 
-            if strictly_increasing:
+        if can_batch_copy:
+            # Always preserve exact `pack_items.position ASC, pack_items.id ASC` order (`slice_items`)!
+            # NEVER call `sorted(dump_ids)` in a way that scrambles `pack_items.position`!
+            dump_ids = [int(f["dump_message_id"]) for f in slice_items]
+            strictly_ascending = all(
+                dump_ids[i] < dump_ids[i + 1] for i in range(len(dump_ids) - 1)
+            )
+
+            if strictly_ascending:
+                # 100% fast path: strictly ascending dump_message_ids -> 1 native `copy_messages` per chunk!
                 try:
                     for c_start in range(0, len(dump_ids), BATCH_CHUNK_SIZE):
                         chunk_ids = dump_ids[c_start : c_start + BATCH_CHUNK_SIZE]
@@ -192,22 +201,79 @@ async def deliver_pack_to_chat(
                             message_ids=chunk_ids,
                             protect_content=protect,
                         )
-                        if copied_res:
-                            for m_obj in copied_res:
-                                mid_val = getattr(m_obj, "message_id", None)
-                                if mid_val is None and isinstance(m_obj, dict):
-                                    mid_val = m_obj.get("message_id")
-                                if mid_val is None and isinstance(m_obj, int):
-                                    mid_val = m_obj
-                                if mid_val:
-                                    sent_ids.append(int(mid_val))
-                            delivered += len(copied_res)
+                        delivered += _collect_copied_ids(copied_res)
                 except Exception:
                     if delivered == 0:
                         delivered = 0
+            else:
+                # Older / manually reordered / naturally sorted pack where `dump_message_id`s are NOT
+                # globally strictly ascending: split into maximal consecutive strictly ascending runs!
+                # - Runs of length >= 2 use `bot.copy_messages()` (up to 100 per call).
+                # - Singletons (or failed run copies) fall back to `send_stored_media()` in exact position order!
+                runs: list[list[dict[str, Any]]] = []
+                for item_f in slice_items:
+                    cur_mid = int(item_f["dump_message_id"])
+                    if runs and int(runs[-1][-1]["dump_message_id"]) < cur_mid:
+                        runs[-1].append(item_f)
+                    else:
+                        runs.append([item_f])
+
+                op_count = 0
+                for run in runs:
+                    if len(run) >= 2:
+                        for c_start in range(0, len(run), BATCH_CHUNK_SIZE):
+                            sub_run = run[c_start : c_start + BATCH_CHUNK_SIZE]
+                            if len(sub_run) >= 2:
+                                run_ids = [int(x["dump_message_id"]) for x in sub_run]
+                                try:
+                                    copied_res = await tg_retry_call(
+                                        copy_batch_fn,
+                                        chat_id=chat_id,
+                                        from_chat_id=dump_channel_id,
+                                        message_ids=run_ids,
+                                        protect_content=protect,
+                                    )
+                                    copied_cnt = _collect_copied_ids(copied_res)
+                                    if copied_cnt > 0:
+                                        delivered += copied_cnt
+                                        op_count += 1
+                                        await asyncio.sleep(0.05 if op_count % 15 else 0.25)
+                                        continue
+                                except Exception:
+                                    pass
+                            # Per-item sequential fallback for singleton tail or failed batch run
+                            for single_f in sub_run:
+                                sent = await send_stored_media(
+                                    bot,
+                                    chat_id,
+                                    single_f,
+                                    protect_content=protect,
+                                    auto_delete_ttl=0,
+                                )
+                                if sent:
+                                    delivered += 1
+                                    if getattr(sent, "message_id", None):
+                                        sent_ids.append(sent.message_id)
+                                op_count += 1
+                                await asyncio.sleep(0.05 if op_count % 15 else 0.25)
+                    else:
+                        single_f = run[0]
+                        sent = await send_stored_media(
+                            bot,
+                            chat_id,
+                            single_f,
+                            protect_content=protect,
+                            auto_delete_ttl=0,
+                        )
+                        if sent:
+                            delivered += 1
+                            if getattr(sent, "message_id", None):
+                                sent_ids.append(sent.message_id)
+                        op_count += 1
+                        await asyncio.sleep(0.05 if op_count % 15 else 0.25)
 
         if delivered == 0:
-            # Clean fallback to cached file_id delivery
+            # Clean fallback to cached file_id delivery in exact `pack_items.position ASC` order
             for idx, f in enumerate(slice_items):
                 sent = await send_stored_media(
                     bot,
@@ -577,9 +643,14 @@ async def render_pack_edit_drawer(
                 callback_data=f"pk:add:{pack_id}",
                 style="primary",
             ),
-            InlineKeyboardButton(text="✏️ Rename", callback_data=f"pk:ren:{pack_id}"),
+            InlineKeyboardButton(
+                text="🔢 Sort 1→N",
+                callback_data=f"pk:sort:{pack_id}",
+                style="success",
+            ),
         ],
         [
+            InlineKeyboardButton(text="✏️ Rename", callback_data=f"pk:ren:{pack_id}"),
             InlineKeyboardButton(text="💬 Welcome Note", callback_data=f"pk:desc:{pack_id}"),
         ],
     ]
@@ -856,10 +927,16 @@ async def cmd_batch_done(
     state: FSMContext,
     db: Database,
     bot: Bot,
+    config: Optional[Config] = None,
     bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not message.from_user:
         return
+    from handlers.upload import flush_pending_pack_builder_uploads
+
+    await flush_pending_pack_builder_uploads(
+        message.from_user.id, state, bot, db, config, bot_username=bot_username
+    )
     data = await state.get_data()
     fids: list[int] = data.get("pack_file_ids") or []
     append_pid: Optional[int] = data.get("append_pack_id")
@@ -906,10 +983,16 @@ async def cb_batch_finish(
     state: FSMContext,
     db: Database,
     bot: Bot,
+    config: Optional[Config] = None,
     bot_username: str = "KoshBox_Bot",
 ) -> None:
     if not callback.from_user:
         return
+    from handlers.upload import flush_pending_pack_builder_uploads
+
+    await flush_pending_pack_builder_uploads(
+        callback.from_user.id, state, bot, db, config, bot_username=bot_username
+    )
     data = await state.get_data()
     fids: list[int] = data.get("pack_file_ids") or []
     append_pid: Optional[int] = data.get("append_pack_id")
@@ -1090,6 +1173,32 @@ async def cb_pack_edit_page(callback: CallbackQuery, db: Database) -> None:
         await callback.answer("Pack not found.", show_alert=True)
         return
     await safe_edit_or_send(callback, rendered[0], rendered[1], also_ack=True)
+
+
+@router.callback_query(F.data.startswith("pk:sort:"))
+async def cb_pack_natural_sort(callback: CallbackQuery, db: Database) -> None:
+    """1-Tap Natural Numeric Sort (1->N) for existing Packs (e.g. Part 1, Part 2, ..., Part 62)."""
+    if not callback.from_user:
+        return
+    pid = int(callback.data.split(":")[2])
+    user = await db.get_user(callback.from_user.id)
+    pack = await db.get_pack(pid)
+    if not pack or not user or pack["vault_id"] != user["vault_id"]:
+        await callback.answer("Pack not found.", show_alert=True)
+        return
+    sorted_cnt = await db.natural_sort_pack_items(pid)
+    rendered = await render_pack_edit_drawer(callback.from_user.id, pid, db, page=0)
+    ans = f"🔢 Sorted {sorted_cnt} files in natural 1→N order!"
+    if rendered:
+        await safe_edit_or_send(
+            callback,
+            rendered[0],
+            rendered[1],
+            answer_text=ans,
+            also_ack=True,
+        )
+    else:
+        await callback.answer(ans)
 
 
 @router.callback_query(F.data.startswith("pk:rmf:"))

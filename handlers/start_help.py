@@ -1170,6 +1170,13 @@ async def cb_switch_help_tab(
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    if message.from_user:
+        from handlers.upload import _PACK_BUILDER_BUFFER, _PACK_BUILDER_TASKS
+
+        _PACK_BUILDER_BUFFER.pop(message.from_user.id, None)
+        pend_task = _PACK_BUILDER_TASKS.pop(message.from_user.id, None)
+        if pend_task and not pend_task.done():
+            pend_task.cancel()
     current = await state.get_state()
     if current is None:
         await message.answer(
@@ -1195,6 +1202,12 @@ async def cb_fsm_cancel(
 ) -> None:
     if not callback.from_user:
         return
+    from handlers.upload import _PACK_BUILDER_BUFFER, _PACK_BUILDER_TASKS
+
+    _PACK_BUILDER_BUFFER.pop(callback.from_user.id, None)
+    pend_task = _PACK_BUILDER_TASKS.pop(callback.from_user.id, None)
+    if pend_task and not pend_task.done():
+        pend_task.cancel()
     await state.clear()
     target = callback.data.split(":", 2)[2]
     uname = bot_username or "KoshBox_Bot"

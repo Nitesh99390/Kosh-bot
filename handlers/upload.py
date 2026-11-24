@@ -12,6 +12,7 @@ from config import Config
 from database import Database
 from handlers.packs import render_pack_detail
 from utils.formatters import (
+    BATCH_CHUNK_SIZE,
     EFFECT_PARTY,
     EFFECT_THUMBS_UP,
     MEDIA_ICONS,
@@ -41,7 +42,8 @@ _USER_DROP_BUFFER: dict[int, list[dict[str, Any]]] = {}
 _USER_DROP_TASKS: dict[int, asyncio.Task] = {}
 _USER_DROP_LOCKS: dict[int, asyncio.Lock] = {}
 
-# Per-user debounced live status updater for interactive Pack Builder (`/batch`, `➕ New Pack`, `➕ Add Files`)
+# Per-user burst buffers & debounced live status updater for interactive Pack Builder (`/batch`, `➕ New Pack`, `➕ Add Files`)
+_PACK_BUILDER_BUFFER: dict[int, list[dict[str, Any]]] = {}
 _PACK_BUILDER_TASKS: dict[int, asyncio.Task] = {}
 _PACK_BUILDER_LOCKS: dict[int, asyncio.Lock] = {}
 
@@ -76,7 +78,9 @@ def _get_drop_lock(user_id: int) -> asyncio.Lock:
 def _get_builder_lock(user_id: int) -> asyncio.Lock:
     lock = _PACK_BUILDER_LOCKS.get(user_id)
     if lock is None:
-        _prune_idle_locks(_PACK_BUILDER_LOCKS, _PACK_BUILDER_TASKS)
+        _prune_idle_locks(
+            _PACK_BUILDER_LOCKS, _PACK_BUILDER_TASKS, _PACK_BUILDER_BUFFER
+        )
         lock = asyncio.Lock()
         _PACK_BUILDER_LOCKS[user_id] = lock
     return lock
@@ -92,7 +96,12 @@ def _clean_auto_pack_title(files: list[dict[str, Any]]) -> str:
     base = base.replace("_", " ").strip()
     # Strip trailing episode/chapter/part numbers if multiple files share a series prefix
     if len(files) >= 2:
-        stripped = re.sub(r"[\s\-–_#]*(?:ep|ch|part|pt|vol)?[\s\-_#]*\d+\s*$", "", base, flags=re.IGNORECASE).strip()
+        stripped = re.sub(
+            r"[\s\-–_#]*(?:ep|ch|part|pt|vol)?[\s\-_#]*\d+\s*$",
+            "",
+            base,
+            flags=re.IGNORECASE,
+        ).strip()
         if len(stripped) >= 4:
             base = stripped
     base = base[:38].strip() or "File Pack"
@@ -254,37 +263,244 @@ MEDIA_FILTER = (
 )
 
 
-async def _queue_user_drop(
-    user_id: int,
-    entry: dict[str, Any],
-    anchor_message: Message,
+def _extract_msg_id(obj: Any) -> Optional[int]:
+    mid = getattr(obj, "message_id", None)
+    if mid is None and isinstance(obj, dict):
+        mid = obj.get("message_id")
+    if mid is None and isinstance(obj, int):
+        mid = obj
+    return int(mid) if mid is not None else None
+
+
+async def _archive_sorted_entries(
+    sorted_entries: list[dict[str, Any]],
+    user: dict[str, Any],
     bot: Bot,
     db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
+) -> list[dict[str, Any]]:
+    """
+    Archives a `message.message_id`-ascending sorted list of incoming media messages into
+    `DUMP_CHANNEL_ID` and SQLite in STRICT ascending `message_id` order (1 -> N):
+    - Dedupes/restores existing vault files first without redundant dump forwards.
+    - Archives new unique files in exact `message.message_id` ascending order using
+      `bot.forward_messages(..., message_ids=sorted_msg_ids_chunk, disable_notification=True)`
+      in chunks of <= 100 (with sequential per-message `forward_message` fallback — NEVER
+      concurrent `asyncio.gather` forwarding that races order!).
+    - Saves rows into `files` sequentially in that exact order so both `dump_message_id`
+      and `pack_items.position` (`1, 2, ..., N`) are strictly sequential!
+    """
+    if not sorted_entries:
+        return []
+
+    uname = bot_username or "KoshBox_Bot"
+    active_group_id = user.get("active_group_id")
+    if active_group_id and not await db.is_vault_in_group(
+        user["vault_id"], active_group_id
+    ):
+        active_group_id = None
+        await db.set_active_group(user["user_id"], None)
+
+    # Pass 1: Check duplicates in vault & deduplicate within the same burst
+    resolved_by_idx: dict[int, dict[str, Any]] = {}
+    seen_new_uniques: dict[str, int] = {}  # file_unique_id -> first_idx
+    dup_of_first_idx: dict[int, int] = {}  # idx -> first_idx
+    to_forward_indices: list[int] = []
+
+    for idx, item in enumerate(sorted_entries):
+        meta = item["meta"]
+        f_uniq = meta["file_unique_id"]
+        existing = await db.find_duplicate(user["vault_id"], f_uniq)
+        if existing:
+            was_trashed = bool(existing.get("is_trashed"))
+            if was_trashed:
+                await db.restore_file(existing["id"])
+            target_file = await db.get_file(existing["id"])
+            if target_file is not None:
+                resolved_by_idx[idx] = {
+                    "status": "restored" if was_trashed else "dup",
+                    "file": target_file,
+                }
+            continue
+
+        if f_uniq in seen_new_uniques:
+            dup_of_first_idx[idx] = seen_new_uniques[f_uniq]
+            continue
+
+        seen_new_uniques[f_uniq] = idx
+        to_forward_indices.append(idx)
+
+    # Pass 2: Archive new files to DUMP_CHANNEL_ID in exact ascending `message_id` order
+    forward_batch_fn = getattr(bot, "forward_messages", None)
+    dumped_info_by_idx: dict[int, tuple[int, str]] = {}  # idx -> (dump_message_id, stored_file_id)
+    error_reported = False
+
+    # Group contiguous entries sharing the same `from_chat_id` (always 1 chat in private DM)
+    c_pos = 0
+    while c_pos < len(to_forward_indices):
+        first_msg: Message = sorted_entries[to_forward_indices[c_pos]]["message"]
+        from_chat_id = first_msg.chat.id
+        chunk_indices: list[int] = []
+        prev_mid = -1
+        while (
+            c_pos < len(to_forward_indices)
+            and len(chunk_indices) < BATCH_CHUNK_SIZE
+        ):
+            cand_idx = to_forward_indices[c_pos]
+            cand_msg: Message = sorted_entries[cand_idx]["message"]
+            if cand_msg.chat.id != from_chat_id or cand_msg.message_id <= prev_mid:
+                break
+            chunk_indices.append(cand_idx)
+            prev_mid = cand_msg.message_id
+            c_pos += 1
+
+        if not chunk_indices:
+            # Safety guard if duplicate message_id ever appeared in mock/synthetic tests
+            chunk_indices = [to_forward_indices[c_pos]]
+            c_pos += 1
+
+        chunk_succeeded = False
+        if forward_batch_fn is not None and len(chunk_indices) > 1:
+            sorted_msg_ids_chunk = [
+                int(sorted_entries[i]["message"].message_id) for i in chunk_indices
+            ]
+            try:
+                fwd_res = await tg_retry_call(
+                    forward_batch_fn,
+                    chat_id=config.dump_channel_id,
+                    from_chat_id=from_chat_id,
+                    message_ids=sorted_msg_ids_chunk,
+                    disable_notification=True,
+                )
+                if fwd_res and len(fwd_res) == len(chunk_indices):
+                    parsed_pairs: list[tuple[int, int, str]] = []
+                    valid_all = True
+                    for sub_i, res_obj in enumerate(fwd_res):
+                        d_mid = _extract_msg_id(res_obj)
+                        if not d_mid:
+                            valid_all = False
+                            break
+                        orig_meta = sorted_entries[chunk_indices[sub_i]]["meta"]
+                        d_meta = (
+                            _extract_media(res_obj)
+                            if hasattr(res_obj, "audio")
+                            else None
+                        )
+                        s_fid = d_meta["file_id"] if d_meta else orig_meta["file_id"]
+                        parsed_pairs.append((chunk_indices[sub_i], d_mid, s_fid))
+                    if valid_all:
+                        for orig_i, d_mid, s_fid in parsed_pairs:
+                            dumped_info_by_idx[orig_i] = (d_mid, s_fid)
+                        chunk_succeeded = True
+            except Exception:
+                chunk_succeeded = False
+
+        if not chunk_succeeded:
+            # Sequential per-message fallback — strictly in ascending `message_id` order!
+            for orig_i in chunk_indices:
+                msg_obj: Message = sorted_entries[orig_i]["message"]
+                orig_meta = sorted_entries[orig_i]["meta"]
+                try:
+                    dumped = await tg_retry_call(
+                        bot.forward_message,
+                        chat_id=config.dump_channel_id,
+                        from_chat_id=msg_obj.chat.id,
+                        message_id=msg_obj.message_id,
+                    )
+                except Exception as exc:
+                    if not error_reported:
+                        error_reported = True
+                        await tg_retry_call(
+                            msg_obj.reply,
+                            f"⚠️ <b>Dump Channel Error</b>\n"
+                            f"<blockquote>Make @{esc(uname)} Admin with Post Messages permission.</blockquote>\n"
+                            f"<code>{esc(str(exc))}</code>",
+                        )
+                    continue
+                if dumped is None:
+                    continue
+                d_mid = _extract_msg_id(dumped)
+                if not d_mid:
+                    continue
+                dumped_meta = (
+                    _extract_media(dumped) if hasattr(dumped, "audio") else None
+                )
+                stored_file_id = (
+                    dumped_meta["file_id"] if dumped_meta else orig_meta["file_id"]
+                )
+                dumped_info_by_idx[orig_i] = (d_mid, stored_file_id)
+
+    # Pass 3: Persist into `files` in exact ascending `message.message_id` order
+    for orig_i in to_forward_indices:
+        if orig_i not in dumped_info_by_idx:
+            continue
+        d_mid, stored_file_id = dumped_info_by_idx[orig_i]
+        meta = sorted_entries[orig_i]["meta"]
+        saved = await db.add_file(
+            vault_id=user["vault_id"],
+            uploader_user_id=user["user_id"],
+            group_id=active_group_id,
+            media_type=meta["media_type"],
+            file_id=stored_file_id,
+            file_unique_id=meta["file_unique_id"],
+            dump_message_id=d_mid,
+            title=meta["title"],
+            performer=meta["performer"],
+            file_name=meta["file_name"],
+            mime_type=meta["mime_type"],
+            file_size=meta["file_size"],
+            duration=meta["duration"],
+            caption=meta["caption"],
+            tags=meta["tags"],
+        )
+        if saved is not None:
+            resolved_by_idx[orig_i] = {"status": "saved", "file": saved}
+
+    for dup_i, first_i in dup_of_first_idx.items():
+        first_res = resolved_by_idx.get(first_i)
+        if first_res is not None:
+            resolved_by_idx[dup_i] = {"status": "dup", "file": first_res["file"]}
+
+    results: list[dict[str, Any]] = []
+    for idx in range(len(sorted_entries)):
+        if idx in resolved_by_idx:
+            results.append(resolved_by_idx[idx])
+    return results
+
+
+async def _queue_user_drop(
+    user_id: int,
+    raw_entry: dict[str, Any],
+    bot: Bot,
+    db: Database,
+    config: Config,
     bot_username: str = "KoshBox_Bot",
 ) -> None:
     """
     Sliding-window coalescer for all incoming user drops outside Pack Builder:
-    - 1 file dropped alone -> sends standard single-file receipt card (or 1-line Bulk receipt).
-    - 2 or more files dropped/forwarded together (even 100+ files!) -> automatically
-      saves all of them into ONE Pack and sends ONE clean Pack Share Link card!
+    - Buffers incoming media messages BEFORE forwarding them to `DUMP_CHANNEL_ID` so
+      concurrent handler invocations can never race `forward_message` out of order!
+    - On flush, sorts buffered messages strictly by `message.message_id` ascending (1 -> N),
+      archives them sequentially/batch via `forward_messages`, and creates the Pack in exact order.
     """
     async with _get_drop_lock(user_id):
         buf = _USER_DROP_BUFFER.setdefault(user_id, [])
         if len(buf) < 500:
-            buf.append(entry)
+            buf.append(raw_entry)
         prev_task = _USER_DROP_TASKS.get(user_id)
         if prev_task and not prev_task.done():
             prev_task.cancel()
         _USER_DROP_TASKS[user_id] = asyncio.create_task(
-            _flush_user_drop(user_id, anchor_message, bot, db, bot_username)
+            _flush_user_drop(user_id, bot, db, config, bot_username)
         )
 
 
 async def _flush_user_drop(
     user_id: int,
-    anchor_message: Message,
     bot: Bot,
     db: Database,
+    config: Config,
     bot_username: str = "KoshBox_Bot",
 ) -> None:
     try:
@@ -293,18 +509,28 @@ async def _flush_user_drop(
         return
 
     async with _get_drop_lock(user_id):
-        items = _USER_DROP_BUFFER.pop(user_id, [])
+        raw_items = _USER_DROP_BUFFER.pop(user_id, [])
         _USER_DROP_TASKS.pop(user_id, None)
     if not _USER_DROP_BUFFER.get(user_id) and user_id not in _USER_DROP_TASKS:
         _USER_DROP_LOCKS.pop(user_id, None)
 
-    if not items:
+    if not raw_items:
         return
+
+    # Sort buffered messages strictly by `message.message_id` ascending (exact forward order!)
+    sorted_raw = sorted(raw_items, key=lambda e: int(e["message"].message_id))
+    anchor_message: Message = sorted_raw[-1]["message"]
 
     user = await db.get_user(user_id)
     if not user:
         return
     uname = bot_username or "KoshBox_Bot"
+
+    items = await _archive_sorted_entries(
+        sorted_raw, user, bot, db, config, bot_username=uname
+    )
+    if not items:
+        return
 
     # Case 1: Exactly ONE file sent -> keep crisp single-file behavior
     if len(items) == 1:
@@ -423,87 +649,26 @@ async def handle_media_upload(
     in_pack_builder = cur_state == PackStates.collecting_items.state
     uname = bot_username or "KoshBox_Bot"
 
-    existing = await db.find_duplicate(user["vault_id"], meta["file_unique_id"])
-
-    if existing:
-        was_trashed = bool(existing.get("is_trashed"))
-        if was_trashed:
-            await db.restore_file(existing["id"])
-        target_file = await db.get_file(existing["id"])
-        assert target_file is not None
-
-        if in_pack_builder:
-            await _append_to_pack_builder(message, state, bot, target_file)
-            return
-
-        await _queue_user_drop(
-            user["user_id"],
-            {"status": "restored" if was_trashed else "dup", "file": target_file},
-            message,
-            bot,
-            db,
-            uname,
-        )
-        return
-
-    # Forward to dump channel for permanent Telegram cloud storage (FloodWait-safe)
-    try:
-        dumped = await tg_retry_call(
-            bot.forward_message,
-            chat_id=config.dump_channel_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
-    except Exception as exc:
-        await tg_retry_call(
-            message.reply,
-            f"⚠️ <b>Dump Channel Error</b>\n"
-            f"<blockquote>Make @{esc(uname)} Admin with Post Messages permission.</blockquote>\n"
-            f"<code>{esc(str(exc))}</code>",
-        )
-        return
-
-    if dumped is None:
-        return
-
-    dumped_meta = _extract_media(dumped)
-    stored_file_id = dumped_meta["file_id"] if dumped_meta else meta["file_id"]
-
-    active_group_id = user.get("active_group_id")
-    if active_group_id and not await db.is_vault_in_group(
-        user["vault_id"], active_group_id
-    ):
-        active_group_id = None
-        await db.set_active_group(user["user_id"], None)
-
-    saved = await db.add_file(
-        vault_id=user["vault_id"],
-        uploader_user_id=user["user_id"],
-        group_id=active_group_id,
-        media_type=meta["media_type"],
-        file_id=stored_file_id,
-        file_unique_id=meta["file_unique_id"],
-        dump_message_id=dumped.message_id,
-        title=meta["title"],
-        performer=meta["performer"],
-        file_name=meta["file_name"],
-        mime_type=meta["mime_type"],
-        file_size=meta["file_size"],
-        duration=meta["duration"],
-        caption=meta["caption"],
-        tags=meta["tags"],
-    )
+    raw_entry = {"message": message, "meta": meta}
 
     if in_pack_builder:
-        await _append_to_pack_builder(message, state, bot, saved)
+        await _queue_pack_builder_item(
+            user["user_id"],
+            raw_entry,
+            state,
+            bot,
+            db,
+            config,
+            bot_username=uname,
+        )
         return
 
     await _queue_user_drop(
         user["user_id"],
-        {"status": "saved", "file": saved},
-        message,
+        raw_entry,
         bot,
         db,
+        config,
         uname,
     )
 
@@ -525,7 +690,9 @@ def _build_live_pack_status_card(
 
     recent_lines = [f"• {esc(t[:36])}" for t in recent_titles[-4:]]
     if fids_count > len(recent_lines):
-        recent_lines.insert(0, f"<i>…+{fids_count - len(recent_lines)} earlier file(s)</i>")
+        recent_lines.insert(
+            0, f"<i>…+{fids_count - len(recent_lines)} earlier file(s)</i>"
+        )
     preview = "\n".join(recent_lines) if recent_lines else "<i>Waiting for files…</i>"
 
     text = (
@@ -552,43 +719,107 @@ def _build_live_pack_status_card(
     return text, kb
 
 
-async def _append_to_pack_builder(
-    message: Message,
+async def _drain_pack_builder_buffer_locked(
+    user_id: int,
     state: FSMContext,
     bot: Bot,
-    file_row: dict[str, Any],
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     """
-    Appends a file to the active Pack Builder session WITHOUT sending 100 separate messages!
-    Debounces updates and edits a SINGLE live status card in-place.
+    Flushes any buffered incoming messages for `user_id` inside `_get_builder_lock(user_id)`:
+    sorts strictly by `message.message_id` ascending, archives to `DUMP_CHANNEL_ID` in exact
+    order, and appends the resulting `file_id`s into FSM `pack_file_ids`.
     """
-    if not message.from_user:
+    raw_items = _PACK_BUILDER_BUFFER.pop(user_id, [])
+    if not raw_items:
         return
-    uid = message.from_user.id
 
-    async with _get_builder_lock(uid):
-        data = await state.get_data()
-        fids: list[int] = list(data.get("pack_file_ids") or [])
-        total_sz = int(data.get("pack_total_size") or 0)
-        recent: list[str] = list(data.get("pack_recent_titles") or [])
+    user = await db.get_user(user_id)
+    if not user:
+        return
 
+    sorted_raw = sorted(raw_items, key=lambda e: int(e["message"].message_id))
+    archived = await _archive_sorted_entries(
+        sorted_raw, user, bot, db, config, bot_username=bot_username
+    )
+    if not archived:
+        return
+
+    data = await state.get_data()
+    fids: list[int] = list(data.get("pack_file_ids") or [])
+    total_sz = int(data.get("pack_total_size") or 0)
+    recent: list[str] = list(data.get("pack_recent_titles") or [])
+
+    changed = False
+    for entry in archived:
+        file_row = entry["file"]
         if file_row["id"] not in fids:
             fids.append(file_row["id"])
             total_sz += int(file_row.get("file_size") or 0)
             icon = MEDIA_ICONS.get(file_row["media_type"], "📦")
             recent.append(f"{icon} {file_row['title']}")
-            recent = recent[-5:]
-            await state.update_data(
-                pack_file_ids=fids,
-                pack_total_size=total_sz,
-                pack_recent_titles=recent,
-            )
+            changed = True
 
-        prev_task = _PACK_BUILDER_TASKS.get(uid)
+    if changed:
+        recent = recent[-5:]
+        await state.update_data(
+            pack_file_ids=fids,
+            pack_total_size=total_sz,
+            pack_recent_titles=recent,
+        )
+
+
+async def flush_pending_pack_builder_uploads(
+    user_id: int,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    config: Optional[Config] = None,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    """
+    Ensures any still-buffered Pack Builder drops are archived & ordered BEFORE `/done`
+    or `✓ Finish Pack` reads `pack_file_ids`, even if the user taps Finish immediately!
+    """
+    if config is None:
+        return
+    async with _get_builder_lock(user_id):
+        prev_task = _PACK_BUILDER_TASKS.pop(user_id, None)
         if prev_task and not prev_task.done():
             prev_task.cancel()
-        _PACK_BUILDER_TASKS[uid] = asyncio.create_task(
-            _flush_pack_builder_status(uid, message.chat.id, state, bot)
+        await _drain_pack_builder_buffer_locked(
+            user_id, state, bot, db, config, bot_username=bot_username
+        )
+
+
+async def _queue_pack_builder_item(
+    user_id: int,
+    raw_entry: dict[str, Any],
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
+) -> None:
+    """
+    Buffers incoming Pack Builder media messages BEFORE forwarding to `DUMP_CHANNEL_ID`,
+    sorts them by `message.message_id` ascending on debounce flush, and edits a SINGLE
+    live status card in-place (zero spam, 100% deterministic order).
+    """
+    chat_id = raw_entry["message"].chat.id
+    async with _get_builder_lock(user_id):
+        buf = _PACK_BUILDER_BUFFER.setdefault(user_id, [])
+        if len(buf) < 500:
+            buf.append(raw_entry)
+        prev_task = _PACK_BUILDER_TASKS.get(user_id)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        _PACK_BUILDER_TASKS[user_id] = asyncio.create_task(
+            _flush_pack_builder_status(
+                user_id, chat_id, state, bot, db, config, bot_username
+            )
         )
 
 
@@ -597,6 +828,9 @@ async def _flush_pack_builder_status(
     chat_id: int,
     state: FSMContext,
     bot: Bot,
+    db: Database,
+    config: Config,
+    bot_username: str = "KoshBox_Bot",
 ) -> None:
     try:
         await asyncio.sleep(PACK_STATUS_DEBOUNCE_SECONDS)
@@ -608,7 +842,12 @@ async def _flush_pack_builder_status(
             _PACK_BUILDER_TASKS.pop(user_id, None)
             cur_state = await state.get_state()
             if cur_state != PackStates.collecting_items.state:
+                _PACK_BUILDER_BUFFER.pop(user_id, None)
                 return
+
+            await _drain_pack_builder_buffer_locked(
+                user_id, state, bot, db, config, bot_username=bot_username
+            )
 
             data = await state.get_data()
             fids: list[int] = list(data.get("pack_file_ids") or [])
@@ -650,5 +889,8 @@ async def _flush_pack_builder_status(
             if sent and getattr(sent, "message_id", None):
                 await state.update_data(pack_status_msg_id=sent.message_id)
     finally:
-        if user_id not in _PACK_BUILDER_TASKS:
+        if (
+            user_id not in _PACK_BUILDER_TASKS
+            and not _PACK_BUILDER_BUFFER.get(user_id)
+        ):
             _PACK_BUILDER_LOCKS.pop(user_id, None)
