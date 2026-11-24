@@ -1,3 +1,4 @@
+import logging
 import asyncio
 import html
 import time
@@ -194,23 +195,26 @@ async def tg_retry_call(coro_factory, *args, max_retries: int = 4, **kwargs):
     2. Automatic `reply_markup` style/CopyText downgrade fallback if a Bot API proxy or client
        rejects Bot API 9.4 button styles.
     """
-    for attempt in range(max_retries):
+    markup_downgrade_level = 0
+    for attempt in range(max_retries + 2):
         try:
             return await coro_factory(*args, **kwargs)
         except TelegramRetryAfter as exc:
             wait_s = min(max(float(exc.retry_after), 0.5), 45.0) + 0.25
-            if attempt + 1 >= max_retries:
+            if attempt + 1 >= max_retries + 2:
                 raise
             await asyncio.sleep(wait_s)
         except TelegramBadRequest as exc:
             rm = kwargs.get("reply_markup")
-            if rm is not None and _is_markup_bad_request(exc):
-                plain_rm = downgrade_reply_markup(rm, drop_copy_text=False)
-                try:
-                    return await coro_factory(*args, **{**kwargs, "reply_markup": plain_rm})
-                except TelegramBadRequest:
-                    safe_rm = downgrade_reply_markup(rm, drop_copy_text=True)
-                    return await coro_factory(*args, **{**kwargs, "reply_markup": safe_rm})
+            if rm is not None and _is_markup_bad_request(exc) and markup_downgrade_level < 2:
+                markup_downgrade_level += 1
+                kwargs = {
+                    **kwargs,
+                    "reply_markup": downgrade_reply_markup(
+                        rm, drop_copy_text=(markup_downgrade_level >= 2)
+                    ),
+                }
+                continue
             raise
     return None
 
@@ -347,9 +351,9 @@ def build_trial_locked_card(
     """
     sub = f"\n📄 <b>{esc(title[:40])}</b>" if title else ""
     text = (
-        f"🔒 <b>Trial Access Ended</b>{sub}\n"
-        f"<blockquote>You already used your free preview for this link.\n"
-        f"Tap below to request full access or message the owner.</blockquote>"
+        f"🔒 <b>Free Preview Already Used</b>{sub}\n"
+        f"<blockquote>This link allows <b>1 preview per person</b>.\n"
+        f"Tap <b>🔓 Request Full Access</b> below for permanent, unrestricted access.</blockquote>"
     )
     return text, build_contact_owner_kb(
         contact_url, request_access_cb=request_access_cb
@@ -361,9 +365,9 @@ def build_trial_expiry_notice_text(title: str = "", ttl_seconds: int = 0) -> str
     dur = f" ({format_ttl_short(ttl_seconds)})" if ttl_seconds > 0 else ""
     label = f" for <b>{esc(title[:36])}</b>" if title else ""
     return (
-        f"⏱ <b>Trial Session Ended</b>\n"
-        f"<blockquote>Your preview{label}{dur} was cleared automatically.\n"
-        f"Tap below for permanent full access or to contact the owner.</blockquote>"
+        f"⏱ <b>Preview Timer Ended</b>\n"
+        f"<blockquote>Your temporary preview{label}{dur} was automatically cleared.\n"
+        f"Want permanent access? Tap below to unlock or message the owner.</blockquote>"
     )
 
 
@@ -435,7 +439,7 @@ async def batch_delete_chat_messages(
                 pass
         for mid in chunk:
             try:
-                await bot.delete_message(chat_id=chat_id, message_id=mid)
+                await tg_retry_call(bot.delete_message, chat_id=chat_id, message_id=mid)
                 deleted_total += 1
             except Exception:
                 pass
@@ -449,11 +453,18 @@ async def execute_due_scheduled_deletes(bot: Bot, db: Any, limit: int = 50) -> i
     2. Sends optional post-expiry notice card with the owner's `💬 Contact Owner` primary button.
     Returns count of processed batch jobs.
     """
-    due_rows = await db.pop_due_scheduled_deletes(limit=limit)
+    use_deferred_delete = hasattr(db, "get_due_scheduled_deletes") and hasattr(
+        db, "delete_scheduled_delete"
+    )
+    if use_deferred_delete:
+        due_rows = await db.get_due_scheduled_deletes(limit=limit)
+    else:
+        due_rows = await db.pop_due_scheduled_deletes(limit=limit)
     if not due_rows:
         return 0
 
     for job in due_rows:
+        job_id = job.get("id")
         chat_id = int(job["chat_id"])
         msg_ids: list[int] = job.get("message_ids") or []
         notify_text = (job.get("notify_text") or "").strip()
@@ -461,31 +472,39 @@ async def execute_due_scheduled_deletes(bot: Bot, db: Any, limit: int = 50) -> i
         ltype = (job.get("link_type") or "").strip()
         lid = int(job.get("link_id") or 0)
 
+        skip_delivery = False
         if ltype in ("file", "pack") and lid > 0 and hasattr(db, "has_active_access_grant"):
             try:
                 if await db.has_active_access_grant(ltype, lid, chat_id):
-                    continue
+                    skip_delivery = True
             except Exception:
                 pass
 
-        if msg_ids:
-            await batch_delete_chat_messages(bot, chat_id, msg_ids)
+        if not skip_delivery:
+            if msg_ids:
+                await batch_delete_chat_messages(bot, chat_id, msg_ids)
 
-        if notify_text:
-            req_cb: Optional[str] = None
-            if ltype == "file" and lid > 0:
-                req_cb = f"req:f:{lid}"
-            elif ltype == "pack" and lid > 0:
-                req_cb = f"req:p:{lid}"
-            kb = build_contact_owner_kb(contact_url, request_access_cb=req_cb)
+            if notify_text:
+                req_cb: Optional[str] = None
+                if ltype == "file" and lid > 0:
+                    req_cb = f"req:f:{lid}"
+                elif ltype == "pack" and lid > 0:
+                    req_cb = f"req:p:{lid}"
+                kb = build_contact_owner_kb(contact_url, request_access_cb=req_cb)
+                try:
+                    await tg_retry_call(
+                        bot.send_message,
+                        chat_id=chat_id,
+                        text=notify_text,
+                        reply_markup=kb,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+
+        if use_deferred_delete and job_id is not None:
             try:
-                await tg_retry_call(
-                    bot.send_message,
-                    chat_id=chat_id,
-                    text=notify_text,
-                    reply_markup=kb,
-                    disable_web_page_preview=True,
-                )
+                await db.delete_scheduled_delete(int(job_id))
             except Exception:
                 pass
     return len(due_rows)
@@ -688,6 +707,33 @@ async def safe_edit_or_send(
         await _do_edit()
 
 
+_fmt_logger = logging.getLogger("koshbox.formatters")
+
+
+def esc_truncate(raw: str, max_escaped_len: int) -> str:
+    """
+    Escapes raw text for Telegram HTML and truncates safely BEFORE escaping
+    so HTML entities (`&amp;`, `&lt;`) and surrounding tags are NEVER bisected.
+    """
+    text = str(raw or "")
+    if max_escaped_len <= 0:
+        return ""
+    escaped = esc(text)
+    if len(escaped) <= max_escaped_len:
+        return escaped
+    if max_escaped_len <= 1:
+        return "…"
+    budget = max_escaped_len - 1
+    lo, hi = 0, min(len(text), budget)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(esc(text[:mid])) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return esc(text[:lo]) + "…"
+
+
 async def send_stored_media(
     bot: Bot,
     chat_id: int,
@@ -709,21 +755,30 @@ async def send_stored_media(
     Delivers any archived vault item into a chat.
     Safely escapes raw user captions so `<` or `&` in filenames/captions NEVER break HTML parse_mode!
     """
-    if custom_caption is not None:
-        caption = custom_caption
-    elif file_row.get("caption"):
-        caption = esc(file_row["caption"])
-    else:
-        caption = f"📦 <b>{esc(file_row['title'])}</b>"
-
+    suffix_parts: list[str] = []
     if extra_note and file_row["media_type"] not in ("sticker", "video_note"):
-        caption = f"{caption}\n<i>{esc(extra_note)}</i>"
+        suffix_parts.append(f"\n<i>{esc(extra_note)}</i>")
     if auto_delete_ttl > 0 and file_row["media_type"] not in ("sticker", "video_note"):
-        caption = f"{caption}\n<i>⏱ Auto-deletes in {format_ttl_short(auto_delete_ttl)}</i>"
+        suffix_parts.append(f"\n<i>⏱ Auto-deletes in {format_ttl_short(auto_delete_ttl)}</i>")
+    suffix = "".join(suffix_parts)
 
-    # Guard against Telegram's 1024-character media caption limit
-    if len(caption) > 1020:
-        caption = caption[:1015] + "…"
+    # Guard against Telegram's 1024-character media caption limit WITHOUT splitting HTML tags/entities
+    max_body_len = max(64, 1020 - len(suffix))
+    if custom_caption is not None:
+        if len(custom_caption) <= max_body_len:
+            body = custom_caption
+        else:
+            # Fallback to plain-escaped truncation if a custom HTML caption exceeds budget
+            body = esc_truncate(custom_caption, max_body_len)
+    elif file_row.get("caption"):
+        body = esc_truncate(str(file_row["caption"]), max_body_len)
+    else:
+        title_budget = max(16, max_body_len - len("📦 <b></b>"))
+        body = f"📦 <b>{esc_truncate(str(file_row.get('title') or 'Untitled'), title_budget)}</b>"
+
+    caption = f"{body}{suffix}"
+    if len(caption) > 1024:
+        caption = body[:1020]
 
     mtype = file_row["media_type"]
     fid = file_row["file_id"]
@@ -774,7 +829,8 @@ async def send_stored_media(
                 message_effect_id=message_effect_id,
                 **rm_kwargs,
             )
-    except Exception:
+    except Exception as exc:
+        _fmt_logger.warning("send_stored_media failed (file_id=%s, type=%s): %s", file_row.get("id"), mtype, exc)
         return None
 
     if sent and auto_delete_ttl > 0:

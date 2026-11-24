@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -33,7 +34,7 @@ def normalize_contact_url(raw: Optional[str]) -> str:
     low = val.lower()
     if low.startswith("http://t.me/") or low.startswith("https://t.me/") or low.startswith("http://telegram.me/") or low.startswith("https://telegram.me/"):
         path = val.split("://", 1)[1].split("/", 1)[1].strip() if "/" in val.split("://", 1)[1] else ""
-        if not path:
+        if not path or any(ch.isspace() for ch in path):
             return ""
         clean_path = path.split("?")[0].strip("/")
         if clean_path.startswith("+") and len(clean_path) > 2:
@@ -123,6 +124,7 @@ class Database:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.conn: Optional[aiosqlite.Connection] = None
+        self._write_lock: asyncio.Lock = asyncio.Lock()
         # Bounded user cache (maxsize=2000, ttl=120s) + last_seen write throttle + UI asset cache
         self._user_cache: TTLCache[int, dict[str, Any]] = TTLCache(maxsize=2000, ttl=120.0)
         self._last_seen_written: TTLCache[int, float] = TTLCache(maxsize=5000, ttl=600.0)
@@ -170,6 +172,7 @@ class Database:
             """
             CREATE TABLE IF NOT EXISTS vaults (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id INTEGER DEFAULT NULL,
                 created_at INTEGER NOT NULL
             );
 
@@ -451,6 +454,24 @@ class Database:
                 "ALTER TABLE files ADD COLUMN auto_delete_ttl INTEGER DEFAULT 0;"
             )
 
+        vault_cols = await _table_cols("vaults")
+        if "owner_user_id" not in vault_cols:
+            await self.conn.execute(
+                "ALTER TABLE vaults ADD COLUMN owner_user_id INTEGER DEFAULT NULL;"
+            )
+            await self.conn.execute(
+                """
+                UPDATE vaults
+                SET owner_user_id = (
+                    SELECT u.user_id FROM users u
+                    WHERE u.vault_id = vaults.id
+                    ORDER BY u.created_at ASC, u.user_id ASC
+                    LIMIT 1
+                )
+                WHERE owner_user_id IS NULL
+                """
+            )
+
         pack_cols = await _table_cols("packs")
         if "description" not in pack_cols:
             await self.conn.execute(
@@ -645,18 +666,32 @@ class Database:
             self._user_cache.set(user_id, user)
             return dict(user)
 
-        v_cur = await self.conn.execute(
-            "INSERT INTO vaults (created_at) VALUES (?)", (now,)
-        )
-        vault_id = v_cur.lastrowid
-        await self.conn.execute(
-            """
-            INSERT INTO users (user_id, username, full_name, vault_id, created_at, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, uname, fname, vault_id, now, now),
-        )
-        await self.conn.commit()
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            )
+            existing = await cur.fetchone()
+            if existing:
+                user = dict(existing)
+                self._user_cache.set(user_id, user)
+                return dict(user)
+            try:
+                v_cur = await self.conn.execute(
+                    "INSERT INTO vaults (owner_user_id, created_at) VALUES (?, ?)",
+                    (user_id, now),
+                )
+                vault_id = v_cur.lastrowid
+                await self.conn.execute(
+                    """
+                    INSERT INTO users (user_id, username, full_name, vault_id, created_at, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, uname, fname, vault_id, now, now),
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         cur = await self.conn.execute(
             "SELECT * FROM users WHERE user_id = ?", (user_id,)
         )
@@ -752,7 +787,7 @@ class Database:
         accounts: list[dict[str, Any]] = []
         if preferred_user_id:
             pref = await self.get_user(preferred_user_id)
-            if pref:
+            if pref and pref.get("vault_id") == vault_id:
                 accounts.append(pref)
         vault_users = await self.get_linked_accounts(vault_id)
         seen_uids = {u["user_id"] for u in accounts}
@@ -891,67 +926,147 @@ class Database:
         await self.conn.commit()
         return cur.rowcount > 0
 
+    async def revert_link_request_to_pending(self, code: str) -> bool:
+        assert self.conn is not None
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE link_requests
+                SET status = 'pending',
+                    requester_user_id = NULL,
+                    requester_name = '',
+                    requester_username = ''
+                WHERE code = ? AND status = 'awaiting_approval'
+                """,
+                (code.upper(),),
+            )
+            await self.conn.commit()
+            return cur.rowcount > 0
+
+    async def get_vault_owner_id(self, vault_id: int) -> Optional[int]:
+        assert self.conn is not None
+        cur = await self.conn.execute(
+            "SELECT owner_user_id FROM vaults WHERE id = ?", (vault_id,)
+        )
+        row = await cur.fetchone()
+        if row and row["owner_user_id"] is not None:
+            return int(row["owner_user_id"])
+        linked = await self.get_linked_accounts(vault_id)
+        return int(linked[0]["user_id"]) if linked else None
+
     async def approve_link_request(
         self, code: str, approver_user_id: int
     ) -> Optional[dict[str, Any]]:
         assert self.conn is not None
         now = int(time.time())
-        req = await self.get_link_request(code)
-        if not req:
-            return None
-        if req["owner_user_id"] != approver_user_id:
-            return None
-        if req["status"] != "awaiting_approval" or req["expires_at"] < now:
-            return None
+        async with self._write_lock:
+            req = await self.get_link_request(code)
+            if not req:
+                return None
+            if req["owner_user_id"] != approver_user_id:
+                return None
+            if req["status"] != "awaiting_approval" or req["expires_at"] < now:
+                return None
 
-        requester_id = req["requester_user_id"]
-        target_vault_id = req["owner_vault_id"]
-        requester = await self.get_user(requester_id)
-        if not requester:
-            return None
+            approver = await self.get_user(approver_user_id)
+            if not approver or approver["vault_id"] != req["owner_vault_id"]:
+                return None
 
-        old_vault_id = requester["vault_id"]
-        if old_vault_id != target_vault_id:
-            await self.conn.execute(
-                """
-                UPDATE files SET vault_id = ?
-                WHERE vault_id = ?
-                  AND file_unique_id NOT IN (
-                      SELECT file_unique_id FROM files WHERE vault_id = ?
-                  )
-                """,
-                (target_vault_id, old_vault_id, target_vault_id),
-            )
-            await self.conn.execute(
-                "UPDATE groups SET owner_vault_id = ? WHERE owner_vault_id = ?",
-                (target_vault_id, old_vault_id),
-            )
-            await self.conn.execute(
-                "UPDATE packs SET vault_id = ? WHERE vault_id = ?",
-                (target_vault_id, old_vault_id),
-            )
-            await self.conn.execute(
-                """
-                INSERT OR IGNORE INTO group_members (group_id, vault_id, role, joined_at)
-                SELECT group_id, ?, role, joined_at FROM group_members WHERE vault_id = ?
-                """,
-                (target_vault_id, old_vault_id),
-            )
-            await self.conn.execute(
-                "DELETE FROM group_members WHERE vault_id = ?", (old_vault_id,)
-            )
-            await self.conn.execute(
-                "UPDATE users SET vault_id = ? WHERE vault_id = ?",
-                (target_vault_id, old_vault_id),
-            )
-            self._invalidate_vault_users(old_vault_id)
-            self._invalidate_vault_users(target_vault_id)
+            requester_id = req["requester_user_id"]
+            target_vault_id = approver["vault_id"]
+            requester = await self.get_user(requester_id)
+            if not requester:
+                return None
 
-        await self.conn.execute(
-            "UPDATE link_requests SET status = 'approved' WHERE code = ?",
-            (code.upper(),),
-        )
-        await self.conn.commit()
+            try:
+                claim_cur = await self.conn.execute(
+                    """
+                    UPDATE link_requests
+                    SET status = 'approved'
+                    WHERE code = ? AND status = 'awaiting_approval' AND expires_at >= ?
+                    """,
+                    (code.upper(), now),
+                )
+                if claim_cur.rowcount == 0:
+                    await self.conn.rollback()
+                    return None
+
+                old_vault_id = requester["vault_id"]
+                if old_vault_id != target_vault_id:
+                    dup_cur = await self.conn.execute(
+                        """
+                        SELECT old_f.id AS old_id, tgt_f.id AS tgt_id
+                        FROM files old_f
+                        JOIN files tgt_f
+                          ON tgt_f.vault_id = ?
+                         AND tgt_f.file_unique_id = old_f.file_unique_id
+                        WHERE old_f.vault_id = ?
+                        """,
+                        (target_vault_id, old_vault_id),
+                    )
+                    dup_pairs = [(int(r["old_id"]), int(r["tgt_id"])) for r in await dup_cur.fetchall()]
+                    for old_fid, tgt_fid in dup_pairs:
+                        await self.conn.execute(
+                            """
+                            INSERT OR IGNORE INTO pack_items (pack_id, file_id, position, pos)
+                            SELECT pack_id, ?, position, pos FROM pack_items WHERE file_id = ?
+                            """,
+                            (tgt_fid, old_fid),
+                        )
+                        await self.conn.execute(
+                            "DELETE FROM pack_items WHERE file_id = ?", (old_fid,)
+                        )
+                        await self.conn.execute(
+                            "DELETE FROM files_fts WHERE file_id = ?", (old_fid,)
+                        )
+                        await self.conn.execute(
+                            "DELETE FROM link_user_claims WHERE link_type = 'file' AND link_id = ?",
+                            (old_fid,),
+                        )
+                        await self.conn.execute(
+                            "DELETE FROM link_access_grants WHERE link_type = 'file' AND link_id = ?",
+                            (old_fid,),
+                        )
+                        await self.conn.execute(
+                            "DELETE FROM files WHERE id = ?", (old_fid,)
+                        )
+
+                    await self.conn.execute(
+                        "UPDATE files SET vault_id = ? WHERE vault_id = ?",
+                        (target_vault_id, old_vault_id),
+                    )
+                    await self.conn.execute(
+                        "UPDATE groups SET owner_vault_id = ? WHERE owner_vault_id = ?",
+                        (target_vault_id, old_vault_id),
+                    )
+                    await self.conn.execute(
+                        "UPDATE packs SET vault_id = ? WHERE vault_id = ?",
+                        (target_vault_id, old_vault_id),
+                    )
+                    await self.conn.execute(
+                        """
+                        INSERT INTO group_members (group_id, vault_id, role, joined_at)
+                        SELECT group_id, ?, role, joined_at FROM group_members WHERE vault_id = ?
+                        ON CONFLICT(group_id, vault_id) DO UPDATE SET
+                            role = CASE WHEN excluded.role = 'owner' THEN 'owner' ELSE group_members.role END
+                        """,
+                        (target_vault_id, old_vault_id),
+                    )
+                    await self.conn.execute(
+                        "DELETE FROM group_members WHERE vault_id = ?", (old_vault_id,)
+                    )
+                    await self.conn.execute(
+                        "UPDATE users SET vault_id = ? WHERE vault_id = ?",
+                        (target_vault_id, old_vault_id),
+                    )
+                    self._invalidate_vault_users(old_vault_id)
+                    self._invalidate_vault_users(target_vault_id)
+
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+
         self._invalidate_user(requester_id)
         self._invalidate_user(approver_user_id)
         return req
@@ -970,23 +1085,46 @@ class Database:
         await self.conn.commit()
         return req
 
-    async def unlink_account(self, target_user_id: int, vault_id: int) -> bool:
+    async def unlink_account(
+        self,
+        target_user_id: int,
+        vault_id: int,
+        *,
+        actor_user_id: Optional[int] = None,
+    ) -> bool:
         assert self.conn is not None
-        linked = await self.get_linked_accounts(vault_id)
-        if len(linked) <= 1:
-            return False
-        if not any(u["user_id"] == target_user_id for u in linked):
-            return False
-        now = int(time.time())
-        v_cur = await self.conn.execute(
-            "INSERT INTO vaults (created_at) VALUES (?)", (now,)
-        )
-        new_vault_id = v_cur.lastrowid
-        await self.conn.execute(
-            "UPDATE users SET vault_id = ?, active_group_id = NULL WHERE user_id = ?",
-            (new_vault_id, target_user_id),
-        )
-        await self.conn.commit()
+        async with self._write_lock:
+            linked = await self.get_linked_accounts(vault_id)
+            if len(linked) <= 1:
+                return False
+            if not any(u["user_id"] == target_user_id for u in linked):
+                return False
+            owner_id = await self.get_vault_owner_id(vault_id)
+            if actor_user_id is not None:
+                if target_user_id != actor_user_id and actor_user_id != owner_id:
+                    return False
+            now = int(time.time())
+            try:
+                v_cur = await self.conn.execute(
+                    "INSERT INTO vaults (owner_user_id, created_at) VALUES (?, ?)",
+                    (target_user_id, now),
+                )
+                new_vault_id = v_cur.lastrowid
+                await self.conn.execute(
+                    "UPDATE users SET vault_id = ?, active_group_id = NULL WHERE user_id = ?",
+                    (new_vault_id, target_user_id),
+                )
+                if owner_id == target_user_id:
+                    remaining = [u["user_id"] for u in linked if u["user_id"] != target_user_id]
+                    new_owner = remaining[0] if remaining else None
+                    await self.conn.execute(
+                        "UPDATE vaults SET owner_user_id = ? WHERE id = ?",
+                        (new_owner, vault_id),
+                    )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         self._invalidate_user(target_user_id)
         return True
 
@@ -1113,12 +1251,23 @@ class Database:
         if not group:
             return "not_found"
         if group["owner_vault_id"] == vault_id:
-            await self.conn.execute(
-                "UPDATE users SET active_group_id = NULL WHERE active_group_id = ?",
-                (group_id,),
-            )
-            await self.conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
-            await self.conn.commit()
+            async with self._write_lock:
+                try:
+                    fcur = await self.conn.execute(
+                        "SELECT id FROM files WHERE group_id = ?", (group_id,)
+                    )
+                    affected_fids = [int(r["id"]) for r in await fcur.fetchall()]
+                    await self.conn.execute(
+                        "UPDATE users SET active_group_id = NULL WHERE active_group_id = ?",
+                        (group_id,),
+                    )
+                    await self.conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+                    for fid in affected_fids:
+                        await self._upsert_fts(fid)
+                    await self.conn.commit()
+                except Exception:
+                    await self.conn.rollback()
+                    raise
             self._user_cache.invalidate_where(
                 lambda _uid, row: row.get("active_group_id") == group_id
             )
@@ -1363,6 +1512,9 @@ class Database:
             return None
         token = _gen_token(10)
         owner = await self.get_user(f["uploader_user_id"])
+        if not owner or owner.get("vault_id") != f.get("vault_id"):
+            linked = await self.get_linked_accounts(int(f["vault_id"]))
+            owner = linked[0] if linked else None
         default_one_time = 1 if (owner and owner.get("default_one_time")) else 0
         default_protect = 1 if (owner and owner.get("protect_content")) else 0
         await self.conn.execute(
@@ -1459,6 +1611,22 @@ class Database:
         )
         await self.conn.commit()
 
+    async def try_increment_file_share_views(self, db_file_id: int) -> bool:
+        assert self.conn is not None
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE files
+                SET share_views = COALESCE(share_views, 0) + 1,
+                    use_count = use_count + 1
+                WHERE id = ?
+                  AND (COALESCE(share_max_views, 0) = 0 OR COALESCE(share_views, 0) < share_max_views)
+                """,
+                (db_file_id,),
+            )
+            await self.conn.commit()
+            return cur.rowcount > 0
+
     async def set_file_share_pin(self, db_file_id: int, pin: Optional[str]) -> bool:
         assert self.conn is not None
         hashed = hash_pin(pin) if (pin and pin.strip()) else ""
@@ -1521,19 +1689,37 @@ class Database:
         await self._upsert_fts(db_file_id)
         await self.conn.commit()
 
+    async def get_unreferenced_dump_message_ids(self, candidate_dump_ids: list[int]) -> list[int]:
+        assert self.conn is not None
+        clean = sorted({int(m) for m in candidate_dump_ids if m and int(m) > 0})
+        if not clean:
+            return []
+        placeholders = ",".join("?" for _ in clean)
+        cur = await self.conn.execute(
+            f"SELECT DISTINCT dump_message_id FROM files WHERE dump_message_id IN ({placeholders})",
+            clean,
+        )
+        still_used = {int(r["dump_message_id"]) for r in await cur.fetchall()}
+        return [m for m in clean if m not in still_used]
+
     async def delete_file(self, db_file_id: int) -> None:
         assert self.conn is not None
-        await self.conn.execute("DELETE FROM files WHERE id = ?", (db_file_id,))
-        await self.conn.execute("DELETE FROM files_fts WHERE file_id = ?", (db_file_id,))
-        await self.conn.execute(
-            "DELETE FROM link_user_claims WHERE link_type = 'file' AND link_id = ?",
-            (db_file_id,),
-        )
-        await self.conn.execute(
-            "DELETE FROM link_access_grants WHERE link_type = 'file' AND link_id = ?",
-            (db_file_id,),
-        )
-        await self.conn.commit()
+        async with self._write_lock:
+            try:
+                await self.conn.execute("DELETE FROM files WHERE id = ?", (db_file_id,))
+                await self.conn.execute("DELETE FROM files_fts WHERE file_id = ?", (db_file_id,))
+                await self.conn.execute(
+                    "DELETE FROM link_user_claims WHERE link_type = 'file' AND link_id = ?",
+                    (db_file_id,),
+                )
+                await self.conn.execute(
+                    "DELETE FROM link_access_grants WHERE link_type = 'file' AND link_id = ?",
+                    (db_file_id,),
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
 
     async def list_trashed_files(
         self, vault_id: int, limit: int = 20, offset: int = 0
@@ -1618,42 +1804,48 @@ class Database:
             one_time = 1 if (creator and creator.get("default_one_time")) else 0
         else:
             one_time = 1 if one_time_per_user else 0
-        cur = await self.conn.execute(
-            """
-            INSERT INTO packs (
-                vault_id, creator_user_id, title, description, share_token,
-                pin_hash, protect_content, expires_at, max_views, one_time_per_user,
-                auto_delete_ttl, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                vault_id,
-                creator_user_id,
-                title.strip() or "File Pack",
-                description.strip()[:300],
-                token,
-                pin_h,
-                1 if protect_content else 0,
-                exp,
-                max(0, int(max_views)),
-                one_time,
-                max(0, int(auto_delete_ttl)),
-                now,
-            ),
-        )
-        pack_id = cur.lastrowid
-        seen: set[int] = set()
-        pos_val = 0
-        for fid in file_ids:
-            if fid in seen:
-                continue
-            seen.add(fid)
-            pos_val += 1
-            await self.conn.execute(
-                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, position, pos) VALUES (?, ?, ?, ?)",
-                (pack_id, fid, pos_val, pos_val),
-            )
-        await self.conn.commit()
+        async with self._write_lock:
+            try:
+                cur = await self.conn.execute(
+                    """
+                    INSERT INTO packs (
+                        vault_id, creator_user_id, title, description, share_token,
+                        pin_hash, protect_content, expires_at, max_views, one_time_per_user,
+                        auto_delete_ttl, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        vault_id,
+                        creator_user_id,
+                        title.strip() or "File Pack",
+                        description.strip()[:300],
+                        token,
+                        pin_h,
+                        1 if protect_content else 0,
+                        exp,
+                        max(0, int(max_views)),
+                        one_time,
+                        max(0, int(auto_delete_ttl)),
+                        now,
+                    ),
+                )
+                pack_id = cur.lastrowid
+                seen: set[int] = set()
+                pos_val = 0
+                for fid in file_ids:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                    ins = await self.conn.execute(
+                        "INSERT OR IGNORE INTO pack_items (pack_id, file_id, position, pos) VALUES (?, ?, ?, ?)",
+                        (pack_id, fid, pos_val + 1, pos_val + 1),
+                    )
+                    if ins.rowcount > 0:
+                        pos_val += 1
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         res = await self.get_pack(pack_id)
         assert res is not None
         return res
@@ -1662,22 +1854,31 @@ class Database:
         self, pack_id: int, file_ids: list[int]
     ) -> Optional[dict[str, Any]]:
         assert self.conn is not None
-        cur = await self.conn.execute(
-            "SELECT COALESCE(MAX(position), 0) FROM pack_items WHERE pack_id = ?",
-            (pack_id,),
-        )
-        next_pos = int((await cur.fetchone())[0])
-        seen: set[int] = set()
-        for fid in file_ids:
-            if fid in seen:
-                continue
-            seen.add(fid)
-            next_pos += 1
-            await self.conn.execute(
-                "INSERT OR IGNORE INTO pack_items (pack_id, file_id, position, pos) VALUES (?, ?, ?, ?)",
-                (pack_id, fid, next_pos, next_pos),
-            )
-        await self.conn.commit()
+        async with self._write_lock:
+            pcur = await self.conn.execute("SELECT id FROM packs WHERE id = ?", (pack_id,))
+            if not await pcur.fetchone():
+                return None
+            try:
+                cur = await self.conn.execute(
+                    "SELECT COALESCE(MAX(position), 0) FROM pack_items WHERE pack_id = ?",
+                    (pack_id,),
+                )
+                next_pos = int((await cur.fetchone())[0])
+                seen: set[int] = set()
+                for fid in file_ids:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                    ins = await self.conn.execute(
+                        "INSERT OR IGNORE INTO pack_items (pack_id, file_id, position, pos) VALUES (?, ?, ?, ?)",
+                        (pack_id, fid, next_pos + 1, next_pos + 1),
+                    )
+                    if ins.rowcount > 0:
+                        next_pos += 1
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         return await self.get_pack(pack_id)
 
     async def natural_sort_pack_items(self, pack_id: int) -> int:
@@ -1688,32 +1889,37 @@ class Database:
         Returns the number of sorted items.
         """
         assert self.conn is not None
-        cur = await self.conn.execute(
-            """
-            SELECT pi.id AS item_id, pi.file_id, pi.position, f.caption, f.title, f.file_name
-            FROM pack_items pi
-            JOIN files f ON f.id = pi.file_id
-            WHERE pi.pack_id = ?
-            ORDER BY pi.position ASC, pi.id ASC
-            """,
-            (pack_id,),
-        )
-        rows = [dict(r) for r in await cur.fetchall()]
-        if not rows:
-            return 0
-
-        def _row_sort_key(r: dict[str, Any]):
-            label = (r.get("caption") or "").strip() or (r.get("title") or "").strip() or (r.get("file_name") or "").strip()
-            return (natural_sort_key(label), int(r["position"]), int(r["item_id"]))
-
-        sorted_rows = sorted(rows, key=_row_sort_key)
-        for new_pos, r in enumerate(sorted_rows, start=1):
-            await self.conn.execute(
-                "UPDATE pack_items SET position = ?, pos = ? WHERE id = ?",
-                (new_pos, new_pos, r["item_id"]),
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                """
+                SELECT pi.id AS item_id, pi.file_id, pi.position, f.caption, f.title, f.file_name
+                FROM pack_items pi
+                JOIN files f ON f.id = pi.file_id
+                WHERE pi.pack_id = ?
+                ORDER BY pi.position ASC, pi.id ASC
+                """,
+                (pack_id,),
             )
-        await self.conn.commit()
-        return len(sorted_rows)
+            rows = [dict(r) for r in await cur.fetchall()]
+            if not rows:
+                return 0
+
+            def _row_sort_key(r: dict[str, Any]):
+                label = (r.get("caption") or "").strip() or (r.get("title") or "").strip() or (r.get("file_name") or "").strip()
+                return (natural_sort_key(label), int(r["position"]), int(r["item_id"]))
+
+            sorted_rows = sorted(rows, key=_row_sort_key)
+            try:
+                for new_pos, r in enumerate(sorted_rows, start=1):
+                    await self.conn.execute(
+                        "UPDATE pack_items SET position = ?, pos = ? WHERE id = ?",
+                        (new_pos, new_pos, r["item_id"]),
+                    )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+            return len(sorted_rows)
 
     async def remove_file_from_pack(self, pack_id: int, file_id: int) -> bool:
         assert self.conn is not None
@@ -1817,11 +2023,30 @@ class Database:
         return [dict(r) for r in await cur.fetchall()]
 
     async def list_vault_packs(
-        self, vault_id: int, limit: int = 20, offset: int = 0
+        self,
+        vault_id: int,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        title_query: str = "",
+        only_non_empty: bool = False,
     ) -> list[dict[str, Any]]:
         assert self.conn is not None
+        conditions = ["p.vault_id = ?"]
+        params: list[Any] = [vault_id]
+        tq = (title_query or "").strip().lower()
+        if tq:
+            escaped_tq = self._escape_like(tq)
+            conditions.append("LOWER(p.title) LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped_tq}%")
+        if only_non_empty:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM pack_items pi JOIN files f ON f.id = pi.file_id "
+                "WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0)"
+            )
+        where_sql = " AND ".join(conditions)
         cur = await self.conn.execute(
-            """
+            f"""
             SELECT p.*,
                    (SELECT COUNT(*) FROM pack_items pi
                     JOIN files f ON f.id = pi.file_id
@@ -1830,11 +2055,11 @@ class Database:
                     JOIN files f ON f.id = pi.file_id
                     WHERE pi.pack_id = p.id AND COALESCE(f.is_trashed, 0) = 0) AS total_size
             FROM packs p
-            WHERE p.vault_id = ?
+            WHERE {where_sql}
             ORDER BY p.created_at DESC
             LIMIT ? OFFSET ?
             """,
-            (vault_id, limit, offset),
+            [*params, limit, offset],
         )
         return [dict(r) for r in await cur.fetchall()]
 
@@ -1971,6 +2196,9 @@ class Database:
         if per_link > 0:
             return per_link
         owner = await self.get_user(int(file_row["uploader_user_id"]))
+        if not owner or owner.get("vault_id") != file_row.get("vault_id"):
+            linked = await self.get_linked_accounts(int(file_row["vault_id"]))
+            owner = linked[0] if linked else None
         return resolve_effective_auto_delete_ttl(
             per_link, int((owner or {}).get("auto_delete_ttl") or 0)
         )
@@ -1986,6 +2214,9 @@ class Database:
         if per_link > 0:
             return per_link
         creator = await self.get_user(int(pack_row["creator_user_id"]))
+        if not creator or creator.get("vault_id") != pack_row.get("vault_id"):
+            linked = await self.get_linked_accounts(int(pack_row["vault_id"]))
+            creator = linked[0] if linked else None
         return resolve_effective_auto_delete_ttl(
             per_link, int((creator or {}).get("auto_delete_ttl") or 0)
         )
@@ -1997,21 +2228,44 @@ class Database:
         )
         await self.conn.commit()
 
+    async def try_increment_pack_views(self, pack_id: int) -> bool:
+        assert self.conn is not None
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                """
+                UPDATE packs
+                SET views = COALESCE(views, 0) + 1
+                WHERE id = ?
+                  AND (COALESCE(max_views, 0) = 0 OR COALESCE(views, 0) < max_views)
+                """,
+                (pack_id,),
+            )
+            await self.conn.commit()
+            return cur.rowcount > 0
+
     async def delete_pack(self, pack_id: int, vault_id: int) -> bool:
         assert self.conn is not None
-        cur = await self.conn.execute(
-            "DELETE FROM packs WHERE id = ? AND vault_id = ?", (pack_id, vault_id)
-        )
-        await self.conn.execute(
-            "DELETE FROM link_user_claims WHERE link_type = 'pack' AND link_id = ?",
-            (pack_id,),
-        )
-        await self.conn.execute(
-            "DELETE FROM link_access_grants WHERE link_type = 'pack' AND link_id = ?",
-            (pack_id,),
-        )
-        await self.conn.commit()
-        return cur.rowcount > 0
+        async with self._write_lock:
+            try:
+                cur = await self.conn.execute(
+                    "DELETE FROM packs WHERE id = ? AND vault_id = ?", (pack_id, vault_id)
+                )
+                if cur.rowcount == 0:
+                    await self.conn.rollback()
+                    return False
+                await self.conn.execute(
+                    "DELETE FROM link_user_claims WHERE link_type = 'pack' AND link_id = ?",
+                    (pack_id,),
+                )
+                await self.conn.execute(
+                    "DELETE FROM link_access_grants WHERE link_type = 'pack' AND link_id = ?",
+                    (pack_id,),
+                )
+                await self.conn.commit()
+                return True
+            except Exception:
+                await self.conn.rollback()
+                raise
 
     # -------------------- 1-TIME PER-USER TRIAL CLAIMS & SCHEDULED BATCH DELETES --------------------
 
@@ -2033,6 +2287,19 @@ class Database:
         )
         await self.conn.commit()
         return cur.rowcount > 0
+
+    async def release_link_claim(
+        self, link_type: str, link_id: int, user_id: int
+    ) -> bool:
+        """Rolls back a 1-time trial claim if delivery failed before sending any media."""
+        assert self.conn is not None
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                "DELETE FROM link_user_claims WHERE link_type = ? AND link_id = ? AND user_id = ?",
+                (link_type, int(link_id), int(user_id)),
+            )
+            await self.conn.commit()
+            return cur.rowcount > 0
 
     async def has_claimed_link(
         self, link_type: str, link_id: int, user_id: int
@@ -2224,10 +2491,10 @@ class Database:
         await self.conn.commit()
         return int(cur.lastrowid or 0)
 
-    async def pop_due_scheduled_deletes(
+    async def get_due_scheduled_deletes(
         self, now_ts: Optional[int] = None, limit: int = 50
     ) -> list[dict[str, Any]]:
-        """Fetches and atomically removes due auto-delete batches (`delete_at <= now`)."""
+        """Fetches due auto-delete batches (`delete_at <= now`) without deleting them until processed."""
         assert self.conn is not None
         now = int(time.time()) if now_ts is None else int(now_ts)
         cur = await self.conn.execute(
@@ -2243,13 +2510,6 @@ class Database:
             (now, limit),
         )
         rows = [dict(r) for r in await cur.fetchall()]
-        if rows:
-            ids = [r["id"] for r in rows]
-            placeholders = ",".join("?" for _ in ids)
-            await self.conn.execute(
-                f"DELETE FROM scheduled_deletes WHERE id IN ({placeholders})", ids
-            )
-            await self.conn.commit()
         for r in rows:
             try:
                 r["message_ids"] = [int(x) for x in json.loads(r["message_ids_json"])]
@@ -2257,7 +2517,103 @@ class Database:
                 r["message_ids"] = []
         return rows
 
+    async def delete_scheduled_delete(self, job_id: int) -> bool:
+        assert self.conn is not None
+        async with self._write_lock:
+            cur = await self.conn.execute(
+                "DELETE FROM scheduled_deletes WHERE id = ?", (int(job_id),)
+            )
+            await self.conn.commit()
+            return cur.rowcount > 0
+
+    async def pop_due_scheduled_deletes(
+        self, now_ts: Optional[int] = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Fetches and atomically removes due auto-delete batches (`delete_at <= now`)."""
+        assert self.conn is not None
+        async with self._write_lock:
+            rows = await self.get_due_scheduled_deletes(now_ts=now_ts, limit=limit)
+            if rows:
+                ids = [r["id"] for r in rows]
+                placeholders = ",".join("?" for _ in ids)
+                await self.conn.execute(
+                    f"DELETE FROM scheduled_deletes WHERE id IN ({placeholders})", ids
+                )
+                await self.conn.commit()
+            return rows
+
     # -------------------- INLINE & VAULT SEARCH --------------------
+
+    @staticmethod
+    def _escape_like(val: str) -> str:
+        return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def _build_search_where(
+        self,
+        vault_id: int,
+        *,
+        text_query: str = "",
+        media_type: Optional[str] = None,
+        group_name_filter: Optional[str] = None,
+        group_id_filter: Optional[int] = None,
+        tag_filter: Optional[str] = None,
+        only_favorites: bool = False,
+        include_fts: bool = True,
+    ) -> tuple[str, list[Any]]:
+        conditions = [
+            "COALESCE(f.is_trashed, 0) = 0",
+            "(f.vault_id = ? OR f.group_id IN (SELECT group_id FROM group_members WHERE vault_id = ?))",
+        ]
+        params: list[Any] = [vault_id, vault_id]
+
+        if media_type:
+            conditions.append("f.media_type = ?")
+            params.append(media_type)
+
+        if only_favorites:
+            conditions.append("f.is_favorite = 1")
+
+        if group_id_filter is not None:
+            conditions.append("f.group_id = ?")
+            params.append(group_id_filter)
+
+        if group_name_filter:
+            conditions.append("LOWER(COALESCE(g.name, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{self._escape_like(group_name_filter.lower())}%")
+
+        if tag_filter:
+            conditions.append("LOWER(f.tags) LIKE ? ESCAPE '\\'")
+            params.append(f"%{self._escape_like(tag_filter.lower())}%")
+
+        cleaned_text = text_query.strip()
+        if cleaned_text:
+            like_pattern = f"%{self._escape_like(cleaned_text.lower())}%"
+            like_clause = """(
+                LOWER(f.title) LIKE ? ESCAPE '\\'
+                OR LOWER(f.performer) LIKE ? ESCAPE '\\'
+                OR LOWER(f.file_name) LIKE ? ESCAPE '\\'
+                OR LOWER(f.caption) LIKE ? ESCAPE '\\'
+                OR LOWER(f.tags) LIKE ? ESCAPE '\\'
+                OR LOWER(f.media_type) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(g.name, '')) LIKE ? ESCAPE '\\'
+            )"""
+            sanitized_tokens = [
+                "".join(ch for ch in tok if ch not in ('"', "'", "\x00")).strip()
+                for tok in cleaned_text.split()
+            ]
+            fts_terms = [f'"{tok}"*' for tok in sanitized_tokens if tok]
+            if include_fts and fts_terms:
+                fts_query = " AND ".join(fts_terms)
+                conditions.append(
+                    f"(f.id IN (SELECT file_id FROM files_fts WHERE files_fts MATCH ?) OR {like_clause})"
+                )
+                params.append(fts_query)
+                params.extend([like_pattern] * 7)
+            else:
+                conditions.append(like_clause)
+                params.extend([like_pattern] * 7)
+
+        return " AND ".join(conditions), params
 
     async def count_files(
         self,
@@ -2269,38 +2625,44 @@ class Database:
         only_favorites: bool = False,
     ) -> int:
         assert self.conn is not None
-        conditions = [
-            "f.is_trashed = 0",
-            "(f.vault_id = ? OR f.group_id IN (SELECT group_id FROM group_members WHERE vault_id = ?))",
-        ]
-        params: list[Any] = [vault_id, vault_id]
-        if media_type:
-            conditions.append("f.media_type = ?")
-            params.append(media_type)
-        if only_favorites:
-            conditions.append("f.is_favorite = 1")
-        if group_id_filter is not None:
-            conditions.append("f.group_id = ?")
-            params.append(group_id_filter)
-
-        cleaned_text = text_query.strip()
-        if not cleaned_text:
-            where_sql = " AND ".join(conditions)
-            cur = await self.conn.execute(
-                f"SELECT COUNT(*) FROM files f WHERE {where_sql}", params
-            )
-            return int((await cur.fetchone())[0])
-
-        rows = await self.search_files(
+        where_sql, params = self._build_search_where(
             vault_id,
-            text_query=cleaned_text,
+            text_query=text_query,
             media_type=media_type,
             group_id_filter=group_id_filter,
             only_favorites=only_favorites,
-            limit=500,
-            offset=0,
+            include_fts=True,
         )
-        return len(rows)
+        try:
+            cur = await self.conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM files f
+                LEFT JOIN groups g ON g.id = f.group_id
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            return int((await cur.fetchone())[0])
+        except aiosqlite.OperationalError:
+            where_sql, params = self._build_search_where(
+                vault_id,
+                text_query=text_query,
+                media_type=media_type,
+                group_id_filter=group_id_filter,
+                only_favorites=only_favorites,
+                include_fts=False,
+            )
+            cur = await self.conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM files f
+                LEFT JOIN groups g ON g.id = f.group_id
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            return int((await cur.fetchone())[0])
 
     async def search_files(
         self,
@@ -2317,37 +2679,39 @@ class Database:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         assert self.conn is not None
-        base_conditions = [
-            "f.is_trashed = 0",
-            "(f.vault_id = ? OR f.group_id IN (SELECT group_id FROM group_members WHERE vault_id = ?))",
-        ]
-        base_params: list[Any] = [vault_id, vault_id]
-
-        if media_type:
-            base_conditions.append("f.media_type = ?")
-            base_params.append(media_type)
-
-        if only_favorites:
-            base_conditions.append("f.is_favorite = 1")
-
-        if group_id_filter is not None:
-            base_conditions.append("f.group_id = ?")
-            base_params.append(group_id_filter)
-
-        if group_name_filter:
-            base_conditions.append("LOWER(COALESCE(g.name, '')) LIKE ?")
-            base_params.append(f"%{group_name_filter.lower()}%")
-
-        if tag_filter:
-            base_conditions.append("LOWER(f.tags) LIKE ?")
-            base_params.append(f"%{tag_filter.lower()}%")
-
         order_clause = SORT_CLAUSES.get(sort_by, SORT_CLAUSES["new"])
-        cleaned_text = text_query.strip()
-
-        # Fast path 1: No free-text query -> pure composite-indexed query
-        if not cleaned_text:
-            where_sql = " AND ".join(base_conditions)
+        where_sql, params = self._build_search_where(
+            vault_id,
+            text_query=text_query,
+            media_type=media_type,
+            group_name_filter=group_name_filter,
+            group_id_filter=group_id_filter,
+            tag_filter=tag_filter,
+            only_favorites=only_favorites,
+            include_fts=True,
+        )
+        sql = f"""
+            SELECT f.*, COALESCE(g.name, '') AS group_name
+            FROM files f
+            LEFT JOIN groups g ON g.id = f.group_id
+            WHERE {where_sql}
+            ORDER BY {order_clause}
+            LIMIT ? OFFSET ?
+        """
+        try:
+            cur = await self.conn.execute(sql, [*params, limit, offset])
+            return [dict(r) for r in await cur.fetchall()]
+        except aiosqlite.OperationalError:
+            where_sql, params = self._build_search_where(
+                vault_id,
+                text_query=text_query,
+                media_type=media_type,
+                group_name_filter=group_name_filter,
+                group_id_filter=group_id_filter,
+                tag_filter=tag_filter,
+                only_favorites=only_favorites,
+                include_fts=False,
+            )
             sql = f"""
                 SELECT f.*, COALESCE(g.name, '') AS group_name
                 FROM files f
@@ -2356,76 +2720,8 @@ class Database:
                 ORDER BY {order_clause}
                 LIMIT ? OFFSET ?
             """
-            cur = await self.conn.execute(sql, [*base_params, limit, offset])
+            cur = await self.conn.execute(sql, [*params, limit, offset])
             return [dict(r) for r in await cur.fetchall()]
-
-        # Fast path 2: FTS5 index-first search! Only fall back to substring LIKE if FTS5 returns < limit rows.
-        sanitized_tokens = [
-            "".join(ch for ch in tok if ch not in ('"', "'", "\x00")).strip()
-            for tok in cleaned_text.split()
-        ]
-        fts_terms = [f'"{tok}"*' for tok in sanitized_tokens if tok]
-        fts_rows: list[dict[str, Any]] = []
-
-        if fts_terms:
-            fts_query = " AND ".join(fts_terms)
-            fts_conditions = [
-                *base_conditions,
-                "f.id IN (SELECT file_id FROM files_fts WHERE files_fts MATCH ?)",
-            ]
-            fts_sql = f"""
-                SELECT f.*, COALESCE(g.name, '') AS group_name
-                FROM files f
-                LEFT JOIN groups g ON g.id = f.group_id
-                WHERE {' AND '.join(fts_conditions)}
-                ORDER BY {order_clause}
-                LIMIT ? OFFSET ?
-            """
-            try:
-                cur = await self.conn.execute(
-                    fts_sql, [*base_params, fts_query, limit, offset]
-                )
-                fts_rows = [dict(r) for r in await cur.fetchall()]
-            except aiosqlite.OperationalError:
-                fts_rows = []
-
-            if len(fts_rows) >= limit:
-                return fts_rows
-
-        # Fallback: Substring LIKE scan only when FTS5 returned fewer than `limit` rows (e.g. infix substring)
-        remaining = limit - len(fts_rows)
-        like_pattern = f"%{cleaned_text.lower()}%"
-        like_conditions = list(base_conditions)
-        like_params = list(base_params)
-
-        if fts_rows:
-            placeholders = ",".join("?" for _ in fts_rows)
-            like_conditions.append(f"f.id NOT IN ({placeholders})")
-            like_params.extend(r["id"] for r in fts_rows)
-
-        like_conditions.append(
-            """(
-                LOWER(f.title) LIKE ?
-                OR LOWER(f.performer) LIKE ?
-                OR LOWER(f.file_name) LIKE ?
-                OR LOWER(f.tags) LIKE ?
-                OR LOWER(COALESCE(g.name, '')) LIKE ?
-            )"""
-        )
-        like_params.extend([like_pattern] * 5)
-        like_offset = 0 if fts_rows else offset
-
-        like_sql = f"""
-            SELECT f.*, COALESCE(g.name, '') AS group_name
-            FROM files f
-            LEFT JOIN groups g ON g.id = f.group_id
-            WHERE {' AND '.join(like_conditions)}
-            ORDER BY {order_clause}
-            LIMIT ? OFFSET ?
-        """
-        cur = await self.conn.execute(like_sql, [*like_params, remaining, like_offset])
-        extra_rows = [dict(r) for r in await cur.fetchall()]
-        return fts_rows + extra_rows
 
     # -------------------- STATS & ADMIN --------------------
 

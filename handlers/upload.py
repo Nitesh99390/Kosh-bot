@@ -17,6 +17,7 @@ from utils.formatters import (
     EFFECT_THUMBS_UP,
     MEDIA_ICONS,
     breadcrumb,
+    batch_delete_chat_messages,
     build_file_card_text,
     build_upload_quick_keyboard,
     esc,
@@ -41,6 +42,7 @@ _MAX_LOCK_POOL = 1024
 _USER_DROP_BUFFER: dict[int, list[dict[str, Any]]] = {}
 _USER_DROP_TASKS: dict[int, asyncio.Task] = {}
 _USER_DROP_LOCKS: dict[int, asyncio.Lock] = {}
+_USER_ARCHIVE_LOCKS: dict[int, asyncio.Lock] = {}
 
 # Per-user burst buffers & debounced live status updater for interactive Pack Builder (`/batch`, `➕ New Pack`, `➕ Add Files`)
 _PACK_BUILDER_BUFFER: dict[int, list[dict[str, Any]]] = {}
@@ -64,6 +66,17 @@ def _prune_idle_locks(
     ]
     for uid in idle_uids:
         lock_map.pop(uid, None)
+
+
+def _get_archive_lock(user_id: int) -> asyncio.Lock:
+    lk = _USER_ARCHIVE_LOCKS.get(user_id)
+    if lk is None:
+        if len(_USER_ARCHIVE_LOCKS) >= 512:
+            for k in [k for k, v in list(_USER_ARCHIVE_LOCKS.items()) if not v.locked() and not getattr(v, "_waiters", None)]:
+                _USER_ARCHIVE_LOCKS.pop(k, None)
+        lk = asyncio.Lock()
+        _USER_ARCHIVE_LOCKS[user_id] = lk
+    return lk
 
 
 def _get_drop_lock(user_id: int) -> asyncio.Lock:
@@ -125,6 +138,23 @@ def _extract_media(msg: Message) -> Optional[dict[str, Any]]:
             "mime_type": a.mime_type or "audio/mpeg",
             "file_size": a.file_size or 0,
             "duration": a.duration or 0,
+            "caption": caption,
+            "tags": hashtags,
+        }
+
+    if msg.animation:
+        an = msg.animation
+        title = an.file_name or (caption[:60] if caption else "GIF Animation")
+        return {
+            "media_type": "animation",
+            "file_id": an.file_id,
+            "file_unique_id": an.file_unique_id,
+            "title": title,
+            "performer": "",
+            "file_name": an.file_name or "",
+            "mime_type": an.mime_type or "video/mp4",
+            "file_size": an.file_size or 0,
+            "duration": an.duration or 0,
             "caption": caption,
             "tags": hashtags,
         }
@@ -209,23 +239,6 @@ def _extract_media(msg: Message) -> Optional[dict[str, Any]]:
             "mime_type": "image/jpeg",
             "file_size": p.file_size or 0,
             "duration": 0,
-            "caption": caption,
-            "tags": hashtags,
-        }
-
-    if msg.animation:
-        an = msg.animation
-        title = an.file_name or (caption[:60] if caption else "GIF Animation")
-        return {
-            "media_type": "animation",
-            "file_id": an.file_id,
-            "file_unique_id": an.file_unique_id,
-            "title": title,
-            "performer": "",
-            "file_name": an.file_name or "",
-            "mime_type": an.mime_type or "video/mp4",
-            "file_size": an.file_size or 0,
-            "duration": an.duration or 0,
             "caption": caption,
             "tags": hashtags,
         }
@@ -393,6 +406,14 @@ async def _archive_sorted_entries(
                         for orig_i, d_mid, s_fid in parsed_pairs:
                             dumped_info_by_idx[orig_i] = (d_mid, s_fid)
                         chunk_succeeded = True
+                if not chunk_succeeded and fwd_res:
+                    orphan_ids = [_extract_msg_id(r) for r in fwd_res]
+                    orphan_ids = [m for m in orphan_ids if m]
+                    if orphan_ids:
+                        try:
+                            await batch_delete_chat_messages(bot, config.dump_channel_id, orphan_ids)
+                        except Exception:
+                            pass
             except Exception:
                 chunk_succeeded = False
 
@@ -409,14 +430,22 @@ async def _archive_sorted_entries(
                         message_id=msg_obj.message_id,
                     )
                 except Exception as exc:
+                    if "message to forward not found" in str(exc).lower():
+                        continue
                     if not error_reported:
                         error_reported = True
-                        await tg_retry_call(
-                            msg_obj.reply,
+                        err_text = (
                             f"⚠️ <b>Dump Channel Error</b>\n"
                             f"<blockquote>Make @{esc(uname)} Admin with Post Messages permission.</blockquote>\n"
-                            f"<code>{esc(str(exc))}</code>",
+                            f"<code>{esc(str(exc))}</code>"
                         )
+                        try:
+                            await tg_retry_call(msg_obj.reply, err_text)
+                        except Exception:
+                            try:
+                                await tg_retry_call(bot.send_message, chat_id=msg_obj.chat.id, text=err_text)
+                            except Exception:
+                                pass
                     continue
                 if dumped is None:
                     continue
@@ -511,8 +540,6 @@ async def _flush_user_drop(
     async with _get_drop_lock(user_id):
         raw_items = _USER_DROP_BUFFER.pop(user_id, [])
         _USER_DROP_TASKS.pop(user_id, None)
-    if not _USER_DROP_BUFFER.get(user_id) and user_id not in _USER_DROP_TASKS:
-        _USER_DROP_LOCKS.pop(user_id, None)
 
     if not raw_items:
         return
@@ -526,9 +553,22 @@ async def _flush_user_drop(
         return
     uname = bot_username or "KoshBox_Bot"
 
-    items = await _archive_sorted_entries(
-        sorted_raw, user, bot, db, config, bot_username=uname
-    )
+    async def _reply_or_send(text: str, **kwargs):
+        try:
+            return await tg_retry_call(anchor_message.reply, text, **kwargs)
+        except Exception:
+            return await tg_retry_call(bot.send_message, chat_id=anchor_message.chat.id, text=text, **kwargs)
+
+    async def _reply_or_send_effect(text: str, **kwargs):
+        try:
+            return await send_with_effect(anchor_message.reply, text, **kwargs)
+        except Exception:
+            return await send_with_effect(bot.send_message, chat_id=anchor_message.chat.id, text=text, **kwargs)
+
+    async with _get_archive_lock(user_id):
+        items = await _archive_sorted_entries(
+            sorted_raw, user, bot, db, config, bot_username=uname
+        )
     if not items:
         return
 
@@ -540,14 +580,12 @@ async def _flush_user_drop(
 
         if user.get("bulk_mode"):
             if status in ("dup", "restored"):
-                await tg_retry_call(
-                    anchor_message.reply,
+                await _reply_or_send(
                     f"♻️ <i>In Vault:</i> <b>{esc(f['title'])}</b>",
                 )
             else:
                 grp = f" · 📁 {esc(f['group_name'])}" if f.get("group_name") else ""
-                await tg_retry_call(
-                    anchor_message.reply,
+                await _reply_or_send(
                     f"✅ <b>{esc(f['title'])}</b>{grp}",
                 )
             return
@@ -562,8 +600,7 @@ async def _flush_user_drop(
             badge = "✅ <b>Saved</b>"
             eff = EFFECT_THUMBS_UP
 
-        await send_with_effect(
-            anchor_message.reply,
+        await _reply_or_send_effect(
             build_file_card_text(f, uname, header_badge=badge),
             reply_markup=build_upload_quick_keyboard(f),
             disable_web_page_preview=True,
@@ -589,8 +626,7 @@ async def _flush_user_drop(
     # Edge case: user sent the exact same duplicate file twice -> treat as single duplicate
     if len(unique_files) == 1:
         f = unique_files[0]
-        await tg_retry_call(
-            anchor_message.reply,
+        await _reply_or_send(
             build_file_card_text(
                 f, uname, header_badge="♻️ <b>Already Saved</b>"
             ),
@@ -615,8 +651,7 @@ async def _flush_user_drop(
         stat_note = f"✅ <b>Auto-Packed {len(unique_files)} files</b>"
         if dup_cnt:
             stat_note += f" <i>({new_cnt} new · {dup_cnt} in vault)</i>"
-        await send_with_effect(
-            anchor_message.reply,
+        await _reply_or_send_effect(
             f"{stat_note}\n{rendered[0]}",
             reply_markup=rendered[1],
             disable_web_page_preview=True,
@@ -688,18 +723,21 @@ def _build_live_pack_status_card(
         else f"✅ Finish Pack ({fids_count})"
     )
 
-    recent_lines = [f"• {esc(t[:36])}" for t in recent_titles[-4:]]
+    start_num = max(1, fids_count - len(recent_titles[-4:]) + 1)
+    recent_lines = [
+        f"<b>{start_num + i}.</b> {esc(t[:34])}" for i, t in enumerate(recent_titles[-4:])
+    ]
     if fids_count > len(recent_lines):
         recent_lines.insert(
             0, f"<i>…+{fids_count - len(recent_lines)} earlier file(s)</i>"
         )
-    preview = "\n".join(recent_lines) if recent_lines else "<i>Waiting for files…</i>"
+    preview = "\n".join(recent_lines) if recent_lines else "<i>Send or forward files here to queue them…</i>"
 
     text = (
         f"{breadcrumb('🏠 Home', '🎒 Packs', mode_lbl)}\n"
-        f"🎒 <b>{mode_lbl}</b> · <b>{fids_count}</b> queued <i>({format_size(total_size)})</i>\n"
+        f"🎒 <b>{mode_lbl}</b> · <b>{fids_count}</b> file(s) <i>({format_size(total_size)})</i>\n"
         f"<blockquote>{preview}</blockquote>\n"
-        f"<i>Send more files or tap <b>{esc(finish_lbl)}</b> below:</i>"
+        f"<i>1→N order preserved automatically. Send more or tap <b>{esc(finish_lbl)}</b>:</i>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -889,8 +927,12 @@ async def _flush_pack_builder_status(
             if sent and getattr(sent, "message_id", None):
                 await state.update_data(pack_status_msg_id=sent.message_id)
     finally:
+        lk = _PACK_BUILDER_LOCKS.get(user_id)
         if (
-            user_id not in _PACK_BUILDER_TASKS
+            lk is not None
+            and not lk.locked()
+            and not getattr(lk, "_waiters", None)
+            and user_id not in _PACK_BUILDER_TASKS
             and not _PACK_BUILDER_BUFFER.get(user_id)
         ):
             _PACK_BUILDER_LOCKS.pop(user_id, None)

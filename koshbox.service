@@ -1,7 +1,10 @@
+# Template systemd unit — adjust User and paths (or run deploy_oracle.sh to auto-generate)
 [Unit]
 Description=KoshBox Telegram Inline Dump Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple

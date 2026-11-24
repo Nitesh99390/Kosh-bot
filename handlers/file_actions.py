@@ -10,13 +10,16 @@ from aiogram.types import (
     Message,
 )
 
+from config import Config
 from database import Database
+from utils.cache import TTLCache
 from utils.formatters import (
     MEDIA_ICONS,
     MEDIA_LABELS,
     SORT_LABELS,
     SORT_ORDER,
     back_btn,
+    batch_delete_chat_messages,
     breadcrumb,
     build_file_card_text,
     build_file_keyboard,
@@ -35,6 +38,7 @@ from utils.formatters import (
 from utils.states import FileEditStates, SearchStates
 
 router = Router(name="file_actions")
+_SEARCH_QUERY_CACHE: TTLCache[int, str] = TTLCache(maxsize=2048, ttl=900.0)
 
 BROWSE_PAGE_SIZE = 5
 
@@ -136,6 +140,8 @@ async def render_browse_page(
 
     if group_filter:
         grp = await db.get_group(group_filter)
+        if grp and not await db.is_vault_in_group(user["vault_id"], group_filter):
+            grp = None
         folder_name = grp["name"] if grp else "Folder"
         folder_icon = "👥" if (grp and grp["is_shared"]) else "📁"
         trail = breadcrumb("🏠 Home", "📁 Folders", esc(folder_name))
@@ -205,13 +211,20 @@ async def render_browse_page(
                 ]
             )
 
-    if (page > 0 or has_next) and not text_query:
+    if page > 0 or has_next:
+        if text_query:
+            _SEARCH_QUERY_CACHE.set(user_id, text_query)
+            prev_cb = f"brs:{gid}:{page - 1}"
+            next_cb = f"brs:{gid}:{page + 1}"
+        else:
+            prev_cb = f"br:{flt}:{sort_key}:{gid}:{page - 1}"
+            next_cb = f"br:{flt}:{sort_key}:{gid}:{page + 1}"
         nav_row: list[InlineKeyboardButton] = []
         if page > 0:
             nav_row.append(
                 InlineKeyboardButton(
                     text="⬅️ Prev",
-                    callback_data=f"br:{flt}:{sort_key}:{gid}:{page - 1}",
+                    callback_data=prev_cb,
                 )
             )
         nav_row.append(
@@ -224,7 +237,7 @@ async def render_browse_page(
             nav_row.append(
                 InlineKeyboardButton(
                     text="Next ➡️",
-                    callback_data=f"br:{flt}:{sort_key}:{gid}:{page + 1}",
+                    callback_data=next_cb,
                 )
             )
         buttons.append(nav_row)
@@ -359,7 +372,7 @@ def _render_file_link_card(
             f"<blockquote>"
             f"📡 <b>Status:</b> {state_badge}  •  {views_badge}  •  ⏳ <b>Link:</b> {exp_status}\n"
             f"💣 <b>Auto-Del:</b> {adel_status}  •  👤 <b>1×/User:</b> {one_time_str}\n"
-            f"🛡️ <b>No-Fwd:</b> {prot_status}  •  🔑 <b>PIN:</b> {pin_status}"
+            f"🛡️ <b>No-Forward:</b> {prot_status}  •  🔑 <b>PIN Lock:</b> {pin_status}"
             f"</blockquote>\n"
             f"🔗 <code>{url}</code>"
         )
@@ -377,7 +390,7 @@ async def render_move_file_menu(
     if not user:
         user = await db.ensure_user(user_id)
     f = await db.get_file(fid)
-    if not f or not await db.can_vault_access_file(user["vault_id"], f):
+    if not f or f["vault_id"] != user["vault_id"]:
         return None
     groups = await db.list_vault_groups(user["vault_id"])
 
@@ -504,10 +517,30 @@ async def cb_noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("brs:"))
+async def cb_browse_search_page(callback: CallbackQuery, db: Database) -> None:
+    if not callback.from_user:
+        return
+    parts = callback.data.split(":")
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await callback.answer()
+        return
+    gid = int(parts[1])
+    pg = int(parts[2])
+    q = _SEARCH_QUERY_CACHE.get(callback.from_user.id) or ""
+    await _ensure_cb_user(callback, db)
+    text, kb = await render_browse_page(
+        callback.from_user.id, "all", "def", gid, pg, db, text_query=q
+    )
+    await safe_edit_or_send(callback, text, kb, also_ack=True)
+
+
 @router.message(Command("files"))
-async def cmd_files(message: Message, db: Database) -> None:
+async def cmd_files(message: Message, db: Database, state: Optional[FSMContext] = None) -> None:
     if not message.from_user:
         return
+    if state is not None:
+        await state.clear()
     await db.ensure_user(
         message.from_user.id,
         message.from_user.username or "",
@@ -603,7 +636,7 @@ async def cb_search_prompt_ctx(callback: CallbackQuery, state: FSMContext) -> No
     )
 
 
-@router.message(SearchStates.waiting_for_query)
+@router.message(SearchStates.waiting_for_query, F.text, ~F.text.startswith('/'))
 async def fsm_run_search(
     message: Message, state: FSMContext, db: Database
 ) -> None:
@@ -628,9 +661,11 @@ async def fsm_run_search(
 
 
 @router.message(Command("trash"))
-async def cmd_trash(message: Message, db: Database) -> None:
+async def cmd_trash(message: Message, db: Database, state: Optional[FSMContext] = None) -> None:
     if not message.from_user:
         return
+    if state is not None:
+        await state.clear()
     await db.ensure_user(
         message.from_user.id,
         message.from_user.username or "",
@@ -667,11 +702,25 @@ async def cb_trash_empty_confirm(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data == "trash:empty_do")
-async def cb_trash_empty_do(callback: CallbackQuery, db: Database) -> None:
+async def cb_trash_empty_do(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Optional[Bot] = None,
+    config: Optional[Config] = None,
+) -> None:
     if not callback.from_user:
         return
     user = await _ensure_cb_user(callback, db)
+    trashed = await db.list_trashed_files(user["vault_id"], limit=5000, offset=0)
+    cand_dump_ids = [int(f["dump_message_id"]) for f in trashed if f.get("dump_message_id")]
     removed = await db.empty_trash(user["vault_id"])
+    if bot is not None and config is not None and cand_dump_ids:
+        unref_ids = await db.get_unreferenced_dump_message_ids(cand_dump_ids)
+        if unref_ids:
+            try:
+                await batch_delete_chat_messages(bot, config.dump_channel_id, unref_ids)
+            except Exception:
+                pass
     text, kb = await render_trash_page(callback.from_user.id, 0, db)
     await safe_edit_or_send(
         callback,
@@ -929,8 +978,8 @@ async def cb_toggle_share(
 
     user = await _ensure_cb_user(callback, db)
     f = await db.get_file(fid)
-    if not f or not await db.can_vault_access_file(user["vault_id"], f):
-        await callback.answer("File not found.", show_alert=True)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
         return
     token = await db.toggle_share_token(fid)
     updated = await db.get_file(fid)
@@ -1174,7 +1223,7 @@ async def cb_file_pin_prompt(
     )
 
 
-@router.message(FileEditStates.waiting_for_share_pin)
+@router.message(FileEditStates.waiting_for_share_pin, F.text, ~F.text.startswith('/'))
 async def fsm_save_file_pin(
     message: Message,
     state: FSMContext,
@@ -1308,7 +1357,12 @@ async def cb_purge_file(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data.startswith("f:purge_do:"))
-async def cb_purge_file_do(callback: CallbackQuery, db: Database) -> None:
+async def cb_purge_file_do(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Optional[Bot] = None,
+    config: Optional[Config] = None,
+) -> None:
     if not callback.from_user:
         return
     fid = int(callback.data.split(":")[2])
@@ -1317,7 +1371,15 @@ async def cb_purge_file_do(callback: CallbackQuery, db: Database) -> None:
     if not f or f["vault_id"] != user["vault_id"]:
         await callback.answer("Owner only.", show_alert=True)
         return
+    dump_mid = int(f.get("dump_message_id") or 0)
     await db.delete_file(fid)
+    if bot is not None and config is not None and dump_mid > 0:
+        unref_ids = await db.get_unreferenced_dump_message_ids([dump_mid])
+        if unref_ids:
+            try:
+                await batch_delete_chat_messages(bot, config.dump_channel_id, unref_ids)
+            except Exception:
+                pass
     await safe_edit_or_send(
         callback,
         f"💥 <b>Permanently Deleted</b> · <i>{esc(f['title'])}</i>",
@@ -1334,8 +1396,8 @@ async def cb_rename_prompt(callback: CallbackQuery, state: FSMContext, db: Datab
     fid = int(callback.data.split(":")[2])
     user = await _ensure_cb_user(callback, db)
     f = await db.get_file(fid)
-    if not f or not await db.can_vault_access_file(user["vault_id"], f):
-        await callback.answer("File not found.", show_alert=True)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
         return
     await state.set_state(FileEditStates.waiting_for_title)
     await state.update_data(edit_file_id=fid)
@@ -1347,7 +1409,7 @@ async def cb_rename_prompt(callback: CallbackQuery, state: FSMContext, db: Datab
     )
 
 
-@router.message(FileEditStates.waiting_for_title)
+@router.message(FileEditStates.waiting_for_title, F.text, ~F.text.startswith('/'))
 async def fsm_save_title(
     message: Message,
     state: FSMContext,
@@ -1389,8 +1451,8 @@ async def cb_tags_prompt(callback: CallbackQuery, state: FSMContext, db: Databas
     fid = int(callback.data.split(":")[2])
     user = await _ensure_cb_user(callback, db)
     f = await db.get_file(fid)
-    if not f or not await db.can_vault_access_file(user["vault_id"], f):
-        await callback.answer("File not found.", show_alert=True)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
         return
     await state.set_state(FileEditStates.waiting_for_tags)
     await state.update_data(edit_file_id=fid)
@@ -1403,7 +1465,7 @@ async def cb_tags_prompt(callback: CallbackQuery, state: FSMContext, db: Databas
     )
 
 
-@router.message(FileEditStates.waiting_for_tags)
+@router.message(FileEditStates.waiting_for_tags, F.text, ~F.text.startswith('/'))
 async def fsm_save_tags(
     message: Message,
     state: FSMContext,
@@ -1448,8 +1510,8 @@ async def cb_caption_prompt(callback: CallbackQuery, state: FSMContext, db: Data
     fid = int(callback.data.split(":")[2])
     user = await _ensure_cb_user(callback, db)
     f = await db.get_file(fid)
-    if not f or not await db.can_vault_access_file(user["vault_id"], f):
-        await callback.answer("File not found.", show_alert=True)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
         return
     await state.set_state(FileEditStates.waiting_for_caption)
     await state.update_data(edit_file_id=fid)
@@ -1462,7 +1524,7 @@ async def cb_caption_prompt(callback: CallbackQuery, state: FSMContext, db: Data
     )
 
 
-@router.message(FileEditStates.waiting_for_caption)
+@router.message(FileEditStates.waiting_for_caption, F.text, ~F.text.startswith('/'))
 async def fsm_save_caption(
     message: Message,
     state: FSMContext,
@@ -1536,8 +1598,8 @@ async def cb_set_file_group(
 
     user = await _ensure_cb_user(callback, db)
     f = await db.get_file(fid)
-    if not f or not await db.can_vault_access_file(user["vault_id"], f):
-        await callback.answer("File not found.", show_alert=True)
+    if not f or f["vault_id"] != user["vault_id"]:
+        await callback.answer("Owner only.", show_alert=True)
         return
     if gid is not None and not await db.is_vault_in_group(user["vault_id"], gid):
         await callback.answer("Invalid folder.", show_alert=True)

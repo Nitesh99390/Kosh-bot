@@ -12,7 +12,7 @@ class TTLCache(Generic[K, V]):
     Prevents unbounded memory growth during 24/7 PM2 / systemd uptime.
     """
 
-    __slots__ = ("maxsize", "ttl", "_clock", "_data")
+    __slots__ = ("maxsize", "ttl", "_clock", "_data", "_last_purge")
 
     def __init__(
         self,
@@ -29,6 +29,7 @@ class TTLCache(Generic[K, V]):
         self.ttl = float(ttl)
         self._clock = clock
         self._data: OrderedDict[K, tuple[V, float]] = OrderedDict()
+        self._last_purge: float = self._clock()
 
     def get(self, key: K, default: Optional[V] = None) -> Optional[V]:
         item = self._data.get(key)
@@ -48,7 +49,11 @@ class TTLCache(Generic[K, V]):
             self._data.move_to_end(key)
         self._data[key] = (value, expires_at)
         if len(self._data) > self.maxsize:
-            self.purge_expired()
+            now = self._clock()
+            purge_interval = min(self.ttl * 0.5, 5.0)
+            if (now - self._last_purge) >= purge_interval:
+                self.purge_expired()
+                self._last_purge = now
             while len(self._data) > self.maxsize:
                 self._data.popitem(last=False)
 

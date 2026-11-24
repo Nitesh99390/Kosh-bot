@@ -76,64 +76,67 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
-
-    # Fetch bot identity ONCE at startup so handlers never pay 145ms per-click RTT
-    me = await bot.get_me()
-    bot_username = me.username or "KoshBox_Bot"
-    logger.info(
-        "Starting KoshBox as @%s (id=%s, uvloop=%s)",
-        bot_username,
-        me.id,
-        _USING_UVLOOP,
-    )
-    if not me.supports_inline_queries:
-        logger.warning(
-            "Inline mode is DISABLED in @BotFather! Run /setinline in @BotFather for @%s.",
-            bot_username,
-        )
-
-    # Shared workflow dependencies injected into handlers
-    dp["db"] = db
-    dp["config"] = config
-    dp["bot_username"] = bot_username
-
-    # Outer Guard & Anti-Flood Middleware (Ban check, Force-Sub gate, Rate-Limiting)
-    guard = GuardAndThrottleMiddleware(rate_limit=config.rate_limit_interval)
-    dp.message.outer_middleware(guard)
-    dp.callback_query.outer_middleware(guard)
-
-    # Register routers (FSM / command routers before catch-all media upload)
-    dp.include_router(admin.router)
-    dp.include_router(start_help.router)
-    dp.include_router(accounts.router)
-    dp.include_router(packs.router)
-    dp.include_router(groups.router)
-    dp.include_router(file_actions.router)
-    dp.include_router(inline.router)
-    dp.include_router(upload.router)
-
-    await _set_bot_commands(bot)
-
-    # Pre-warm custom 3D UI banners into Dump Channel ONCE (reuses SQLite file_id on subsequent boots)
-    banner_status = await warmup_banners_in_dump_channel(bot, db, config)
-    logger.info("UI Banner cache status (Dump Channel): %s", banner_status)
-
-    # Start restart-safe, zero-RAM-bloat SQLite batch auto-delete sweeper (`bot.delete_messages()`)
-    sweeper_task = asyncio.create_task(
-        run_scheduled_deletes_sweeper(bot, db, interval_seconds=5.0)
-    )
+    sweeper_task: asyncio.Task | None = None
 
     try:
+        # Fetch bot identity ONCE at startup so handlers never pay 145ms per-click RTT
+        me = await bot.get_me()
+        bot_username = me.username or "KoshBox_Bot"
+        logger.info(
+            "Starting KoshBox as @%s (id=%s, uvloop=%s)",
+            bot_username,
+            me.id,
+            _USING_UVLOOP,
+        )
+        if not me.supports_inline_queries:
+            logger.warning(
+                "Inline mode is DISABLED in @BotFather! Run /setinline in @BotFather for @%s.",
+                bot_username,
+            )
+
+        # Shared workflow dependencies injected into handlers
+        dp["db"] = db
+        dp["config"] = config
+        dp["bot_username"] = bot_username
+
+        # Outer Guard & Anti-Flood Middleware (Ban check, Force-Sub gate, Rate-Limiting)
+        guard = GuardAndThrottleMiddleware(rate_limit=config.rate_limit_interval)
+        dp.message.outer_middleware(guard)
+        dp.callback_query.outer_middleware(guard)
+        dp.inline_query.outer_middleware(guard)
+
+        # Register routers (`start_help` before `admin` so `/start` and `/cancel` are never shadowed)
+        dp.include_router(start_help.router)
+        dp.include_router(admin.router)
+        dp.include_router(accounts.router)
+        dp.include_router(packs.router)
+        dp.include_router(groups.router)
+        dp.include_router(file_actions.router)
+        dp.include_router(inline.router)
+        dp.include_router(upload.router)
+
+        await _set_bot_commands(bot)
+
+        # Pre-warm custom 3D UI banners into Dump Channel ONCE (reuses SQLite file_id on subsequent boots)
+        banner_status = await warmup_banners_in_dump_channel(bot, db, config)
+        logger.info("UI Banner cache status (Dump Channel): %s", banner_status)
+
+        # Start restart-safe, zero-RAM-bloat SQLite batch auto-delete sweeper (`bot.delete_messages()`)
+        sweeper_task = asyncio.create_task(
+            run_scheduled_deletes_sweeper(bot, db, interval_seconds=5.0)
+        )
+
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
         )
     finally:
-        sweeper_task.cancel()
-        try:
-            await sweeper_task
-        except asyncio.CancelledError:
-            pass
+        if sweeper_task is not None:
+            sweeper_task.cancel()
+            try:
+                await sweeper_task
+            except asyncio.CancelledError:
+                pass
         await db.close()
         await bot.session.close()
 

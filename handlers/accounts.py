@@ -45,12 +45,14 @@ async def render_accounts_panel(
         else breadcrumb("🏠 Home", "⚙️ Settings", "🔗 Sync Accounts")
     )
 
+    owner_uid = await db.get_vault_owner_id(user["vault_id"])
     acc_lines: list[str] = []
     for acc in linked:
         uname = f"@{esc(acc['username'])}" if acc["username"] else "no-username"
-        you_tag = " · <i>(This Account)</i>" if acc["user_id"] == user["user_id"] else ""
+        role_tag = " 👑" if owner_uid and acc["user_id"] == owner_uid else ""
+        you_tag = " · <i>(You)</i>" if acc["user_id"] == user["user_id"] else ""
         acc_lines.append(
-            f"• <b>{esc(acc['full_name'] or 'User')}</b> ({uname}){you_tag}"
+            f"• <b>{esc(acc['full_name'] or 'User')}</b>{role_tag} ({uname}){you_tag}"
         )
 
     lines = [
@@ -61,8 +63,12 @@ async def render_accounts_panel(
 
     buttons: list[list[InlineKeyboardButton]] = []
     if manage_unlink and len(linked) > 1:
+        owner_uid = await db.get_vault_owner_id(user["vault_id"])
+        is_vault_owner = (owner_uid is None) or (user["user_id"] == owner_uid)
         lines.append("<i>Tap an account below to separate it into its own vault:</i>")
         for acc in linked:
+            if not is_vault_owner and acc["user_id"] != user["user_id"]:
+                continue
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -220,7 +226,8 @@ async def fsm_verify_code(
         parts = raw.split(maxsplit=1)
         raw = parts[1] if len(parts) > 1 else ""
     if "link_" in raw:
-        raw = raw.split("link_", 1)[1].split()[0]
+        tail_parts = raw.split("link_", 1)[1].split()
+        raw = tail_parts[0] if tail_parts else ""
     await state.clear()
     await handle_verify_code(message, raw, db, bot)
 
@@ -302,6 +309,7 @@ async def handle_verify_code(
             reply_markup=confirm_kb,
         )
     except Exception:
+        await db.revert_link_request_to_pending(req["code"])
         await message.answer("⚠️ Could not reach primary account.")
         return
 
@@ -447,8 +455,20 @@ async def cb_unlink_ask(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
     target_id = int(callback.data.split(":")[2])
+    caller = await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     target_user = await db.get_user(target_id)
-    t_name = esc(target_user["full_name"]) if target_user else str(target_id)
+    if not target_user or target_user.get("vault_id") != caller["vault_id"]:
+        await callback.answer("Account not found in your vault.", show_alert=True)
+        return
+    owner_uid = await db.get_vault_owner_id(caller["vault_id"])
+    if target_id != caller["user_id"] and owner_uid is not None and caller["user_id"] != owner_uid:
+        await callback.answer("Only the vault owner can unlink other accounts.", show_alert=True)
+        return
+    t_name = esc(target_user["full_name"] or str(target_id))
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -470,7 +490,7 @@ async def cb_unlink_ask(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data.startswith("acc:unlink:"))
-async def cb_unlink(callback: CallbackQuery, db: Database) -> None:
+async def cb_unlink(callback: CallbackQuery, db: Database, bot: Bot) -> None:
     if not callback.from_user:
         return
     target_id = int(callback.data.split(":")[2])
@@ -479,9 +499,20 @@ async def cb_unlink(callback: CallbackQuery, db: Database) -> None:
         callback.from_user.username or "",
         callback.from_user.full_name or "",
     )
-    ok = await db.unlink_account(target_id, user["vault_id"])
+    ok = await db.unlink_account(target_id, user["vault_id"], actor_user_id=user["user_id"])
     if not ok:
-        await callback.answer("Cannot unlink the last account.", show_alert=True)
+        await callback.answer(
+            "Cannot unlink: only the vault owner can unlink other accounts (and at least 1 must remain).",
+            show_alert=True,
+        )
         return
+    if target_id != user["user_id"]:
+        try:
+            await bot.send_message(
+                chat_id=target_id,
+                text="🔓 <b>Account Unlinked</b>\n<blockquote>Your account was unlinked from the shared vault and moved to a separate vault.</blockquote>",
+            )
+        except Exception:
+            pass
     text, kb = await render_accounts_panel(callback.from_user.id, db)
     await safe_edit_or_send(callback, text, kb, answer_text="Unlinked", also_ack=True)

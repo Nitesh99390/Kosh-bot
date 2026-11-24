@@ -1,6 +1,9 @@
 from typing import Any, Optional
 
+import logging
+
 from aiogram import Bot, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     ChosenInlineResult,
     InlineKeyboardButton,
@@ -21,9 +24,10 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
-from utils.formatters import MEDIA_LABELS, esc, format_duration, format_size
+from utils.formatters import MEDIA_LABELS, downgrade_reply_markup, esc, esc_truncate, format_duration, format_size
 
 router = Router(name="inline")
+logger = logging.getLogger("koshbox.inline")
 
 TYPE_ALIASES = {
     "audio": "audio",
@@ -178,11 +182,13 @@ def _to_inline_result(
 ) -> Optional[InlineQueryResult]:
     res_id = str(f["id"])
     mtype = f["media_type"]
-    fid = f["file_id"]
-    title = (f.get("title") or "Untitled")[:128]
+    fid = (f.get("file_id") or "").strip()
+    if not fid:
+        return None
+    title = ((f.get("title") or "").strip() or "Untitled")[:128]
     desc = _build_description(f)[:200]
     raw_cap = f.get("caption")
-    caption = esc(raw_cap)[:1020] if raw_cap else None
+    caption = esc_truncate(raw_cap, 1020) if raw_cap else None
 
     if mtype == "audio":
         return InlineQueryResultCachedAudio(
@@ -257,9 +263,15 @@ async def handle_inline_query(
         inline_query.from_user.username or "",
         inline_query.from_user.full_name or "",
     )
+    if user.get("is_banned") and inline_query.from_user.id not in config.admin_ids:
+        try:
+            await inline_query.answer([], cache_time=5, is_personal=True)
+        except Exception:
+            pass
+        return
 
     try:
-        offset = int(inline_query.offset) if inline_query.offset else 0
+        offset = max(0, int(inline_query.offset)) if inline_query.offset else 0
     except ValueError:
         offset = 0
 
@@ -272,10 +284,13 @@ async def handle_inline_query(
     next_offset = ""
 
     if parsed["packs_only"]:
-        packs = await db.list_vault_packs(user["vault_id"], limit=page_size + 1, offset=offset)
-        q_low = parsed["text_query"].lower()
-        if q_low:
-            packs = [p for p in packs if q_low in p["title"].lower()]
+        packs = await db.list_vault_packs(
+            user["vault_id"],
+            limit=page_size + 1,
+            offset=offset,
+            title_query=parsed["text_query"],
+            only_non_empty=True,
+        )
         has_more = len(packs) > page_size
         for p in packs[:page_size]:
             if p["item_count"] > 0:
@@ -302,6 +317,7 @@ async def handle_inline_query(
                 results.append(item)
 
     if not results and offset == 0:
+        next_offset = ""
         raw_q = (inline_query.query or "").strip()
         hint_title = f"No results for '{raw_q[:28]}'" if raw_q else "Vault is empty"
         hint_desc = (
@@ -315,21 +331,46 @@ async def handle_inline_query(
                 title=hint_title,
                 description=hint_desc,
                 input_message_content=InputTextMessageContent(
-                    message_text=f"⚡ Instant cloud vault & sharing via @{uname}"
+                    message_text=f"⚡ Instant cloud vault &amp; sharing via @{uname}"
                 ),
             )
         )
 
-    await inline_query.answer(
-        results=results,
-        cache_time=2,
-        is_personal=True,
-        next_offset=next_offset,
-        button=InlineQueryResultsButton(
-            text="⚡ Open Vault",
-            start_parameter="upload",
-        ),
-    )
+    btn = InlineQueryResultsButton(text="⚡ Open Vault", start_parameter="upload")
+    try:
+        await inline_query.answer(
+            results=results,
+            cache_time=2,
+            is_personal=True,
+            next_offset=next_offset,
+            button=btn,
+        )
+    except TelegramBadRequest as exc:
+        err_l = str(exc).lower()
+        if "query is too old" in err_l or "query_id_invalid" in err_l:
+            return
+        # Downgrade button styles on pack results if rejected by Bot API/proxy
+        downgraded: list[InlineQueryResult] = []
+        for item in results:
+            rm = getattr(item, "reply_markup", None)
+            if rm is not None:
+                try:
+                    item = item.model_copy(
+                        update={"reply_markup": downgrade_reply_markup(rm, drop_copy_text=True)}
+                    )
+                except Exception:
+                    pass
+            downgraded.append(item)
+        try:
+            await inline_query.answer(
+                results=downgraded,
+                cache_time=2,
+                is_personal=True,
+                next_offset=next_offset,
+                button=btn,
+            )
+        except Exception as inner_exc:
+            logger.warning("inline_query.answer failed: %s (retry: %s)", exc, inner_exc)
 
 
 @router.chosen_inline_result()

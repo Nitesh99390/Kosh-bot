@@ -46,7 +46,7 @@ from utils.formatters import (
     tg_retry_call,
     toggle_label,
 )
-from utils.middleware import check_force_sub, invalidate_force_sub_cache
+from utils.middleware import check_force_sub, invalidate_force_sub_cache, pop_pending_force_sub_start
 from utils.states import SettingsStates, ShareUnlockStates
 
 router = Router(name="start_help")
@@ -202,40 +202,88 @@ async def render_home_dashboard(
             active_folder = f"{'👥' if grp['is_shared'] else '📁'} {grp['name']}"
 
     mode_badges: list[str] = []
-    if user.get("bulk_mode"):
-        mode_badges.append("⚡ Bulk")
     if user.get("default_one_time"):
-        mode_badges.append("👤 1×/User")
+        mode_badges.append("👤 1× Preview")
     if user.get("protect_content"):
-        mode_badges.append("🛡️ No-Fwd")
+        mode_badges.append("🛡️ No-Forward")
     if user.get("auto_delete_ttl"):
-        mode_badges.append(f"⏱ {format_ttl_short(user['auto_delete_ttl'])}")
-    mode_str = " · ".join(mode_badges) if mode_badges else "Standard"
+        mode_badges.append(f"⏱ Auto-Del {format_ttl_short(user['auto_delete_ttl'])}")
+    if user.get("bulk_mode"):
+        mode_badges.append("⚡ Quiet Mode")
+    mode_str = " · ".join(mode_badges) if mode_badges else "Standard (No extra locks)"
 
     total_files = stats["total_files"]
     total_size = format_size(stats["total_size"])
     packs_cnt = stats.get("packs_count", 0)
+    uname = esc(bot_username or "KoshBox_Bot")
 
-    greeting = f"👋 Hi, <b>{esc(first_name[:22])}</b>!" if first_name else "☁️ <b>Cloud Vault</b>"
+    greeting = f"👋 Welcome, <b>{esc(first_name[:22])}</b>" if first_name else "☁️ <b>KoshBox Vault</b>"
+
+    if total_files == 0 and packs_cnt == 0:
+        text = (
+            f"✨ <b>KoshBox Cloud Vault</b>\n"
+            f"{greeting} — your private cloud library is ready.\n"
+            f"<blockquote>"
+            f"<b>How to start in 30 seconds:</b>\n"
+            f"1️⃣ <b>Save a File</b> — Send or forward any media here.\n"
+            f"2️⃣ <b>Auto-Pack</b> — Drop 2+ files together for 1 shareable link.\n"
+            f"3️⃣ <b>Share Anywhere</b> — Type <code>@{uname}</code> in any chat."
+            f"</blockquote>\n"
+            f"💡 <i>Just drop a file right here, or choose an option below:</i>"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📤 Upload First File",
+                        callback_data="nav:upload",
+                        style="primary",
+                    ),
+                    InlineKeyboardButton(
+                        text="📖 How It Works",
+                        callback_data="nav:help",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🎒 Create a Pack",
+                        callback_data="pk:new",
+                    ),
+                    InlineKeyboardButton(
+                        text="📁 Folders",
+                        callback_data="nav:groups",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⚙️ Settings &amp; Locks",
+                        callback_data="nav:settings",
+                    ),
+                ],
+            ]
+        )
+        return text, kb
+
     text = (
-        f"{greeting} · <b>KoshBox</b>\n"
+        f"✨ <b>KoshBox</b> · {greeting}\n"
         f"<blockquote>"
-        f"📦 <b>{total_files}</b> Files ({total_size})  •  🎒 <b>{packs_cnt}</b> Packs\n"
-        f"📥 Save to: <b>{esc(active_folder)}</b>  •  {mode_str}"
+        f"📦 <b>{total_files}</b> Files <i>({total_size})</i>  •  🎒 <b>{packs_cnt}</b> Packs\n"
+        f"📥 <b>Auto-Save:</b> {esc(active_folder)}\n"
+        f"🛡️ <b>Defaults:</b> {mode_str}"
         f"</blockquote>\n"
-        f"💡 <i>Send any file here to save it, or tap a button below:</i>"
+        f"💡 <i>Drop any file to save it, or send 2+ files together to auto-pack:</i>"
     )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📦 My Files",
+                    text=f"📦 My Files ({total_files})",
                     callback_data="br:all:def:0:0",
                     style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="🎒 File Packs",
+                    text=f"🎒 Packs ({packs_cnt})",
                     callback_data="nav:packs",
                 ),
             ],
@@ -245,13 +293,13 @@ async def render_home_dashboard(
                     callback_data="nav:groups",
                 ),
                 InlineKeyboardButton(
-                    text="🔍 Quick Search",
+                    text="🔍 Inline Search",
                     switch_inline_query_current_chat="",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="📤 Upload / Pack",
+                    text="➕ Upload / Pack",
                     callback_data="nav:upload",
                 ),
                 InlineKeyboardButton(
@@ -265,14 +313,15 @@ async def render_home_dashboard(
 
 
 def render_upload_hub_card() -> tuple[str, InlineKeyboardMarkup]:
-    """Simple, crystal-clear Upload & Bundle Hub card."""
+    """Crystal-clear, beginner-friendly Upload & Auto-Pack Hub card."""
     caption = (
-        f"{breadcrumb('🏠 Home', '📤 Upload')}\n"
+        f"{breadcrumb('🏠 Home', '📤 Upload & Pack')}\n"
         f"📤 <b>Upload &amp; Bundle Files</b>\n"
         f"<blockquote>"
-        f"• <b>1 File:</b> Send or forward any file, video, audio, or photo to save instantly.\n"
-        f"• <b>2+ Files Together:</b> Automatically bundles into 1 shareable Pack Link!\n"
-        f"• <b>Tags:</b> Add <code>#tags</code> in caption to organize."
+        f"1️⃣ <b>Single File</b> — Send or forward any media to save privately.\n"
+        f"2️⃣ <b>Auto-Pack (2+ Files)</b> — Forward multiple files together to get <b>1 Pack Link</b> in exact 1→N order.\n"
+        f"3️⃣ <b>Custom Pack</b> — Tap <b>➕ Build New Pack</b> to collect files across multiple chats.\n"
+        f"🏷️ <b>Tip:</b> Add <code>#tags</code> in captions to find files faster."
         f"</blockquote>"
     )
     kb = InlineKeyboardMarkup(
@@ -284,13 +333,13 @@ def render_upload_hub_card() -> tuple[str, InlineKeyboardMarkup]:
                     style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="📁 Choose Folder",
+                    text="📁 Set Upload Folder",
                     callback_data="nav:groups",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="📦 View My Files",
+                    text="📦 My Files",
                     callback_data="br:all:def:0:0",
                 ),
                 home_btn("🏠 Home"),
@@ -307,41 +356,57 @@ def _render_help_panel(
 
     if help_tab == "commands":
         text = (
-            f"{breadcrumb('🏠 Home', '📖 Help Guide')}\n"
-            f"📖 <b>Commands &amp; Shortcuts</b>\n"
+            f"{breadcrumb('🏠 Home', '📖 Help', '⌨️ Commands')}\n"
+            f"⌨️ <b>Commands &amp; Shortcuts</b>\n"
             f"<blockquote>"
-            f"• /start — Open Home Dashboard\n"
-            f"• /files — Browse &amp; filter saved files\n"
+            f"<b>Vault &amp; Files</b>\n"
+            f"• /start — Home Dashboard\n"
+            f"• /files — Browse, filter &amp; sort files\n"
+            f"• /search — Search by title, artist, or #tag\n"
+            f"• /trash — Restore or permanently delete\n\n"
+            f"<b>Packs &amp; Sharing</b>\n"
             f"• /packs — Manage multi-file Pack Links\n"
-            f"• /batch — Bundle 1–100+ files into 1 link\n"
-            f"• /groups — Personal folders &amp; shared groups\n"
-            f"• /search — Search files by name or #tag\n"
-            f"• /settings — Auto-delete, Trial lock &amp; Support\n"
-            f"• /trash — Restore deleted files"
+            f"• /batch — Collect files into a custom pack\n"
+            f"• /groups — Private folders &amp; shared spaces\n"
+            f"• /settings — Link security &amp; preferences"
+            f"</blockquote>"
+        )
+    elif help_tab == "security":
+        text = (
+            f"{breadcrumb('🏠 Home', '📖 Help', '🔒 Link Locks')}\n"
+            f"🔒 <b>Link Protection Explained</b>\n"
+            f"<blockquote>"
+            f"• <b>👤 1× Preview (Trial):</b> Each visitor can open the link once; repeat taps ask for Full Access.\n"
+            f"• <b>⏱ Auto-Delete:</b> Clears delivered files from the visitor's chat after your timer ends.\n"
+            f"• <b>🛡️ Block Forwarding:</b> Prevents visitors from saving or forwarding files.\n"
+            f"• <b>🔑 PIN Lock:</b> Requires a password before opening.\n"
+            f"• <b>🔓 Full Access Grant:</b> Approve a visitor for permanent, timer-free access."
             f"</blockquote>"
         )
     else:
         text = (
-            f"{breadcrumb('🏠 Home', '📖 Help Guide')}\n"
-            f"📖 <b>How to Use KoshBox</b>\n"
+            f"{breadcrumb('🏠 Home', '📖 Help', '✨ Basics')}\n"
+            f"✨ <b>How to Use KoshBox</b>\n"
             f"<blockquote>"
-            f"<b>1. Save Files:</b> Just send or forward any media here.\n"
-            f"<b>2. Share Links:</b> Open any file/pack → tap <b>🔗 Share Link</b>.\n"
-            f"<b>3. Send in Any Chat:</b> Type <code>@{uname}</code> anywhere:\n"
+            f"<b>1. Save:</b> Send or forward any media here — it's stored privately.\n"
+            f"<b>2. Auto-Pack:</b> Forward 2+ files together to get 1 ordered Pack Link.\n"
+            f"<b>3. Share Anywhere:</b> Type <code>@{uname}</code> in any chat:\n"
             f"  • <code>@{uname} song</code> — Search by name\n"
-            f"  • <code>@{uname} t:audio</code> — Filter (<code>video</code>, <code>doc</code>, <code>photo</code>)\n"
+            f"  • <code>@{uname} t:video</code> — Filter (<code>audio</code>, <code>doc</code>, <code>photo</code>, <code>gif</code>)\n"
             f"  • <code>@{uname} fav</code> or <code>packs</code> — Starred / Packs"
             f"</blockquote>"
         )
 
-    tab_inline_lbl = "● Quick Guide" if help_tab != "commands" else "○ Quick Guide"
-    tab_cmd_lbl = "● Commands" if help_tab == "commands" else "○ Commands"
+    tab_basics = "● Basics" if help_tab not in ("commands", "security") else "○ Basics"
+    tab_sec = "● Locks" if help_tab == "security" else "○ Locks"
+    tab_cmd = "● Commands" if help_tab == "commands" else "○ Commands"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text=tab_inline_lbl, callback_data="help:inline"),
-                InlineKeyboardButton(text=tab_cmd_lbl, callback_data="help:commands"),
+                InlineKeyboardButton(text=tab_basics, callback_data="help:inline"),
+                InlineKeyboardButton(text=tab_sec, callback_data="help:security"),
+                InlineKeyboardButton(text=tab_cmd, callback_data="help:commands"),
             ],
             [
                 InlineKeyboardButton(
@@ -448,33 +513,36 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
 
     text = (
         f"{breadcrumb('🏠 Home', '⚙️ Settings')}\n"
-        f"⚙️ <b>Settings &amp; Link Defaults</b>\n"
+        f"⚙️ <b>Settings &amp; Link Protection</b>\n"
         f"<blockquote>"
-        f"👤 <b>1×/User Trial:</b> {'🟢 ON' if one_time_on else '⚪ OFF'}  •  🛡️ <b>No-Forward:</b> {'🟢 ON' if prot_on else '⚪ OFF'}\n"
-        f"💣 <b>Auto-Delete:</b> {ttl_lbl}  •  💬 <b>Contact:</b> {contact_badge}\n"
-        f"⚡ <b>Silent Bulk:</b> {'🟢 ON' if bulk_on else '⚪ OFF'}  •  ↕️ <b>Sort:</b> {sort_label}\n"
-        f"📥 <b>Upload Folder:</b> {esc(active_folder)}"
+        f"<b>🔒 Share Link Defaults</b> <i>(for new links)</i>\n"
+        f"• <b>One-Time Preview:</b> {'🟢 ON' if one_time_on else '⚪ OFF'}  •  <b>No-Forward:</b> {'🟢 ON' if prot_on else '⚪ OFF'}\n"
+        f"• <b>Auto-Delete Timer:</b> {ttl_lbl}  •  <b>Owner Contact:</b> {contact_badge}\n\n"
+        f"<b>🎛️ Vault Preferences</b>\n"
+        f"• <b>Quiet Upload:</b> {'🟢 ON' if bulk_on else '⚪ OFF'}  •  <b>Default Sort:</b> {sort_label}\n"
+        f"• <b>Upload Folder:</b> {esc(active_folder)}"
         f"</blockquote>\n"
-        f"<i>Tap any option below to change it:</i>"
+        f"<i>Tap any button below to toggle or configure:</i>"
     )
 
-    contact_btn_lbl = "💬 Contact: Set ✓" if saved_contact else "💬 Set Contact"
+    contact_btn_lbl = "💬 Owner Contact ✓" if saved_contact else "💬 Set Owner Contact"
 
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text=f"{'🟢' if one_time_on else '⚪'} 1×/User: {'ON' if one_time_on else 'OFF'}",
+                text=f"{'🟢' if one_time_on else '⚪'} 1× Preview: {'ON' if one_time_on else 'OFF'}",
                 callback_data="set:1x",
                 style="success" if one_time_on else None,
             ),
             InlineKeyboardButton(
-                text=toggle_label(prot_on, "No-Fwd"),
+                text=f"{'🟢' if prot_on else '⚪'} No-Forward: {'ON' if prot_on else 'OFF'}",
                 callback_data="set:prot",
+                style="success" if prot_on else None,
             ),
         ],
         [
             InlineKeyboardButton(
-                text=f"💣 Auto-Del: {ttl_lbl}",
+                text=f"⏱ Auto-Delete: {ttl_lbl}",
                 callback_data="set:ttl",
                 style="success" if ttl_val > 0 else None,
             ),
@@ -486,7 +554,7 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
         ],
         [
             InlineKeyboardButton(
-                text=toggle_label(bulk_on, "Bulk"),
+                text=f"{'🟢' if bulk_on else '⚪'} Quiet Upload: {'ON' if bulk_on else 'OFF'}",
                 callback_data="set:bulk",
             ),
             InlineKeyboardButton(
@@ -518,6 +586,7 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
 @router.callback_query(F.data == "fsub:check")
 async def cb_force_sub_verify(
     callback: CallbackQuery,
+    state: FSMContext,
     db: Database,
     bot: Bot,
     config: Config,
@@ -538,6 +607,20 @@ async def cb_force_sub_verify(
         callback.from_user.username or "",
         callback.from_user.full_name or "",
     )
+    pending_args = pop_pending_force_sub_start(callback.from_user.id)
+    if pending_args and isinstance(callback.message, Message):
+        try:
+            await callback.answer("✅ Membership verified!")
+        except Exception:
+            pass
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        fake_msg = callback.message.model_copy(update={"from_user": callback.from_user})
+        fake_cmd = CommandObject(prefix="/", command="start", args=pending_args)
+        await cmd_start(fake_msg, fake_cmd, state, db, bot, config, bot_username=bot_username)
+        return
     text, kb = await render_home_dashboard(
         callback.from_user.id,
         callback.from_user.first_name or "",
@@ -594,6 +677,7 @@ async def _deliver_shared_file_with_claim_check(
     )
     req_cb = f"req:f:{file_row['id']}"
 
+    claimed_this_call = False
     if not has_full_access and file_row.get("share_one_time"):
         claimed_now = await db.try_claim_link("file", file_row["id"], visitor["user_id"])
         if not claimed_now:
@@ -606,6 +690,20 @@ async def _deliver_shared_file_with_claim_check(
                 locked_txt, reply_markup=locked_kb, disable_web_page_preview=True
             )
             return
+        claimed_this_call = True
+
+    if not has_full_access and int(file_row.get("share_max_views") or 0) > 0:
+        reserved = await db.try_increment_file_share_views(file_row["id"])
+        if not reserved:
+            if claimed_this_call:
+                await db.release_link_claim("file", file_row["id"], visitor["user_id"])
+            await message.answer(
+                "🔒 <b>View Limit Reached</b>\n<blockquote>This link has reached its maximum view count.</blockquote>"
+            )
+            return
+        view_already_counted = True
+    else:
+        view_already_counted = False
 
     raw_ttl = await db.resolve_file_auto_delete_ttl(file_row)
     ttl = 0 if has_full_access else raw_ttl
@@ -643,8 +741,11 @@ async def _deliver_shared_file_with_claim_check(
         link_id=int(file_row["id"]),
     )
     if sent:
-        await db.increment_file_share_views(file_row["id"])
+        if not view_already_counted:
+            await db.increment_file_share_views(file_row["id"])
     else:
+        if claimed_this_call:
+            await db.release_link_claim("file", file_row["id"], visitor["user_id"])
         await message.answer("⚠️ Unsupported media format.")
 
 
@@ -683,6 +784,7 @@ async def _deliver_shared_pack_with_claim_check(
     )
     req_cb = f"req:p:{pack['id']}"
 
+    claimed_this_call = False
     if not has_full_access and pack.get("one_time_per_user"):
         claimed_now = await db.try_claim_link("pack", pack["id"], visitor["user_id"])
         if not claimed_now:
@@ -695,6 +797,19 @@ async def _deliver_shared_pack_with_claim_check(
                 locked_txt, reply_markup=locked_kb, disable_web_page_preview=True
             )
             return
+        claimed_this_call = True
+
+    count_view_in_deliver = True
+    if not has_full_access and int(pack.get("max_views") or 0) > 0:
+        reserved = await db.try_increment_pack_views(pack["id"])
+        if not reserved:
+            if claimed_this_call:
+                await db.release_link_claim("pack", pack["id"], visitor["user_id"])
+            await message.answer(
+                "🔒 <b>View Limit Reached</b>\n<blockquote>This pack link has reached its maximum view count.</blockquote>"
+            )
+            return
+        count_view_in_deliver = False
 
     raw_ttl = await db.resolve_pack_auto_delete_ttl(pack)
     ttl = 0 if has_full_access else raw_ttl
@@ -705,7 +820,7 @@ async def _deliver_shared_pack_with_claim_check(
         or bool(pack.get("protect_content"))
         or force_protect
     )
-    await deliver_pack_to_chat(
+    delivered = await deliver_pack_to_chat(
         bot,
         message.chat.id,
         pack,
@@ -716,11 +831,13 @@ async def _deliver_shared_pack_with_claim_check(
         has_full_access=has_full_access,
         access_badge=format_grant_badge(grant["expires_at"]) if grant else "",
         show_request_cta=is_trial_or_protected,
-        count_view=True,
+        count_view=count_view_in_deliver,
         dump_channel_id=config.dump_channel_id if config else None,
         contact_url=contact_url,
         celebrate=True,
     )
+    if delivered == 0 and claimed_this_call:
+        await db.release_link_claim("pack", pack["id"], visitor["user_id"])
 
 
 @router.message(CommandStart())
@@ -1011,7 +1128,7 @@ async def cmd_upload(
     await send_banner_message(message, "upload", caption, kb, bot, db, config)
 
 
-@router.message(ShareUnlockStates.waiting_for_file_pin)
+@router.message(ShareUnlockStates.waiting_for_file_pin, F.text, ~F.text.startswith('/'))
 async def fsm_unlock_shared_file(
     message: Message, state: FSMContext, db: Database, bot: Bot
 ) -> None:
@@ -1067,7 +1184,7 @@ async def fsm_unlock_shared_file(
     await _deliver_shared_file_with_claim_check(message, visitor, file_row, db, bot)
 
 
-@router.message(ShareUnlockStates.waiting_for_pack_pin)
+@router.message(ShareUnlockStates.waiting_for_pack_pin, F.text, ~F.text.startswith('/'))
 async def fsm_unlock_shared_pack(
     message: Message,
     state: FSMContext,
@@ -1312,6 +1429,9 @@ async def cb_fsm_cancel(
         )
         return
     if target == "adm:refresh":
+        if callback.from_user.id not in config.admin_ids:
+            await callback.answer("Admin only.", show_alert=True)
+            return
         from handlers.admin import _render_admin_panel
 
         text, kb = await _render_admin_panel(db)
@@ -1377,8 +1497,9 @@ async def cb_fsm_cancel(
         else:
             fid = int(target.split(":")[2])
             back_ctx = None
+        caller_u = await db.get_user(callback.from_user.id)
         f = await db.get_file(fid)
-        if f:
+        if f and caller_u and not f.get("is_trashed") and f["vault_id"] == caller_u["vault_id"]:
             from handlers.file_actions import _render_file_link_card
 
             claims = await db.count_link_claims("file", fid)
@@ -1402,8 +1523,9 @@ async def cb_fsm_cancel(
         else:
             fid = int(target.split(":")[2])
             back_ctx = None
+        caller_u = await db.get_user(callback.from_user.id)
         f = await db.get_file(fid)
-        if f:
+        if f and caller_u and not f.get("is_trashed") and await db.can_vault_access_file(caller_u["vault_id"], f):
             await safe_edit_or_send(
                 callback,
                 build_file_card_text(f, uname, edit_mode=True),
@@ -1440,8 +1562,9 @@ async def cb_fsm_cancel(
         else:
             fid = int(target.split(":")[2])
             back_ctx = None
+        caller_u = await db.get_user(callback.from_user.id)
         f = await db.get_file(fid)
-        if f:
+        if f and caller_u and not f.get("is_trashed") and await db.can_vault_access_file(caller_u["vault_id"], f):
             await safe_edit_or_send(
                 callback,
                 build_file_card_text(f, uname),
@@ -1504,9 +1627,11 @@ async def cb_fsm_cancel(
 
 
 @router.message(Command("bulk"))
-async def cmd_bulk(message: Message, db: Database) -> None:
+async def cmd_bulk(message: Message, db: Database, state: Optional[FSMContext] = None) -> None:
     if not message.from_user:
         return
+    if state is not None:
+        await state.clear()
     await db.ensure_user(
         message.from_user.id,
         message.from_user.username or "",
@@ -1533,9 +1658,11 @@ async def cmd_bulk(message: Message, db: Database) -> None:
 
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message, db: Database) -> None:
+async def cmd_stats(message: Message, db: Database, state: Optional[FSMContext] = None) -> None:
     if not message.from_user:
         return
+    if state is not None:
+        await state.clear()
     await db.ensure_user(
         message.from_user.id,
         message.from_user.username or "",
@@ -1559,9 +1686,11 @@ async def cb_nav_stats(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.message(Command("settings"))
-async def cmd_settings(message: Message, db: Database) -> None:
+async def cmd_settings(message: Message, db: Database, state: Optional[FSMContext] = None) -> None:
     if not message.from_user:
         return
+    if state is not None:
+        await state.clear()
     await db.ensure_user(
         message.from_user.id,
         message.from_user.username or "",
@@ -1660,7 +1789,7 @@ async def cb_settings_contact_prompt(
     )
 
 
-@router.message(SettingsStates.waiting_for_support_contact)
+@router.message(SettingsStates.waiting_for_support_contact, F.text, ~F.text.startswith('/'))
 async def fsm_save_support_contact(
     message: Message, state: FSMContext, db: Database
 ) -> None:

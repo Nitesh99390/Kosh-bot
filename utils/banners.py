@@ -16,7 +16,7 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
-from utils.formatters import downgrade_reply_markup, safe_edit_or_send, safe_gather
+from utils.formatters import downgrade_reply_markup, esc, safe_edit_or_send, safe_gather
 
 logger = logging.getLogger("koshbox.banners")
 
@@ -116,7 +116,7 @@ async def get_or_upload_banner_file_id(
                 chat_id=config.dump_channel_id,
                 photo=FSInputFile(path),
                 caption=(
-                    f"🖼️ <b>{label}</b>\n"
+                    f"🖼️ <b>{esc(label)}</b>\n"
                     f"<code>asset:{asset_key}</code> · <i>Cached for zero-upload bot UI</i>"
                 ),
                 disable_notification=True,
@@ -227,21 +227,29 @@ async def send_banner_message(
             if res:
                 return res
         except TelegramBadRequest as exc:
-            logger.warning(
-                "Cached banner file_id invalid for '%s' (%s); refreshing once from Dump Channel.",
-                asset_key,
-                exc,
+            err_l = str(exc).lower()
+            is_bad_fid = any(
+                k in err_l
+                for k in ("wrong file identifier", "file_id", "wrong remote file", "invalid file")
             )
-            fresh_id = await get_or_upload_banner_file_id(
-                asset_key, bot, db, config, force_reupload=True
-            )
-            if fresh_id:
-                try:
-                    res = await _try_answer_photo(message, fresh_id, caption, reply_markup, {})
-                    if res:
-                        return res
-                except Exception:
-                    pass
+            if is_bad_fid:
+                logger.warning(
+                    "Cached banner file_id invalid for '%s' (%s); refreshing once from Dump Channel.",
+                    asset_key,
+                    exc,
+                )
+                fresh_id = await get_or_upload_banner_file_id(
+                    asset_key, bot, db, config, force_reupload=True
+                )
+                if fresh_id:
+                    try:
+                        res = await _try_answer_photo(message, fresh_id, caption, reply_markup, {})
+                        if res:
+                            return res
+                    except Exception:
+                        pass
+            else:
+                logger.warning("send_banner_message photo error (%s): %s", asset_key, exc)
         except Exception as exc:
             logger.warning("send_banner_message photo fallback (%s): %s", asset_key, exc)
 
@@ -260,11 +268,13 @@ async def send_banner_message(
                 reply_markup=safe_rm,
                 disable_web_page_preview=True,
             )
-        return await message.answer(
-            caption,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
+        if effect_kw:
+            return await message.answer(
+                caption,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        raise
 
 
 async def edit_or_send_banner(
@@ -351,7 +361,7 @@ async def edit_or_send_banner(
         sent = await send_banner_message(
             callback.message, asset_key, caption, reply_markup, bot, db, config
         )
-        if sent and getattr(callback.message, "text", None):
+        if sent:
             try:
                 await callback.message.delete()
             except Exception:

@@ -15,12 +15,14 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
+CREATED_ENV=0
 if [ ! -f "$APP_DIR/.env" ]; then
     cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+    CREATED_ENV=1
     echo ""
     echo "⚠️  Created .env from .env.example."
     echo "    Edit $APP_DIR/.env with your BOT_TOKEN, DUMP_CHANNEL_ID, and ADMIN_IDS first!"
-    echo "    Then run: sudo systemctl restart koshbox"
+    echo "    Then run: sudo systemctl start koshbox"
 fi
 
 echo "==> Configuring systemd service..."
@@ -30,6 +32,8 @@ sudo bash -c "cat > $SERVICE_FILE" <<EOF
 Description=KoshBox Telegram Inline Dump Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -46,7 +50,11 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable koshbox
-sudo systemctl restart koshbox
+if [ "$CREATED_ENV" -eq 0 ]; then
+    sudo systemctl restart koshbox
+else
+    echo "ℹ️  Skipped starting koshbox service because .env was just created with placeholders."
+fi
 
 echo ""
 echo "✅ KoshBox service installed!"

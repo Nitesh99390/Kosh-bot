@@ -208,8 +208,9 @@ async def render_single_group(
     if grp["is_shared"]:
         meta_line += f"  •  {grp['member_count']} member(s)"
 
+    auto_save_note = "🟢 ON <i>(new uploads save here)</i>" if is_active else "⚪ OFF"
     info_lines = [
-        f"📥 <b>Auto-Save Uploads Here:</b> {'🟢 ON' if is_active else '⚪ OFF'}",
+        f"📥 <b>Auto-Save Uploads:</b> {auto_save_note}",
         f"🔍 <b>Inline Filter:</b> <code>@{esc(uname)} g:{esc(grp['name'])}</code>",
     ]
     invite_url = ""
@@ -420,7 +421,7 @@ async def cb_join_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(GroupStates.waiting_for_personal_name)
+@router.message(GroupStates.waiting_for_personal_name, F.text, ~F.text.startswith('/'))
 async def fsm_create_personal(
     message: Message,
     state: FSMContext,
@@ -450,7 +451,7 @@ async def fsm_create_personal(
 
     if move_fid:
         f = await db.get_file(move_fid)
-        if f and await db.can_vault_access_file(user["vault_id"], f):
+        if f and f["vault_id"] == user["vault_id"]:
             await db.move_file_to_group(move_fid, grp["id"])
             updated_f = await db.get_file(move_fid)
             uname = bot_username or "KoshBox_Bot"
@@ -476,7 +477,7 @@ async def fsm_create_personal(
         )
 
 
-@router.message(GroupStates.waiting_for_shared_name)
+@router.message(GroupStates.waiting_for_shared_name, F.text, ~F.text.startswith('/'))
 async def fsm_create_shared(
     message: Message,
     state: FSMContext,
@@ -512,7 +513,7 @@ async def fsm_create_shared(
         )
 
 
-@router.message(GroupStates.waiting_for_invite_code)
+@router.message(GroupStates.waiting_for_invite_code, F.text, ~F.text.startswith('/'))
 async def fsm_join_group(
     message: Message,
     state: FSMContext,
@@ -527,7 +528,8 @@ async def fsm_join_group(
         await state.clear()
         return
     if "join_" in raw:
-        raw = raw.split("join_", 1)[1].split()[0]
+        tail_parts = raw.split("join_", 1)[1].split()
+        raw = tail_parts[0] if tail_parts else ""
     code = raw.upper()
     user = await db.ensure_user(
         message.from_user.id,
@@ -629,8 +631,11 @@ async def cb_set_active_group(
 ) -> None:
     if not callback.from_user:
         return
-    await _ensure_cb_user(callback, db)
+    user = await _ensure_cb_user(callback, db)
     gid = int(callback.data.split(":")[2])
+    if not await db.is_vault_in_group(user["vault_id"], gid):
+        await callback.answer("Folder not found.", show_alert=True)
+        return
     await db.set_active_group(callback.from_user.id, gid)
     rendered = await render_single_group(
         callback.from_user.id, gid, db, bot, bot_username=bot_username
@@ -692,7 +697,7 @@ async def cb_rename_group_prompt(
     )
 
 
-@router.message(GroupStates.waiting_for_rename)
+@router.message(GroupStates.waiting_for_rename, F.text, ~F.text.startswith('/'))
 async def fsm_save_group_rename(
     message: Message,
     state: FSMContext,
@@ -773,8 +778,8 @@ async def cb_rm_group_confirm(callback: CallbackQuery, db: Database) -> None:
     gid = int(callback.data.split(":")[2])
     user = await _ensure_cb_user(callback, db)
     grp = await db.get_group(gid)
-    if not grp:
-        await callback.answer("Not found.", show_alert=True)
+    if not grp or not await db.is_vault_in_group(user["vault_id"], gid):
+        await callback.answer("Folder not found.", show_alert=True)
         return
     is_owner = grp["owner_vault_id"] == user["vault_id"]
     if is_owner:

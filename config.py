@@ -37,14 +37,33 @@ def load_config() -> Config:
         for item in raw_admins.split(","):
             item = item.strip()
             if item:
-                admin_ids.append(int(item))
+                try:
+                    admin_ids.append(int(item))
+                except ValueError as exc:
+                    raise ValueError(f"ADMIN_IDS contains non-integer entry: {item!r}") from exc
 
-    db_path = os.getenv("DB_PATH", "data/koshbox.db").strip() or "data/koshbox.db"
-    inline_page_size = min(max(int(os.getenv("INLINE_PAGE_SIZE", "25")), 5), 50)
-    link_code_ttl = max(int(os.getenv("LINK_CODE_TTL_SECONDS", "300")), 60)
-    force_sub_channel = os.getenv("FORCE_SUB_CHANNEL", "").strip()
-    force_sub_url = os.getenv("FORCE_SUB_URL", "").strip()
-    rate_limit_interval = max(float(os.getenv("RATE_LIMIT_INTERVAL", "0.35")), 0.0)
+    db_path = (os.getenv("DB_PATH") or "").strip() or "data/koshbox.db"
+
+    raw_inline_ps = (os.getenv("INLINE_PAGE_SIZE") or "").strip() or "25"
+    try:
+        inline_page_size = min(max(int(raw_inline_ps), 5), 50)
+    except ValueError as exc:
+        raise ValueError(f"INLINE_PAGE_SIZE must be an integer, got {raw_inline_ps!r}") from exc
+
+    raw_link_ttl = (os.getenv("LINK_CODE_TTL_SECONDS") or "").strip() or "300"
+    try:
+        link_code_ttl = max(int(raw_link_ttl), 60)
+    except ValueError as exc:
+        raise ValueError(f"LINK_CODE_TTL_SECONDS must be an integer, got {raw_link_ttl!r}") from exc
+
+    force_sub_channel = (os.getenv("FORCE_SUB_CHANNEL") or "").strip()
+    force_sub_url = (os.getenv("FORCE_SUB_URL") or "").strip()
+
+    raw_rl = (os.getenv("RATE_LIMIT_INTERVAL") or "").strip() or "0.35"
+    try:
+        rate_limit_interval = max(float(raw_rl), 0.0)
+    except ValueError as exc:
+        raise ValueError(f"RATE_LIMIT_INTERVAL must be a number, got {raw_rl!r}") from exc
 
     return Config(
         bot_token=bot_token,

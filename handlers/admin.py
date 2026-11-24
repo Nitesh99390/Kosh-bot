@@ -4,6 +4,7 @@ import shutil
 import tempfile
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
@@ -114,7 +115,7 @@ async def cb_admin_ban_prompt(
     )
 
 
-@router.message(AdminStates.waiting_for_ban_uid)
+@router.message(AdminStates.waiting_for_ban_uid, F.text, ~F.text.startswith('/'))
 async def fsm_admin_toggle_ban(
     message: Message, state: FSMContext, db: Database, config: Config
 ) -> None:
@@ -174,8 +175,14 @@ async def _send_db_backup(chat_id: int, bot: Bot, db: Database) -> bool:
     with tempfile.TemporaryDirectory() as tmpdir:
         snap_path = os.path.join(tmpdir, "koshbox_backup.db")
         if db.conn:
-            await db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        shutil.copy2(db.db_path, snap_path)
+            try:
+                escaped_path = snap_path.replace("'", "''")
+                await db.conn.execute(f"VACUUM INTO '{escaped_path}'")
+            except Exception:
+                await db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                await asyncio.to_thread(shutil.copy2, db.db_path, snap_path)
+        else:
+            await asyncio.to_thread(shutil.copy2, db.db_path, snap_path)
         await bot.send_document(
             chat_id=chat_id,
             document=FSInputFile(snap_path),
@@ -206,8 +213,13 @@ async def cb_admin_backup(
     ):
         await callback.answer("Admin only.", show_alert=True)
         return
+    try:
+        await callback.answer("⏳ Preparing DB backup…")
+    except Exception:
+        pass
     ok = await _send_db_backup(callback.message.chat.id, bot, db)
-    await callback.answer("Backup sent!" if ok else "DB not found.", show_alert=not ok)
+    if not ok:
+        await callback.message.answer("⚠️ DB file not found.")
 
 
 @router.message(Command("broadcast"))
@@ -239,7 +251,7 @@ async def cb_admin_broadcast(
     )
 
 
-@router.message(AdminStates.waiting_for_broadcast)
+@router.message(AdminStates.waiting_for_broadcast, ~F.text.startswith('/'))
 async def fsm_broadcast(
     message: Message, state: FSMContext, db: Database, bot: Bot, config: Config
 ) -> None:
@@ -254,20 +266,29 @@ async def fsm_broadcast(
     status_msg = await message.answer(f"⏳ Sending to <b>{len(user_ids)}</b> users…")
 
     for uid in user_ids:
-        try:
-            await bot.copy_message(
-                chat_id=uid,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-            )
-            sent += 1
-        except Exception:
+        for _attempt in range(3):
+            try:
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
+                sent += 1
+                break
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(min(max(float(exc.retry_after), 0.5), 60.0) + 0.5)
+            except Exception:
+                failed += 1
+                break
+        else:
             failed += 1
         await asyncio.sleep(0.05)
 
-    await status_msg.edit_text(
-        f"✅ <b>Broadcast Complete</b> · Sent: <b>{sent}</b> · Skipped: <b>{failed}</b>",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[back_btn("adm:refresh", "⬅️ Admin"), home_btn()]]
-        ),
+    done_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[back_btn("adm:refresh", "⬅️ Admin"), home_btn()]]
     )
+    done_text = f"✅ <b>Broadcast Complete</b> · Sent: <b>{sent}</b> · Skipped: <b>{failed}</b>"
+    try:
+        await status_msg.edit_text(done_text, reply_markup=done_kb)
+    except TelegramBadRequest:
+        await message.answer(done_text, reply_markup=done_kb)
