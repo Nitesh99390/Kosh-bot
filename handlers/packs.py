@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Any, Optional
 
 from aiogram import Bot, F, Router
@@ -51,6 +52,15 @@ PACK_ITEMS_EDIT_PAGE_SIZE = 6
 _ACTIVE_DELIVERIES: set[tuple[int, int]] = set()
 
 
+async def _ensure_cb_user(callback: CallbackQuery, db: Database) -> dict:
+    assert callback.from_user is not None
+    return await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
+
+
 async def deliver_pack_to_chat(
     bot: Bot,
     chat_id: int,
@@ -73,11 +83,8 @@ async def deliver_pack_to_chat(
     Ultra-fast, zero-FloodWait Pack Delivery using Telegram's native 100-in-1 `bot.copy_messages()`:
     - Prevents overlapping duplicate runs per `(chat_id, pack['id'])`.
     - Owner self-retrieval (`is_owner=True`): ZERO auto-delete, ZERO `protect_content`, ZERO trial notice.
-    - Full Access Grant (`has_full_access=True`): ZERO auto-delete, ZERO trial notice (respects `protect_content` if set).
-    - Copies up to 100 files from `dump_channel_id` in a SINGLE Bot API call (`copy_messages`),
-      preserving `protect_content` (No-Forward / No-Save) and cutting 100 HTTP calls down to 1!
-    - Gracefully falls back to `send_stored_media` if `dump_channel_id` is unavailable or custom captions require it.
-    - Persists restart-safe `scheduled_deletes` timer + post-expiry `🔓 Request Full Access` & `💬 Contact Owner` notice!
+    - Full Access Grant (`has_full_access=True`): ZERO auto-delete, ZERO trial notice.
+    - Preserves exact `pack_items.position ASC, pack_items.id ASC` order.
     """
     delivery_key = (chat_id, int(pack["id"]))
     if delivery_key in _ACTIVE_DELIVERIES:
@@ -182,15 +189,12 @@ async def deliver_pack_to_chat(
             return added
 
         if can_batch_copy:
-            # Always preserve exact `pack_items.position ASC, pack_items.id ASC` order (`slice_items`)!
-            # NEVER call `sorted(dump_ids)` in a way that scrambles `pack_items.position`!
             dump_ids = [int(f["dump_message_id"]) for f in slice_items]
             strictly_ascending = all(
                 dump_ids[i] < dump_ids[i + 1] for i in range(len(dump_ids) - 1)
             )
 
             if strictly_ascending:
-                # 100% fast path: strictly ascending dump_message_ids -> 1 native `copy_messages` per chunk!
                 try:
                     for c_start in range(0, len(dump_ids), BATCH_CHUNK_SIZE):
                         chunk_ids = dump_ids[c_start : c_start + BATCH_CHUNK_SIZE]
@@ -206,10 +210,6 @@ async def deliver_pack_to_chat(
                     if delivered == 0:
                         delivered = 0
             else:
-                # Older / manually reordered / naturally sorted pack where `dump_message_id`s are NOT
-                # globally strictly ascending: split into maximal consecutive strictly ascending runs!
-                # - Runs of length >= 2 use `bot.copy_messages()` (up to 100 per call).
-                # - Singletons (or failed run copies) fall back to `send_stored_media()` in exact position order!
                 runs: list[list[dict[str, Any]]] = []
                 for item_f in slice_items:
                     cur_mid = int(item_f["dump_message_id"])
@@ -241,7 +241,6 @@ async def deliver_pack_to_chat(
                                         continue
                                 except Exception:
                                     pass
-                            # Per-item sequential fallback for singleton tail or failed batch run
                             for single_f in sub_run:
                                 sent = await send_stored_media(
                                     bot,
@@ -273,14 +272,13 @@ async def deliver_pack_to_chat(
                         await asyncio.sleep(0.05 if op_count % 15 else 0.25)
 
         if delivered == 0:
-            # Clean fallback to cached file_id delivery in exact `pack_items.position ASC` order
             for idx, f in enumerate(slice_items):
                 sent = await send_stored_media(
                     bot,
                     chat_id,
                     f,
                     protect_content=protect,
-                    auto_delete_ttl=0,  # grouped cleanup below
+                    auto_delete_ttl=0,
                 )
                 if sent:
                     delivered += 1
@@ -295,7 +293,7 @@ async def deliver_pack_to_chat(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text=f"📥 Next {nxt_count} ({end_idx + 1}–{end_idx + nxt_count}/{total_items})",
+                            text=f"📥 Next {nxt_count} Files ({end_idx + 1}–{end_idx + nxt_count}/{total_items})",
                             callback_data=f"pk:more:{pack['share_token']}:{end_idx}",
                             style="primary",
                         )
@@ -343,7 +341,6 @@ async def cb_pack_deliver_more(
     bot: Bot,
     config: Optional[Config] = None,
 ) -> None:
-    """Delivers the next paginated batch of files for a large Pack (e.g. 100+ files)."""
     if not callback.from_user or not callback.message:
         return
     parts = callback.data.split(":")
@@ -353,17 +350,12 @@ async def cb_pack_deliver_more(
     token = parts[2]
     offset = int(parts[3])
 
-    # Allow continuation even if max_views or 1x/user was recorded on initial unlock
     pack = await db.get_pack_by_token(token, include_unavailable=True)
     if not pack or pack["item_count"] == 0:
         await callback.answer("⚠️ Pack no longer available.", show_alert=True)
         return
 
-    visitor = await db.ensure_user(
-        callback.from_user.id,
-        callback.from_user.username or "",
-        callback.from_user.full_name or "",
-    )
+    visitor = await _ensure_cb_user(callback, db)
     is_owner = (
         visitor["user_id"] == pack["creator_user_id"]
         or visitor["vault_id"] == pack["vault_id"]
@@ -379,9 +371,7 @@ async def cb_pack_deliver_more(
         if pack.get("is_paused"):
             await callback.answer("⏸ This pack link was paused by the owner.", show_alert=True)
             return
-        import time as _time
-
-        if pack.get("expires_at") and int(pack["expires_at"]) < int(_time.time()):
+        if pack.get("expires_at") and int(pack["expires_at"]) < int(time.time()):
             await callback.answer("⏳ This pack link has expired.", show_alert=True)
             return
 
@@ -430,28 +420,34 @@ async def cb_pack_deliver_more(
 async def render_packs_list(
     user_id: int, db: Database, page: int = 0
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Crisp Multi-File Packs Hub."""
+    """Clean, Simple Multi-File Packs Hub."""
     user = await db.get_user(user_id)
+    if not user:
+        user = await db.ensure_user(user_id)
     total = await db.count_vault_packs(user["vault_id"])
-    offset = max(0, page) * PACKS_PAGE_SIZE
+    total_pages = max(1, (total + PACKS_PAGE_SIZE - 1) // PACKS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * PACKS_PAGE_SIZE
     rows = await db.list_vault_packs(
         user["vault_id"], limit=PACKS_PAGE_SIZE + 1, offset=offset
     )
     has_next = len(rows) > PACKS_PAGE_SIZE
     packs = rows[:PACKS_PAGE_SIZE]
-    total_pages = max(1, (total + PACKS_PAGE_SIZE - 1) // PACKS_PAGE_SIZE)
 
     lines = [
-        breadcrumb("Vault", "Packs"),
-        f"🎒 <b>File Packs</b> · <i>{total} total</i>",
+        breadcrumb("🏠 Home", "🎒 File Packs"),
+        f"🎒 <b>File Packs</b> · <i>{total} pack(s)</i>",
     ]
     buttons: list[list[InlineKeyboardButton]] = []
 
     if not packs:
         lines.append(
-            "<blockquote>Drop 2+ files together to auto-pack, or tap <b>➕ New Pack</b> to bundle with PIN &amp; limits.</blockquote>"
+            "<blockquote>Bundle 2 to 100+ files into a single shareable link!\n"
+            "• Drop 2+ files together to auto-pack, or\n"
+            "• Tap <b>➕ Create Pack</b> below.</blockquote>"
         )
     else:
+        lines.append("<i>Tap any pack below to copy its link or manage security:</i>")
         for p in packs:
             badges = ""
             if p.get("is_paused"):
@@ -461,7 +457,7 @@ async def render_packs_list(
             if int(p.get("auto_delete_ttl") or 0) > 0:
                 badges += "💣 "
             if p.get("pin_hash"):
-                badges += "🔒 "
+                badges += "🔑 "
             lbl = f"{badges}🎒 {p['title'][:20]} ({p['item_count']}) · {format_size(p['total_size'])}"
             buttons.append(
                 [InlineKeyboardButton(text=lbl, callback_data=f"pk:open:{p['id']}")]
@@ -470,20 +466,20 @@ async def render_packs_list(
     if page > 0 or has_next:
         nav: list[InlineKeyboardButton] = []
         if page > 0:
-            nav.append(InlineKeyboardButton(text="◀", callback_data=f"pk:list:{page - 1}"))
-        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+            nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"pk:list:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="noop"))
         if has_next:
-            nav.append(InlineKeyboardButton(text="▶", callback_data=f"pk:list:{page + 1}"))
+            nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"pk:list:{page + 1}"))
         buttons.append(nav)
 
     buttons.append(
         [
             InlineKeyboardButton(
-                text="➕ New Pack",
+                text="➕ Create Pack",
                 callback_data="pk:new",
                 style="primary",
             ),
-            back_btn("nav:home", "◀ Vault"),
+            home_btn("🏠 Home"),
         ]
     )
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -495,14 +491,17 @@ async def render_pack_detail(
     db: Database,
     bot: Optional[Bot] = None,
     bot_username: str = "KoshBox_Bot",
+    sec_mode: bool = False,
 ) -> Optional[tuple[str, InlineKeyboardMarkup]]:
     """
-    Advanced Bug-Proof Pack Detail & Share Link Console:
-    - 1-tap Copy Link + Native Share Sheet
-    - Get All, Edit Title, Add/Remove Files
-    - PIN Lock, No-Forward, Expiry Timer, Max Views Limit, Pause/Resume, Reset Link, Delete
+    Progressive Disclosure Pack Console (Clean 4-Row Primary Card vs Security Sub-Drawer):
+    - Default (`sec_mode=False`): Clean 4-row primary card (Copy/Share, Get All/Edit, Trial/Auto-Del, Security/Back)
+      so the screen is NEVER overcrowded with 14 buttons!
+    - Security Drawer (`sec_mode=True`): Full security controls (1x/User, No-Fwd, Auto-Del, Expiry, PIN, Max Opens, Pause, Reset, Delete).
     """
     user = await db.get_user(user_id)
+    if not user:
+        user = await db.ensure_user(user_id)
     pack = await db.get_pack(pack_id)
     if not pack or pack["vault_id"] != user["vault_id"]:
         return None
@@ -523,18 +522,99 @@ async def render_pack_detail(
     else:
         adel_badge = "💣 Auto-Del: Off"
 
-    sec_parts = [format_max_views_badge(cur_v, max_v)]
+    exp_lbl_badge = format_expiry_badge(pack.get("expires_at"))
+    state_str = "⏸ Paused" if pack.get("is_paused") else "🟢 Active"
+
+    sec_parts = [state_str, format_max_views_badge(cur_v, max_v)]
     if pack.get("one_time_per_user"):
         sec_parts.append(f"👤 1×/User ({claims_cnt})")
-    if pack.get("is_paused"):
-        sec_parts.append("⏸ Paused")
     if pack.get("pin_hash"):
         sec_parts.append("🔑 PIN")
     if pack.get("protect_content"):
         sec_parts.append("🛡️ No-Fwd")
     sec_parts.append(adel_badge)
-    exp_lbl_badge = format_expiry_badge(pack.get("expires_at"))
     sec_parts.append(f"⏳ Link: {exp_lbl_badge}")
+
+    one_time_on = bool(pack.get("one_time_per_user"))
+    one_time_lbl = f"👤 1×/User: {'ON' if one_time_on else 'OFF'}"
+    pin_lbl = "🔑 PIN: ON" if pack.get("pin_hash") else "🔑 Set PIN"
+    prot_lbl = toggle_label(bool(pack.get("protect_content")), "No-Fwd")
+    adel_lbl = f"💣 Auto-Del: {format_ttl_short(adel_val)}"
+    exp_lbl = f"⏳ Link: {exp_lbl_badge}"
+    lim_lbl = f"👁 Limit: {cur_v}/{max_v}" if max_v > 0 else "👁 Limit: ∞"
+    pause_lbl = "▶️ Resume" if pack.get("is_paused") else "⏸ Pause"
+
+    if sec_mode:
+        sec_text = (
+            f"{breadcrumb('🏠 Home', '🎒 Packs', esc(pack['title'][:16]), '🔒 Security')}\n"
+            f"🔒 <b>Pack Link &amp; Security</b>\n"
+            f"🎒 <b>{esc(pack['title'])}</b> <i>({pack['item_count']} files)</i>\n"
+            f"<blockquote>"
+            f"📡 <b>Status:</b> {state_str}  •  {format_max_views_badge(cur_v, max_v)}  •  ⏳ <b>Link:</b> {exp_lbl_badge}\n"
+            f"👤 <b>1×/User:</b> {'🟢 ON (' + str(claims_cnt) + ')' if one_time_on else '⚪ OFF'}  •  {adel_badge}\n"
+            f"🛡️ <b>No-Fwd:</b> {'🟢 ON' if pack.get('protect_content') else '⚪ OFF'}  •  🔑 <b>PIN:</b> {'🟢 ON' if pack.get('pin_hash') else '⚪ OFF'}"
+            f"</blockquote>\n"
+            f"🔗 <code>{share_url}</code>"
+        )
+        sec_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    copy_btn("📋 Copy Link", share_url, style="primary"),
+                    share_url_btn("↗️ Share", share_url, pack["title"]),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=one_time_lbl,
+                        callback_data=f"pk:1x:{pack_id}:s",
+                        style="success" if one_time_on else None,
+                    ),
+                    InlineKeyboardButton(
+                        text=prot_lbl,
+                        callback_data=f"pk:prot:{pack_id}:s",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=adel_lbl,
+                        callback_data=f"pk:adel:{pack_id}:s",
+                        style="success" if adel_val > 0 else None,
+                    ),
+                    InlineKeyboardButton(
+                        text=exp_lbl,
+                        callback_data=f"pk:exp:{pack_id}:s",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=pin_lbl,
+                        callback_data=f"pk:pin:{pack_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text=lim_lbl,
+                        callback_data=f"pk:maxv:{pack_id}:s",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=pause_lbl,
+                        callback_data=f"pk:pause:{pack_id}:s",
+                    ),
+                    InlineKeyboardButton(
+                        text="🔄 New Link",
+                        callback_data=f"pk:regen:{pack_id}:s",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🗑️ Delete Pack",
+                        callback_data=f"pk:del_ask:{pack_id}",
+                        style="danger",
+                    ),
+                    back_btn(f"pk:open:{pack_id}", "⬅️ Pack"),
+                ],
+            ]
+        )
+        return sec_text, sec_kb
 
     preview_lines: list[str] = []
     if pack.get("description"):
@@ -549,31 +629,33 @@ async def render_pack_detail(
 
     quote_tag = "<blockquote expandable>" if len(items) > 4 else "<blockquote>"
     text = (
-        f"{breadcrumb('Vault', 'Packs', esc(pack['title'][:18]))}\n"
+        f"{breadcrumb('🏠 Home', '🎒 Packs', esc(pack['title'][:18]))}\n"
         f"🎒 <b>{esc(pack['title'])}</b>\n"
-        f"<i>{pack['item_count']} files · {format_size(pack['total_size'])} · {' · '.join(sec_parts)}</i>\n"
+        f"<i>{pack['item_count']} files  •  {format_size(pack['total_size'])}  •  {' · '.join(sec_parts)}</i>\n"
         f"{quote_tag}" + "\n".join(preview_lines) + "</blockquote>\n"
         f"🔗 <code>{share_url}</code>"
     )
 
-    one_time_on = bool(pack.get("one_time_per_user"))
-    one_time_lbl = f"👤 1×/User: {'ON' if one_time_on else 'OFF'}"
-    pin_lbl = "🔑 PIN: ON" if pack.get("pin_hash") else "🔑 Set PIN"
-    prot_lbl = toggle_label(bool(pack.get("protect_content")), "No-Fwd")
-    adel_lbl = f"💣 Auto-Del: {format_ttl_short(adel_val)}"
-    exp_lbl = f"⏳ Link: {exp_lbl_badge}"
-    lim_lbl = f"👁 Limit: {cur_v}/{max_v}" if max_v > 0 else "👁 Limit: ∞"
-    pause_lbl = "▶️ Resume" if pack.get("is_paused") else "⏸ Pause"
+    active_locks = sum(
+        [
+            bool(pack.get("pin_hash")),
+            bool(pack.get("protect_content")),
+            bool(pack.get("is_paused")),
+            bool(pack.get("expires_at")),
+            max_v > 0,
+        ]
+    )
+    sec_btn_lbl = f"🔒 Link Locks ({active_locks})" if active_locks else "🔒 Link Locks"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 copy_btn("📋 Copy Link", share_url, style="primary"),
-                share_url_btn("↗️ Share", share_url, pack["title"]),
+                share_url_btn("↗️ Share Link", share_url, pack["title"]),
             ],
             [
-                InlineKeyboardButton(text="📥 Get All", callback_data=f"pk:get:{pack_id}"),
-                InlineKeyboardButton(text="🛠️ Edit Pack", callback_data=f"pk:edit:{pack_id}"),
+                InlineKeyboardButton(text="📥 Get All Files", callback_data=f"pk:get:{pack_id}"),
+                InlineKeyboardButton(text="✏️ Edit Files", callback_data=f"pk:edit:{pack_id}"),
             ],
             [
                 InlineKeyboardButton(
@@ -581,31 +663,25 @@ async def render_pack_detail(
                     callback_data=f"pk:1x:{pack_id}",
                     style="success" if one_time_on else None,
                 ),
-                InlineKeyboardButton(text=prot_lbl, callback_data=f"pk:prot:{pack_id}"),
-            ],
-            [
                 InlineKeyboardButton(
                     text=adel_lbl,
                     callback_data=f"pk:adel:{pack_id}",
                     style="success" if adel_val > 0 else None,
                 ),
-                InlineKeyboardButton(text=exp_lbl, callback_data=f"pk:exp:{pack_id}"),
-            ],
-            [
-                InlineKeyboardButton(text=pin_lbl, callback_data=f"pk:pin:{pack_id}"),
-                InlineKeyboardButton(text=lim_lbl, callback_data=f"pk:maxv:{pack_id}"),
-            ],
-            [
-                InlineKeyboardButton(text=pause_lbl, callback_data=f"pk:pause:{pack_id}"),
-                InlineKeyboardButton(text="🔄 Reset", callback_data=f"pk:regen:{pack_id}"),
             ],
             [
                 InlineKeyboardButton(
-                    text="🗑️ Delete",
-                    callback_data=f"pk:del_ask:{pack_id}",
-                    style="danger",
+                    text=sec_btn_lbl,
+                    callback_data=f"pk:sec:{pack_id}",
                 ),
-                back_btn("pk:list:0", "◀ Packs"),
+                InlineKeyboardButton(
+                    text=exp_lbl,
+                    callback_data=f"pk:exp:{pack_id}",
+                ),
+            ],
+            [
+                back_btn("pk:list:0", "⬅️ Packs"),
+                home_btn("🏠 Home"),
             ],
         ]
     )
@@ -615,8 +691,10 @@ async def render_pack_detail(
 async def render_pack_edit_drawer(
     user_id: int, pack_id: int, db: Database, page: int = 0
 ) -> Optional[tuple[str, InlineKeyboardMarkup]]:
-    """Manage Pack Title, Note/Description, Add More Files, or Remove Individual Files."""
+    """Manage Pack Title, Welcome Note, Natural Sort, Add Files, or Remove Files."""
     user = await db.get_user(user_id)
+    if not user:
+        user = await db.ensure_user(user_id)
     pack = await db.get_pack(pack_id)
     if not pack or pack["vault_id"] != user["vault_id"]:
         return None
@@ -630,10 +708,10 @@ async def render_pack_edit_drawer(
 
     desc_txt = esc(pack["description"][:70]) if pack.get("description") else "None"
     text = (
-        f"{breadcrumb('Vault', 'Packs', esc(pack['title'][:16]), 'Edit')}\n"
-        f"🛠️ <b>Edit Pack: {esc(pack['title'])}</b>\n"
-        f"<blockquote>📦 <b>{total}</b> files · 💬 Note: <i>{desc_txt}</i>\n"
-        f"Tap ✖️ on any file below to remove it from this pack.</blockquote>"
+        f"{breadcrumb('🏠 Home', '🎒 Packs', esc(pack['title'][:16]), '✏️ Edit')}\n"
+        f"✏️ <b>Edit Pack: {esc(pack['title'])}</b>\n"
+        f"<blockquote>📦 <b>{total}</b> files  •  💬 <b>Note:</b> <i>{desc_txt}</i>\n"
+        f"Tap ✖️ on any file below to remove it from this pack:</blockquote>"
     )
 
     rows: list[list[InlineKeyboardButton]] = [
@@ -650,7 +728,7 @@ async def render_pack_edit_drawer(
             ),
         ],
         [
-            InlineKeyboardButton(text="✏️ Rename", callback_data=f"pk:ren:{pack_id}"),
+            InlineKeyboardButton(text="✏️ Rename Pack", callback_data=f"pk:ren:{pack_id}"),
             InlineKeyboardButton(text="💬 Welcome Note", callback_data=f"pk:desc:{pack_id}"),
         ],
     ]
@@ -671,47 +749,64 @@ async def render_pack_edit_drawer(
         if page > 0:
             nav.append(
                 InlineKeyboardButton(
-                    text="◀", callback_data=f"pk:editp:{pack_id}:{page - 1}"
+                    text="⬅️ Prev", callback_data=f"pk:editp:{pack_id}:{page - 1}"
                 )
             )
         nav.append(
-            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop")
+            InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="noop")
         )
         if page + 1 < total_pages:
             nav.append(
                 InlineKeyboardButton(
-                    text="▶", callback_data=f"pk:editp:{pack_id}:{page + 1}"
+                    text="Next ➡️", callback_data=f"pk:editp:{pack_id}:{page + 1}"
                 )
             )
         rows.append(nav)
 
-    rows.append([back_btn(f"pk:open:{pack_id}", "◀ Back to Pack")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🗑️ Delete Pack",
+                callback_data=f"pk:del_ask:{pack_id}",
+                style="danger",
+            ),
+            back_btn(f"pk:open:{pack_id}", "⬅️ Back to Pack"),
+        ]
+    )
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _render_batch_collector(
     count: int, append_pack_id: Optional[int] = None
 ) -> tuple[str, InlineKeyboardMarkup]:
-    mode_lbl = "Add to Pack" if append_pack_id else "Batch Pack Builder"
+    mode_lbl = "Add Files to Pack" if append_pack_id else "New Pack Builder"
     cancel_target = f"pk:open:{append_pack_id}" if append_pack_id else "pk:list:0"
     text = (
-        f"{breadcrumb('Vault', 'Packs', 'Builder')}\n"
+        f"{breadcrumb('🏠 Home', '🎒 Packs', mode_lbl)}\n"
         f"🎒 <b>{mode_lbl}</b> · <b>{count}</b> queued\n"
-        f"<blockquote>Drop or forward 1 to 100+ files right now — this card updates live without spamming your chat!</blockquote>"
+        f"<blockquote>Send or forward 1 to 100+ files right now.\n"
+        f"This card updates live without spamming your chat!</blockquote>"
     )
     rows: list[list[InlineKeyboardButton]] = []
     if count > 0:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"✓ Finish ({count})",
+                    text=f"✅ Finish Pack ({count})",
                     callback_data="pk:finish",
                     style="success",
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="✕ Cancel", callback_data=f"fsm:cancel:{cancel_target}")])
+    rows.append([InlineKeyboardButton(text="✖️ Cancel", callback_data=f"fsm:cancel:{cancel_target}")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _parse_pid_and_sec(data: str) -> tuple[int, bool]:
+    parts = data.split(":")
+    pid = int(parts[2])
+    in_sec = len(parts) >= 4 and parts[3] == "s"
+    return pid, in_sec
 
 
 @router.message(Command("packs"))
@@ -749,28 +844,32 @@ async def cmd_batch(message: Message, state: FSMContext, db: Database) -> None:
 
 
 @router.callback_query(F.data.startswith("pk:list:"))
-async def cb_packs_list(callback: CallbackQuery, db: Database) -> None:
+async def cb_packs_list(
+    callback: CallbackQuery,
+    db: Database,
+    state: Optional[FSMContext] = None,
+) -> None:
     if not callback.from_user:
         return
+    if state is not None:
+        await state.clear()
     page = int(callback.data.split(":")[2])
-    await db.ensure_user(
-        callback.from_user.id,
-        callback.from_user.username or "",
-        callback.from_user.full_name or "",
-    )
+    await _ensure_cb_user(callback, db)
     text, kb = await render_packs_list(callback.from_user.id, db, page)
     await safe_edit_or_send(callback, text, kb, also_ack=True)
 
 
 @router.callback_query(F.data == "nav:packs")
-async def cb_nav_packs(callback: CallbackQuery, db: Database) -> None:
+async def cb_nav_packs(
+    callback: CallbackQuery,
+    db: Database,
+    state: Optional[FSMContext] = None,
+) -> None:
     if not callback.from_user:
         return
-    await db.ensure_user(
-        callback.from_user.id,
-        callback.from_user.username or "",
-        callback.from_user.full_name or "",
-    )
+    if state is not None:
+        await state.clear()
+    await _ensure_cb_user(callback, db)
     text, kb = await render_packs_list(callback.from_user.id, db, 0)
     await safe_edit_or_send(callback, text, kb, also_ack=True)
 
@@ -779,11 +878,25 @@ async def cb_nav_packs(callback: CallbackQuery, db: Database) -> None:
 async def cb_pack_new(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PackStates.collecting_items)
     text, kb = _render_batch_collector(0)
-    msg_id = (
-        callback.message.message_id
-        if (callback.message and not getattr(callback.message, "photo", None))
-        else None
-    )
+    if callback.message and getattr(callback.message, "photo", None):
+        # Transition cleanly from photo banner to live-editable text card and save the NEW message_id!
+        await callback.answer("Drop files to bundle!")
+        sent = await callback.message.answer(text, reply_markup=kb)
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        msg_id = getattr(sent, "message_id", None)
+        await state.update_data(
+            pack_file_ids=[],
+            pack_total_size=0,
+            pack_recent_titles=[],
+            pack_status_msg_id=msg_id,
+            append_pack_id=None,
+        )
+        return
+
+    msg_id = callback.message.message_id if callback.message else None
     await state.update_data(
         pack_file_ids=[],
         pack_total_size=0,
@@ -800,11 +913,10 @@ async def cb_pack_new(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_pack_add_more_files(
     callback: CallbackQuery, state: FSMContext, db: Database
 ) -> None:
-    """Allows appending more files into an existing Pack using the live zero-spam collector."""
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -840,11 +952,10 @@ async def cb_pack_from_group(
     bot: Bot,
     bot_username: str = "KoshBox_Bot",
 ) -> None:
-    """1-Tap: Bundle an entire Folder/Group into a shareable Pack link!"""
     if not callback.from_user:
         return
     gid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     grp = await db.get_group(gid)
     if not grp or not await db.is_vault_in_group(user["vault_id"], gid):
         await callback.answer("Folder not found.", show_alert=True)
@@ -884,7 +995,6 @@ async def cb_pack_quick_album(
     bot: Bot,
     bot_username: str = "KoshBox_Bot",
 ) -> None:
-    """Legacy 1-Tap Pack creation callback handler kept for backwards compatibility."""
     if not callback.from_user:
         return
     raw_ids = callback.data.split(":", 2)[2]
@@ -892,7 +1002,7 @@ async def cb_pack_quick_album(
     if not fids:
         await callback.answer("No files found.", show_alert=True)
         return
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     first = await db.get_file(fids[0])
     title = (
         (first["title"][:28] + f" (+{len(fids)-1})")
@@ -960,7 +1070,7 @@ async def cmd_batch_done(
 
     await state.set_state(PackStates.waiting_for_title)
     await message.answer(
-        f"✏️ <b>Name this Pack</b> <i>({len(fids)} files)</i>\n"
+        f"✏️ <b>Name Your Pack</b> <i>({len(fids)} files)</i>\n"
         f"<blockquote>Send a short title, or tap <b>⚡ Auto Title</b>:</blockquote>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -971,7 +1081,7 @@ async def cmd_batch_done(
                         style="primary",
                     )
                 ],
-                [InlineKeyboardButton(text="◀ Cancel", callback_data="fsm:cancel:pk:list:0")],
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="fsm:cancel:pk:list:0")],
             ]
         ),
     )
@@ -1011,17 +1121,17 @@ async def cb_batch_finish(
                 callback,
                 rendered[0],
                 rendered[1],
-                answer_text=f"✓ Added {len(fids)} file(s)!",
+                answer_text=f"✅ Added {len(fids)} file(s)!",
                 also_ack=True,
             )
         else:
-            await callback.answer(f"✓ Added {len(fids)} file(s)!")
+            await callback.answer(f"✅ Added {len(fids)} file(s)!")
         return
 
     await state.set_state(PackStates.waiting_for_title)
     await safe_edit_or_send(
         callback,
-        f"✏️ <b>Name this Pack</b> <i>({len(fids)} files)</i>\n"
+        f"✏️ <b>Name Your Pack</b> <i>({len(fids)} files)</i>\n"
         f"<blockquote>Send a short title, or tap <b>⚡ Auto Title</b>:</blockquote>",
         InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1032,7 +1142,7 @@ async def cb_batch_finish(
                         style="primary",
                     )
                 ],
-                [InlineKeyboardButton(text="◀ Cancel", callback_data="fsm:cancel:pk:list:0")],
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="fsm:cancel:pk:list:0")],
             ]
         ),
         also_ack=True,
@@ -1055,11 +1165,7 @@ async def cb_pack_auto_title(
     if not fids:
         await callback.answer("No files queued.", show_alert=True)
         return
-    user = await db.ensure_user(
-        callback.from_user.id,
-        callback.from_user.username or "",
-        callback.from_user.full_name or "",
-    )
+    user = await _ensure_cb_user(callback, db)
     first = await db.get_file(fids[0])
     title = (
         f"{first['title'][:32]} ({len(fids)})"
@@ -1098,12 +1204,15 @@ async def fsm_pack_save_title(
 ) -> None:
     if not message.from_user or not message.text:
         return
+    raw = message.text.strip()
+    if raw.startswith("/") and raw.lower().split()[0] in ("/cancel", "/start"):
+        await state.clear()
+        return
     data = await state.get_data()
     fids: list[int] = data.get("pack_file_ids") or []
     await state.clear()
     if not fids:
         return
-    raw = message.text.strip()
     title = f"Pack ({len(fids)} files)" if raw == "-" else raw[:60]
     user = await db.ensure_user(
         message.from_user.id,
@@ -1136,12 +1245,39 @@ async def cb_pack_open(
     db: Database,
     bot: Bot,
     bot_username: str = "KoshBox_Bot",
+    state: Optional[FSMContext] = None,
 ) -> None:
     if not callback.from_user:
         return
+    if state is not None:
+        await state.clear()
+    await _ensure_cb_user(callback, db)
     pid = int(callback.data.split(":")[2])
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=False
+    )
+    if not rendered:
+        await callback.answer("Pack not found.", show_alert=True)
+        return
+    await safe_edit_or_send(callback, rendered[0], rendered[1], also_ack=True)
+
+
+@router.callback_query(F.data.startswith("pk:sec:"))
+async def cb_pack_security_drawer(
+    callback: CallbackQuery,
+    db: Database,
+    bot: Bot,
+    bot_username: str = "KoshBox_Bot",
+    state: Optional[FSMContext] = None,
+) -> None:
+    if not callback.from_user:
+        return
+    if state is not None:
+        await state.clear()
+    await _ensure_cb_user(callback, db)
+    pid = int(callback.data.split(":")[2])
+    rendered = await render_pack_detail(
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=True
     )
     if not rendered:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1150,9 +1286,16 @@ async def cb_pack_open(
 
 
 @router.callback_query(F.data.startswith("pk:edit:"))
-async def cb_pack_edit_drawer(callback: CallbackQuery, db: Database) -> None:
+async def cb_pack_edit_drawer(
+    callback: CallbackQuery,
+    db: Database,
+    state: Optional[FSMContext] = None,
+) -> None:
     if not callback.from_user:
         return
+    if state is not None:
+        await state.clear()
+    await _ensure_cb_user(callback, db)
     pid = int(callback.data.split(":")[2])
     rendered = await render_pack_edit_drawer(callback.from_user.id, pid, db, page=0)
     if not rendered:
@@ -1165,6 +1308,7 @@ async def cb_pack_edit_drawer(callback: CallbackQuery, db: Database) -> None:
 async def cb_pack_edit_page(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
+    await _ensure_cb_user(callback, db)
     _, _, pid_s, page_s = callback.data.split(":")
     rendered = await render_pack_edit_drawer(
         callback.from_user.id, int(pid_s), db, page=int(page_s)
@@ -1177,11 +1321,10 @@ async def cb_pack_edit_page(callback: CallbackQuery, db: Database) -> None:
 
 @router.callback_query(F.data.startswith("pk:sort:"))
 async def cb_pack_natural_sort(callback: CallbackQuery, db: Database) -> None:
-    """1-Tap Natural Numeric Sort (1->N) for existing Packs (e.g. Part 1, Part 2, ..., Part 62)."""
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or not user or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1209,7 +1352,7 @@ async def cb_pack_remove_file(
         return
     _, _, pid_s, fid_s, page_s = callback.data.split(":")
     pid, fid, page = int(pid_s), int(fid_s), int(page_s)
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1243,7 +1386,7 @@ async def cb_pack_rename_prompt(
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1269,6 +1412,10 @@ async def fsm_pack_rename_save(
 ) -> None:
     if not message.from_user or not message.text:
         return
+    raw = message.text.strip()
+    if raw.startswith("/") and raw.lower().split()[0] in ("/cancel", "/start"):
+        await state.clear()
+        return
     data = await state.get_data()
     pid = data.get("rename_pack_id")
     await state.clear()
@@ -1278,7 +1425,7 @@ async def fsm_pack_rename_save(
     pack = await db.get_pack(pid)
     if not pack or not user or pack["vault_id"] != user["vault_id"]:
         return
-    await db.rename_pack(pid, message.text.strip()[:60])
+    await db.rename_pack(pid, raw[:60])
     rendered = await render_pack_detail(
         message.from_user.id, pid, db, bot, bot_username=bot_username
     )
@@ -1295,7 +1442,7 @@ async def cb_pack_desc_prompt(
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1306,7 +1453,7 @@ async def cb_pack_desc_prompt(
     await safe_edit_or_send(
         callback,
         f"💬 <b>Pack Welcome Note</b> · <i>{cur_note}</i>\n"
-        f"<blockquote>Send a note shown when someone opens your link (or <code>-</code> to clear):</blockquote>",
+        f"<blockquote>Send a short note shown when someone opens your pack link (or <code>-</code> to clear):</blockquote>",
         cancel_kb(f"pk:edit:{pid}"),
         also_ack=True,
     )
@@ -1322,6 +1469,10 @@ async def fsm_pack_desc_save(
 ) -> None:
     if not message.from_user or not message.text:
         return
+    raw = message.text.strip()
+    if raw.startswith("/") and raw.lower().split()[0] in ("/cancel", "/start"):
+        await state.clear()
+        return
     data = await state.get_data()
     pid = data.get("desc_pack_id")
     await state.clear()
@@ -1331,7 +1482,6 @@ async def fsm_pack_desc_save(
     pack = await db.get_pack(pid)
     if not pack or not user or pack["vault_id"] != user["vault_id"]:
         return
-    raw = message.text.strip()
     note = "" if raw == "-" else raw[:300]
     await db.set_pack_description(pid, note)
     rendered = await render_pack_detail(
@@ -1353,7 +1503,7 @@ async def cb_pack_get_all(
     if not callback.from_user or not callback.message:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or not user or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1367,7 +1517,7 @@ async def cb_pack_get_all(
         auto_delete_ttl=0,
         force_protect=False,
         is_owner=True,
-        count_view=False,  # Owner retrieving their own pack never burns max_views or triggers trial!
+        count_view=False,
         dump_channel_id=config.dump_channel_id if config else None,
     )
 
@@ -1379,18 +1529,18 @@ async def cb_pack_pin_prompt(
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
     await state.set_state(PackStates.waiting_for_pin)
     await state.update_data(pin_pack_id=pid)
-    status = "Active" if pack.get("pin_hash") else "Off"
+    status = "🟢 Active" if pack.get("pin_hash") else "⚪ Off"
     await safe_edit_or_send(
         callback,
-        f"🔑 <b>Pack PIN Lock</b> · <i>{status}</i>\n"
-        f"<blockquote>Send a PIN/password (up to 24 chars), or <code>-</code> to remove PIN:</blockquote>",
+        f"🔑 <b>Pack PIN / Password</b> · <i>{status}</i>\n"
+        f"<blockquote>Send a PIN/password (up to 24 chars), or send <code>-</code> to remove PIN:</blockquote>",
         cancel_kb(f"pk:open:{pid}"),
         also_ack=True,
     )
@@ -1406,6 +1556,10 @@ async def fsm_pack_set_pin(
 ) -> None:
     if not message.from_user or not message.text:
         return
+    raw = message.text.strip()
+    if raw.startswith("/") and raw.lower().split()[0] in ("/cancel", "/start"):
+        await state.clear()
+        return
     data = await state.get_data()
     pid = data.get("pin_pack_id")
     await state.clear()
@@ -1415,7 +1569,6 @@ async def fsm_pack_set_pin(
     pack = await db.get_pack(pid)
     if not pack or not user or pack["vault_id"] != user["vault_id"]:
         return
-    raw = message.text.strip()
     pin = None if raw == "-" else raw[:24]
     await db.set_pack_pin(pid, pin)
     try:
@@ -1423,7 +1576,7 @@ async def fsm_pack_set_pin(
     except Exception:
         pass
     rendered = await render_pack_detail(
-        message.from_user.id, pid, db, bot, bot_username=bot_username
+        message.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=True
     )
     if rendered:
         await message.answer(
@@ -1440,15 +1593,15 @@ async def cb_pack_toggle_one_time(
 ) -> None:
     if not callback.from_user:
         return
-    pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    pid, in_sec = _parse_pid_and_sec(callback.data)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
     on = await db.toggle_pack_one_time(pid)
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=in_sec
     )
     ans = "👤 1×/User Trial Lock ON" if on else "👤 1×/User Trial Lock OFF"
     if rendered:
@@ -1468,15 +1621,15 @@ async def cb_pack_toggle_prot(
 ) -> None:
     if not callback.from_user:
         return
-    pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    pid, in_sec = _parse_pid_and_sec(callback.data)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
     on = await db.toggle_pack_protect(pid)
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=in_sec
     )
     ans = "🛡️ Content Protection ON" if on else "Content Protection OFF"
     if rendered:
@@ -1496,8 +1649,8 @@ async def cb_pack_cycle_auto_delete(
 ) -> None:
     if not callback.from_user:
         return
-    pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    pid, in_sec = _parse_pid_and_sec(callback.data)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1505,14 +1658,14 @@ async def cb_pack_cycle_auto_delete(
     new_ttl = await db.cycle_pack_auto_delete_ttl(pid)
     owner_ttl = int((user or {}).get("auto_delete_ttl") or 0)
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=in_sec
     )
     if new_ttl > 0:
-        ans = f"💣 Chat Auto-Delete: {format_ttl_short(new_ttl)} (overrides global)"
+        ans = f"💣 Auto-Delete: {format_ttl_short(new_ttl)} (overrides global)"
     elif owner_ttl > 0:
         ans = f"💣 Per-link Off (uses global {format_ttl_short(owner_ttl)})"
     else:
-        ans = "💣 Chat Auto-Delete: Off"
+        ans = "💣 Auto-Delete: Off"
     if rendered:
         await safe_edit_or_send(
             callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
@@ -1530,15 +1683,15 @@ async def cb_pack_cycle_exp(
 ) -> None:
     if not callback.from_user:
         return
-    pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    pid, in_sec = _parse_pid_and_sec(callback.data)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
     new_exp = await db.cycle_pack_expiry(pid)
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=in_sec
     )
     ans = f"⏳ Link Expiry: {format_expiry_badge(new_exp)}"
     if rendered:
@@ -1558,15 +1711,15 @@ async def cb_pack_cycle_max_views(
 ) -> None:
     if not callback.from_user:
         return
-    pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    pid, in_sec = _parse_pid_and_sec(callback.data)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
     lim = await db.cycle_pack_max_views(pid)
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=in_sec
     )
     lbl = f"{lim} opens max" if lim > 0 else "Unlimited opens"
     ans = f"👁 Access Limit: {lbl}"
@@ -1587,15 +1740,15 @@ async def cb_pack_toggle_pause(
 ) -> None:
     if not callback.from_user:
         return
-    pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    pid, in_sec = _parse_pid_and_sec(callback.data)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
     paused = await db.toggle_pack_paused(pid)
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=in_sec
     )
     ans = "⏸ Link Paused" if paused else "▶️ Link Active"
     if rendered:
@@ -1615,17 +1768,17 @@ async def cb_pack_regen(
 ) -> None:
     if not callback.from_user:
         return
-    pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    pid, in_sec = _parse_pid_and_sec(callback.data)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
         return
     await db.regenerate_pack_token(pid)
     rendered = await render_pack_detail(
-        callback.from_user.id, pid, db, bot, bot_username=bot_username
+        callback.from_user.id, pid, db, bot, bot_username=bot_username, sec_mode=in_sec
     )
-    ans = "🔄 New pack link generated (views & user claims reset)"
+    ans = "🔄 New pack link generated (views & claims reset)"
     if rendered:
         await safe_edit_or_send(
             callback, rendered[0], rendered[1], answer_text=ans, also_ack=True
@@ -1639,7 +1792,7 @@ async def cb_pack_del_ask(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     pack = await db.get_pack(pid)
     if not pack or pack["vault_id"] != user["vault_id"]:
         await callback.answer("Pack not found.", show_alert=True)
@@ -1647,7 +1800,7 @@ async def cb_pack_del_ask(callback: CallbackQuery, db: Database) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                back_btn(f"pk:open:{pid}", "◀ Cancel"),
+                back_btn(f"pk:open:{pid}", "⬅️ Cancel"),
                 InlineKeyboardButton(
                     text="💥 Delete Pack",
                     callback_data=f"pk:del:{pid}",
@@ -1659,7 +1812,7 @@ async def cb_pack_del_ask(callback: CallbackQuery, db: Database) -> None:
     await safe_edit_or_send(
         callback,
         f"⚠️ <b>Delete Pack '{esc(pack['title'])}'?</b>\n"
-        f"<blockquote>The share link stops working. Your underlying vault files stay untouched.</blockquote>",
+        f"<blockquote>The share link will stop working, while your saved vault files remain completely safe.</blockquote>",
         kb,
         also_ack=True,
     )
@@ -1670,7 +1823,7 @@ async def cb_pack_del(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
     pid = int(callback.data.split(":")[2])
-    user = await db.get_user(callback.from_user.id)
+    user = await _ensure_cb_user(callback, db)
     await db.delete_pack(pid, user["vault_id"])
     text, kb = await render_packs_list(callback.from_user.id, db, 0)
     await safe_edit_or_send(

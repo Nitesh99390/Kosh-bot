@@ -1,4 +1,5 @@
 import time
+from typing import Optional
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -9,8 +10,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-
-from typing import Optional
 
 from config import Config
 from database import Database, verify_pin
@@ -72,10 +71,6 @@ def reset_access_request_cooldowns() -> None:
 
 
 def _check_access_request_cooldown(user_id: int, link_type: str, link_id: int) -> int:
-    """
-    Returns remaining cooldown seconds (> 0) if `(user_id, link_type, link_id)` already sent
-    a Full Access request within the last 10 minutes; returns 0 if allowed.
-    """
     key = (int(user_id), link_type, int(link_id))
     sent_mono = _ACCESS_REQUEST_COOLDOWN.get(key)
     if sent_mono is None:
@@ -93,7 +88,6 @@ def _mark_access_request_sent(user_id: int, link_type: str, link_id: int) -> Non
 
 
 def _check_pin_lockout(user_id: int, token: str) -> int:
-    """Returns remaining lockout seconds (>0 if locked out, 0 if allowed)."""
     key = (user_id, token)
     entry = _PIN_FAIL_TRACKER.get(key)
     if not entry:
@@ -107,7 +101,6 @@ def _check_pin_lockout(user_id: int, token: str) -> int:
 
 
 def _record_pin_failure(user_id: int, token: str) -> tuple[int, int]:
-    """Records a failed PIN attempt; returns (attempts_left, lockout_seconds_if_triggered)."""
     key = (user_id, token)
     entry = dict(_PIN_FAIL_TRACKER.get(key) or {"fails": 0, "locked_until": 0.0})
     entry["fails"] = int(entry.get("fails", 0)) + 1
@@ -128,19 +121,19 @@ def _diagnose_file_unavailable(raw_file: dict | None) -> tuple[str, str]:
     now = int(time.time())
     if not raw_file:
         return (
-            "⚠️ <b>Link Invalid or Revoked</b>",
-            "This share link was revoked or removed by the owner.",
+            "⚠️ <b>Link Invalid or Disabled</b>",
+            "This share link was removed or disabled by the owner.",
         )
     if raw_file.get("share_paused"):
         return (
             "⏸ <b>Link Temporarily Paused</b>",
-            "The owner has paused access to this link. Try again later.",
+            "The owner has paused this link right now. Please try again later.",
         )
     exp = raw_file.get("share_expires_at")
     if exp and int(exp) > 0 and int(exp) < now:
         return (
             "⏳ <b>Link Expired</b>",
-            "The validity timer on this share link has ended.",
+            "The validity period of this share link has ended.",
         )
     max_v = int(raw_file.get("share_max_views") or 0)
     cur_v = int(raw_file.get("share_views") or 0)
@@ -160,18 +153,18 @@ def _diagnose_pack_unavailable(raw_pack: dict | None) -> tuple[str, str]:
     if not raw_pack or raw_pack.get("item_count", 0) == 0:
         return (
             "⚠️ <b>Pack Unavailable</b>",
-            "This pack link was revoked, emptied, or removed.",
+            "This pack link was removed, emptied, or disabled.",
         )
     if raw_pack.get("is_paused"):
         return (
             "⏸ <b>Pack Link Paused</b>",
-            "The owner has temporarily paused this pack link.",
+            "The owner has paused this pack link right now.",
         )
     exp = raw_pack.get("expires_at")
     if exp and int(exp) > 0 and int(exp) < now:
         return (
             "⏳ <b>Pack Link Expired</b>",
-            "The validity timer on this pack link has ended.",
+            "The validity period of this pack link has ended.",
         )
     max_v = int(raw_pack.get("max_views") or 0)
     cur_v = int(raw_pack.get("views") or 0)
@@ -194,15 +187,15 @@ async def render_home_dashboard(
     bot_username: str = "KoshBox_Bot",
 ) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Ultra-crisp Hero Dashboard (Linear / Raycast / PostBot Pro UX):
-    - Short 4-line scannable layout (Zero fluff!)
-    - Focused 3-row action grid (6 buttons total)
+    Super Clean, Simple & Beginner-Friendly Vault Dashboard:
+    - Clear welcome greeting + neat 2-line summary card
+    - Balanced 2-column symmetric 6-button grid (max 2 buttons per row, clear action verbs)
     """
-    user = await db.get_user(user_id)
+    user = await db.ensure_user(user_id, "", first_name) if not await db.get_user(user_id) else await db.get_user(user_id)
+    assert user is not None
     stats = await db.get_vault_stats(user["vault_id"])
-    uname = esc(bot_username or "KoshBox_Bot")
 
-    active_folder = "Personal"
+    active_folder = "Personal Vault"
     if user.get("active_group_id"):
         grp = await db.get_group(user["active_group_id"])
         if grp:
@@ -223,37 +216,88 @@ async def render_home_dashboard(
     total_size = format_size(stats["total_size"])
     packs_cnt = stats.get("packs_count", 0)
 
-    greeting = f" · <b>{esc(first_name)}</b>" if first_name else ""
+    greeting = f"👋 Hi, <b>{esc(first_name[:22])}</b>!" if first_name else "☁️ <b>Cloud Vault</b>"
     text = (
-        f"⚡ <b>@{uname}</b>{greeting}\n"
+        f"{greeting} · <b>KoshBox</b>\n"
         f"<blockquote>"
-        f"📦 <b>{total_files}</b> files  ·  💾 <b>{total_size}</b>  ·  🎒 <b>{packs_cnt}</b> packs\n"
-        f"🎯 <b>{esc(active_folder)}</b>  ·  {mode_str}"
+        f"📦 <b>{total_files}</b> Files ({total_size})  •  🎒 <b>{packs_cnt}</b> Packs\n"
+        f"📥 Save to: <b>{esc(active_folder)}</b>  •  {mode_str}"
         f"</blockquote>\n"
-        f"<i>Drop any media to archive · search inline anywhere</i>"
+        f"💡 <i>Send any file here to save it, or tap a button below:</i>"
     )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔍 Search Inline",
-                    switch_inline_query_current_chat="",
+                    text="📦 My Files",
+                    callback_data="br:all:def:0:0",
                     style="primary",
                 ),
-                InlineKeyboardButton(text="📦 Files", callback_data="br:all:def:0:0"),
+                InlineKeyboardButton(
+                    text="🎒 File Packs",
+                    callback_data="nav:packs",
+                ),
             ],
             [
-                InlineKeyboardButton(text="📁 Folders", callback_data="nav:groups"),
-                InlineKeyboardButton(text="🎒 Packs", callback_data="nav:packs"),
+                InlineKeyboardButton(
+                    text="📁 Folders",
+                    callback_data="nav:groups",
+                ),
+                InlineKeyboardButton(
+                    text="🔍 Quick Search",
+                    switch_inline_query_current_chat="",
+                ),
             ],
             [
-                InlineKeyboardButton(text="⭐ Starred", callback_data="br:fav:def:0:0"),
-                InlineKeyboardButton(text="⚙️ Settings", callback_data="nav:settings"),
+                InlineKeyboardButton(
+                    text="📤 Upload / Pack",
+                    callback_data="nav:upload",
+                ),
+                InlineKeyboardButton(
+                    text="⚙️ Settings",
+                    callback_data="nav:settings",
+                ),
             ],
         ]
     )
     return text, kb
+
+
+def render_upload_hub_card() -> tuple[str, InlineKeyboardMarkup]:
+    """Simple, crystal-clear Upload & Bundle Hub card."""
+    caption = (
+        f"{breadcrumb('🏠 Home', '📤 Upload')}\n"
+        f"📤 <b>Upload &amp; Bundle Files</b>\n"
+        f"<blockquote>"
+        f"• <b>1 File:</b> Send or forward any file, video, audio, or photo to save instantly.\n"
+        f"• <b>2+ Files Together:</b> Automatically bundles into 1 shareable Pack Link!\n"
+        f"• <b>Tags:</b> Add <code>#tags</code> in caption to organize."
+        f"</blockquote>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Build New Pack",
+                    callback_data="pk:new",
+                    style="primary",
+                ),
+                InlineKeyboardButton(
+                    text="📁 Choose Folder",
+                    callback_data="nav:groups",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 View My Files",
+                    callback_data="br:all:def:0:0",
+                ),
+                home_btn("🏠 Home"),
+            ],
+        ]
+    )
+    return caption, kb
 
 
 def _render_help_panel(
@@ -263,32 +307,34 @@ def _render_help_panel(
 
     if help_tab == "commands":
         text = (
-            f"{breadcrumb('Vault', 'Guide')}\n"
-            f"📖 <b>Commands</b>\n"
+            f"{breadcrumb('🏠 Home', '📖 Help Guide')}\n"
+            f"📖 <b>Commands &amp; Shortcuts</b>\n"
             f"<blockquote>"
-            f"/start — Vault Dashboard\n"
-            f"/files · /search — Browse & find\n"
-            f"/packs · /batch — Multi-file pack links\n"
-            f"/groups — Folders & shared spaces\n"
-            f"/bulk — Fast silent uploads\n"
-            f"/accounts — Multi-account sync\n"
-            f"/settings · /stats · /trash"
+            f"• /start — Open Home Dashboard\n"
+            f"• /files — Browse &amp; filter saved files\n"
+            f"• /packs — Manage multi-file Pack Links\n"
+            f"• /batch — Bundle 1–100+ files into 1 link\n"
+            f"• /groups — Personal folders &amp; shared groups\n"
+            f"• /search — Search files by name or #tag\n"
+            f"• /settings — Auto-delete, Trial lock &amp; Support\n"
+            f"• /trash — Restore deleted files"
             f"</blockquote>"
         )
     else:
         text = (
-            f"{breadcrumb('Vault', 'Guide')}\n"
-            f"📖 <b>Inline Search</b>\n"
+            f"{breadcrumb('🏠 Home', '📖 Help Guide')}\n"
+            f"📖 <b>How to Use KoshBox</b>\n"
             f"<blockquote>"
-            f"Type <code>@{uname}</code> in any chat:\n"
-            f"• <code>@{uname} lofi</code> — Keyword / tag\n"
-            f"• <code>@{uname} t:audio</code> — <code>audio</code> <code>video</code> <code>doc</code> <code>photo</code> <code>gif</code>\n"
-            f"• <code>@{uname} g:music</code> — Folder filter\n"
-            f"• <code>@{uname} fav</code> · <code>top</code> · <code>packs</code>"
+            f"<b>1. Save Files:</b> Just send or forward any media here.\n"
+            f"<b>2. Share Links:</b> Open any file/pack → tap <b>🔗 Share Link</b>.\n"
+            f"<b>3. Send in Any Chat:</b> Type <code>@{uname}</code> anywhere:\n"
+            f"  • <code>@{uname} song</code> — Search by name\n"
+            f"  • <code>@{uname} t:audio</code> — Filter (<code>video</code>, <code>doc</code>, <code>photo</code>)\n"
+            f"  • <code>@{uname} fav</code> or <code>packs</code> — Starred / Packs"
             f"</blockquote>"
         )
 
-    tab_inline_lbl = "● Inline" if help_tab == "inline" else "○ Inline"
+    tab_inline_lbl = "● Quick Guide" if help_tab != "commands" else "○ Quick Guide"
     tab_cmd_lbl = "● Commands" if help_tab == "commands" else "○ Commands"
 
     kb = InlineKeyboardMarkup(
@@ -299,12 +345,16 @@ def _render_help_panel(
             ],
             [
                 InlineKeyboardButton(
-                    text="🔍 Try Inline",
+                    text="🔍 Try Inline Search",
                     switch_inline_query_current_chat="",
                     style="primary",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="📤 Upload Files",
+                    callback_data="nav:upload",
+                ),
             ],
-            [back_btn("nav:settings", "◀ Settings"), home_btn()],
+            [back_btn("nav:settings", "⬅️ Settings"), home_btn()],
         ]
     )
     return text, kb
@@ -312,6 +362,7 @@ def _render_help_panel(
 
 async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKeyboardMarkup]:
     user = await db.get_user(user_id)
+    assert user is not None
     stats = await db.get_vault_stats(user["vault_id"])
     total_files = stats["total_files"]
     by_type = stats["by_type"]
@@ -327,15 +378,15 @@ async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKe
             b_lines.append(f"{icon} <code>{bar}</code> <b>{cnt}</b> {label} <i>({sz})</i>")
         breakdown = "\n".join(b_lines)
     else:
-        breakdown = "<i>No files yet.</i>"
+        breakdown = "<i>No files uploaded yet.</i>"
 
     summary_block = (
-        f"📦 <b>{total_files}</b> files · 💾 <b>{format_size(stats['total_size'])}</b> · 🎒 <b>{stats.get('packs_count', 0)}</b> packs\n"
-        f"⭐ <b>{stats['fav_count']}</b> starred · 📈 <b>{stats['total_uses']}×</b> inline · 📁 <b>{stats['groups_count']}</b> folders"
+        f"📦 <b>{total_files}</b> Files  •  💾 <b>{format_size(stats['total_size'])}</b>  •  🎒 <b>{stats.get('packs_count', 0)}</b> Packs\n"
+        f"⭐ <b>{stats['fav_count']}</b> Starred  •  📤 <b>{stats['total_uses']}×</b> Sent  •  📁 <b>{stats['groups_count']}</b> Folders"
     )
 
     lines = [
-        breadcrumb("Vault", "Analytics"),
+        breadcrumb("🏠 Home", "⚙️ Settings", "📊 Analytics"),
         "📊 <b>Vault Analytics</b>",
         f"<blockquote>{summary_block}</blockquote>",
         breakdown,
@@ -346,15 +397,15 @@ async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKe
             f"{idx}. {MEDIA_ICONS.get(tf['media_type'], '📦')} <b>{esc(tf['title'][:26])}</b> · <code>{tf['use_count']}×</code>"
             for idx, tf in enumerate(stats["top_files"], start=1)
         ]
-        lines.append("<b>Top Inline</b>\n" + "\n".join(top_lines))
+        lines.append("<b>🔥 Most Used Files</b>\n" + "\n".join(top_lines))
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📦 Files", callback_data="br:all:def:0:0"),
+                InlineKeyboardButton(text="📦 My Files", callback_data="br:all:def:0:0", style="primary"),
                 InlineKeyboardButton(text="🔄 Refresh", callback_data="nav:stats"),
             ],
-            [back_btn("nav:settings", "◀ Settings"), home_btn()],
+            [back_btn("nav:settings", "⬅️ Settings"), home_btn()],
         ]
     )
     return "\n".join(lines), kb
@@ -362,12 +413,11 @@ async def _render_stats_panel(user_id: int, db: Database) -> tuple[str, InlineKe
 
 async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Compact Pro Settings & Trial Security Hub (Linear / Raycast mobile-first grid):
-    - Bulk Mode, Default Sort, Auto-Delete Timer (incl. 2h Trial), Content Protection (No-Fwd)
-    - Default 1×/User Trial Mode, Dynamic Per-Owner Support Contact (`@username` / `t.me/...`)
-    - Analytics, Trash, Sync Accounts, Guide
+    Clean, well-grouped Settings & Security Hub:
+    Every toggle clearly shows ON / OFF or its current value so there is zero confusion.
     """
     user = await db.get_user(user_id)
+    assert user is not None
     trash_cnt = await db.count_trashed_files(user["vault_id"])
     sort_key = user.get("default_sort") or "new"
     sort_label = SORT_LABELS.get(sort_key, "Newest")
@@ -390,28 +440,30 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
     else:
         contact_badge = "<i>Not set</i>"
 
-    active_folder = "Personal"
+    active_folder = "Personal Vault"
     if user.get("active_group_id"):
         grp = await db.get_group(user["active_group_id"])
         if grp:
             active_folder = f"{'👥' if grp['is_shared'] else '📁'} {grp['name']}"
 
     text = (
-        f"{breadcrumb('Vault', 'Settings')}\n"
-        f"⚙️ <b>Settings &amp; Trial Security</b>\n"
+        f"{breadcrumb('🏠 Home', '⚙️ Settings')}\n"
+        f"⚙️ <b>Settings &amp; Link Defaults</b>\n"
         f"<blockquote>"
-        f"👤 1×/User: <b>{'ON' if one_time_on else 'OFF'}</b>  ·  🛡️ No-Fwd: <b>{'ON' if prot_on else 'Off'}</b>\n"
-        f"⏱ Auto-Del: <b>{ttl_lbl}</b>  ·  💬 Support: {contact_badge}\n"
-        f"⚡ Bulk: <b>{'ON' if bulk_on else 'Off'}</b>  ·  ↕️ Sort: <b>{sort_label}</b>  ·  🎯 <b>{esc(active_folder)}</b>"
-        f"</blockquote>"
+        f"👤 <b>1×/User Trial:</b> {'🟢 ON' if one_time_on else '⚪ OFF'}  •  🛡️ <b>No-Forward:</b> {'🟢 ON' if prot_on else '⚪ OFF'}\n"
+        f"💣 <b>Auto-Delete:</b> {ttl_lbl}  •  💬 <b>Contact:</b> {contact_badge}\n"
+        f"⚡ <b>Silent Bulk:</b> {'🟢 ON' if bulk_on else '⚪ OFF'}  •  ↕️ <b>Sort:</b> {sort_label}\n"
+        f"📥 <b>Upload Folder:</b> {esc(active_folder)}"
+        f"</blockquote>\n"
+        f"<i>Tap any option below to change it:</i>"
     )
 
-    contact_btn_lbl = "💬 Support: Set" if saved_contact else "💬 Support Contact"
+    contact_btn_lbl = "💬 Contact: Set ✓" if saved_contact else "💬 Set Contact"
 
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text=f"👤 1×/User: {'ON' if one_time_on else 'OFF'}",
+                text=f"{'🟢' if one_time_on else '⚪'} 1×/User: {'ON' if one_time_on else 'OFF'}",
                 callback_data="set:1x",
                 style="success" if one_time_on else None,
             ),
@@ -422,8 +474,9 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
         ],
         [
             InlineKeyboardButton(
-                text=f"⏱ Auto-Del: {ttl_lbl}",
+                text=f"💣 Auto-Del: {ttl_lbl}",
                 callback_data="set:ttl",
+                style="success" if ttl_val > 0 else None,
             ),
             InlineKeyboardButton(
                 text=contact_btn_lbl,
@@ -437,24 +490,28 @@ async def _render_settings_panel(user_id: int, db: Database) -> tuple[str, Inlin
                 callback_data="set:bulk",
             ),
             InlineKeyboardButton(
-                text=f"↕️ {sort_label}",
+                text=f"↕️ Sort: {sort_label}",
                 callback_data="set:sort",
             ),
         ],
         [
-            InlineKeyboardButton(text="📊 Stats", callback_data="nav:stats"),
+            InlineKeyboardButton(text="📊 Analytics", callback_data="nav:stats"),
             InlineKeyboardButton(text=f"🗑️ Trash ({trash_cnt})", callback_data="trash:0"),
         ],
         [
-            InlineKeyboardButton(text="🔗 Sync", callback_data="nav:accounts"),
-            InlineKeyboardButton(text="📖 Guide", callback_data="nav:help"),
+            InlineKeyboardButton(text="🔗 Sync Accounts", callback_data="nav:accounts"),
+            InlineKeyboardButton(text="📖 Help Guide", callback_data="nav:help"),
         ],
     ]
     if user.get("active_group_id"):
         rows.append(
-            [InlineKeyboardButton(text="🎯 Reset Target", callback_data="set:clear_grp")]
+            [
+                InlineKeyboardButton(text="🎯 Reset Upload Folder", callback_data="set:clear_grp"),
+                home_btn("🏠 Home"),
+            ]
         )
-    rows.append([back_btn("nav:home", "◀ Vault")])
+    else:
+        rows.append([home_btn("🏠 Back to Home")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -474,7 +531,7 @@ async def cb_force_sub_verify(
             bot, config.force_sub_channel, callback.from_user.id, bypass_cache=True
         )
         if not ok:
-            await callback.answer("Still not joined — join first!", show_alert=True)
+            await callback.answer("Still not joined — please join the channel first!", show_alert=True)
             return
     await db.ensure_user(
         callback.from_user.id,
@@ -496,7 +553,7 @@ async def cb_force_sub_verify(
         bot,
         db,
         config,
-        answer_text="✓ Verified!",
+        answer_text="✅ Membership verified!",
         also_ack=True,
     )
 
@@ -508,14 +565,6 @@ async def _deliver_shared_file_with_claim_check(
     db: Database,
     bot: Bot,
 ) -> None:
-    """
-    Delivers a shared single file with:
-    - Owner self-retrieval bypass: ZERO trial/claim lock, ZERO auto-delete, ZERO `protect_content`, ZERO trial alerts
-    - Full Access Grant bypass (`link_access_grants`): skips 1x/User lock & auto-delete timer, unlimited opens while valid
-    - Atomic 1-Time Per-User Trial Claim Lock (`INSERT OR IGNORE` BEFORE sending) for regular trial visitors
-    - 2-column `🔓 Request Full Access` + `💬 Contact Owner` CTA on Trial Delivery, Repeat-Open & Expiry Notice
-    - Restart-safe `scheduled_deletes` timer
-    """
     owner = await db.get_user(file_row["uploader_user_id"])
     is_owner = (
         visitor["user_id"] == file_row["uploader_user_id"]
@@ -607,14 +656,6 @@ async def _deliver_shared_pack_with_claim_check(
     bot: Bot,
     config: Optional[Config] = None,
 ) -> None:
-    """
-    Delivers a shared multi-file Pack with:
-    - Owner self-retrieval bypass: ZERO trial/claim lock, ZERO auto-delete, ZERO `protect_content`, ZERO trial alerts
-    - Full Access Grant bypass (`link_access_grants`): skips 1x/User lock & auto-delete timer, unlimited opens while valid
-    - Atomic 1-Time Per-User Trial Claim Lock (`INSERT OR IGNORE` BEFORE sending) for regular trial visitors
-    - 2-column `🔓 Request Full Access` + `💬 Contact Owner` CTA on Trial Delivery, Repeat-Open & Expiry Notice
-    - Native 100-in-1 `copy_messages` batch delivery + restart-safe `scheduled_deletes`
-    """
     is_owner = (
         visitor["user_id"] == pack["creator_user_id"]
         or visitor["vault_id"] == pack["vault_id"]
@@ -704,13 +745,16 @@ async def cmd_start(
     )
     args = (command.args or "").strip()
 
-    # Deep-link: shared single file (Owner Bypass + Full Access Grant + 1x/User Claim Lock + PIN + No-Fwd + Auto-Delete)
+    # Deep-link: shared single file
     if args.startswith("file_"):
         token = args[5:].strip()
         raw_file = await db.get_file_by_share_token(token, include_unavailable=True)
         if not raw_file:
             hdr, reason = _diagnose_file_unavailable(None)
-            await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
+            await message.answer(
+                f"{hdr}\n<blockquote>{reason}</blockquote>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
+            )
             return
 
         is_owner = (
@@ -723,8 +767,6 @@ async def cmd_start(
             else await db.has_active_access_grant("file", raw_file["id"], user["user_id"])
         )
 
-        # Owner & approved Full Access users can always retrieve their unlocked content;
-        # regular visitors must pass paused/expiry/max_views link checks
         file_row = (
             raw_file
             if (is_owner or has_full_access)
@@ -745,7 +787,6 @@ async def cmd_start(
             )
             return
 
-        # Pre-check 1x/User claim BEFORE asking for PIN so repeat trial visitors aren't prompted unnecessarily
         if (
             not is_owner
             and not has_full_access
@@ -776,8 +817,8 @@ async def cmd_start(
             await state.set_state(ShareUnlockStates.waiting_for_file_pin)
             await state.update_data(unlock_file_token=token)
             await message.answer(
-                f"🔒 <b>PIN Required</b>\n"
-                f"<blockquote>Enter PIN to unlock <b>{esc(file_row['title'][:36])}</b>:</blockquote>",
+                f"🔒 <b>Password / PIN Required</b>\n"
+                f"<blockquote>Send the PIN to unlock <b>{esc(file_row['title'][:36])}</b>:</blockquote>",
                 reply_markup=cancel_kb("nav:home"),
             )
             return
@@ -785,13 +826,16 @@ async def cmd_start(
         await _deliver_shared_file_with_claim_check(message, user, file_row, db, bot)
         return
 
-    # Deep-link: shared multi-file Pack (Owner Bypass + Full Access Grant + 1x/User Claim Lock + 100-in-1 Batch Delivery)
+    # Deep-link: shared multi-file Pack
     if args.startswith("pack_"):
         token = args[5:].strip()
         raw_pack = await db.get_pack_by_token(token, include_unavailable=True)
         if not raw_pack or raw_pack.get("item_count", 0) == 0:
             hdr, reason = _diagnose_pack_unavailable(raw_pack)
-            await message.answer(f"{hdr}\n<blockquote>{reason}</blockquote>")
+            await message.answer(
+                f"{hdr}\n<blockquote>{reason}</blockquote>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
+            )
             return
 
         is_owner = (
@@ -854,8 +898,8 @@ async def cmd_start(
             await state.set_state(ShareUnlockStates.waiting_for_pack_pin)
             await state.update_data(unlock_pack_token=token)
             await message.answer(
-                f"🔒 <b>PIN Required</b>\n"
-                f"<blockquote>Enter PIN to unlock <b>{esc(pack['title'])}</b> ({pack['item_count']} files):</blockquote>",
+                f"🔒 <b>Password / PIN Required</b>\n"
+                f"<blockquote>Send the PIN to unlock <b>{esc(pack['title'])}</b> ({pack['item_count']} files):</blockquote>",
                 reply_markup=cancel_kb("nav:home"),
             )
             return
@@ -869,24 +913,25 @@ async def cmd_start(
         group = await db.join_shared_group(user["vault_id"], invite)
         if not group:
             await message.answer(
-                "⚠️ <b>Invalid Invite</b>\n<blockquote>Link expired or reset.</blockquote>"
+                "⚠️ <b>Invalid Invite Link</b>\n<blockquote>This group invite has expired or been reset.</blockquote>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
             )
             return
         uname = bot_username or "KoshBox_Bot"
         await send_with_effect(
             message.answer,
-            f"🎉 <b>Joined {esc(group['name'])}</b> · <i>{group.get('file_count', 0)} files</i>\n"
-            f"<blockquote>Inline: <code>@{esc(uname)} g:{esc(group['name'])}</code></blockquote>",
+            f"🎉 <b>Joined {esc(group['name'])}!</b> · <i>{group.get('file_count', 0)} files</i>\n"
+            f"<blockquote>Search inline anytime: <code>@{esc(uname)} g:{esc(group['name'])}</code></blockquote>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="📂 Open",
+                            text="📂 Open Group",
                             callback_data=f"grp:open:{group['id']}",
                             style="primary",
                         ),
                         InlineKeyboardButton(
-                            text="🔍 Inline",
+                            text="🔍 Search Group",
                             switch_inline_query_current_chat=f"g:{group['name']} ",
                         ),
                     ],
@@ -904,24 +949,7 @@ async def cmd_start(
         return
 
     if args == "upload":
-        upload_caption = (
-            f"📤 <b>Archive Media</b>\n"
-            f"<blockquote>Drop or forward any file, photo, audio, video, or album here.\n"
-            f"Add <code>#tags</code> in caption to auto-organize.</blockquote>"
-        )
-        upload_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🎒 New Pack",
-                        callback_data="pk:new",
-                        style="primary",
-                    ),
-                    InlineKeyboardButton(text="📁 Folder", callback_data="nav:groups"),
-                ],
-                [home_btn("🏠 Vault")],
-            ]
-        )
+        upload_caption, upload_kb = render_upload_hub_card()
         await send_banner_message(
             message, "upload", upload_caption, upload_kb, bot, db, config
         )
@@ -944,6 +972,43 @@ async def cmd_start(
         config,
         message_effect_id=EFFECT_PARTY if is_first_welcome else None,
     )
+
+
+@router.callback_query(F.data == "nav:upload")
+async def cb_nav_upload(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    config: Config,
+) -> None:
+    if not callback.from_user:
+        return
+    await state.clear()
+    caption, kb = render_upload_hub_card()
+    await edit_or_send_banner(
+        callback, "upload", caption, kb, bot, db, config, also_ack=True
+    )
+
+
+@router.message(Command("upload"))
+async def cmd_upload(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    config: Config,
+) -> None:
+    if not message.from_user:
+        return
+    await state.clear()
+    await db.ensure_user(
+        message.from_user.id,
+        message.from_user.username or "",
+        message.from_user.full_name or "",
+    )
+    caption, kb = render_upload_hub_card()
+    await send_banner_message(message, "upload", caption, kb, bot, db, config)
 
 
 @router.message(ShareUnlockStates.waiting_for_file_pin)
@@ -1122,7 +1187,7 @@ async def cb_home_bulk(
         bot,
         db,
         config,
-        answer_text="⚡ Bulk ON" if enabled else "Bulk OFF",
+        answer_text="⚡ Silent Bulk ON" if enabled else "Silent Bulk OFF",
         also_ack=True,
     )
 
@@ -1180,14 +1245,14 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
     if current is None:
         await message.answer(
-            "ℹ️ Nothing active.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Vault")]]),
+            "ℹ️ Nothing active right now.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Home")]]),
         )
         return
     await state.clear()
     await message.answer(
-        "✕ <b>Cancelled</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Vault")]]),
+        "✖️ <b>Cancelled</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn("🏠 Home")]]),
     )
 
 
@@ -1208,6 +1273,12 @@ async def cb_fsm_cancel(
     pend_task = _PACK_BUILDER_TASKS.pop(callback.from_user.id, None)
     if pend_task and not pend_task.done():
         pend_task.cancel()
+
+    await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     await state.clear()
     target = callback.data.split(":", 2)[2]
     uname = bot_username or "KoshBox_Bot"
@@ -1288,16 +1359,24 @@ async def cb_fsm_cancel(
     elif target.startswith("br:"):
         from handlers.file_actions import render_browse_page
 
-        _, flt, sort_key, gid_s, page_s = target.split(":")
-        text, kb = await render_browse_page(
-            callback.from_user.id, flt, sort_key, int(gid_s), int(page_s), db
-        )
-        await safe_edit_or_send(
-            callback, text, kb, answer_text="Cancelled", also_ack=True
-        )
-        return
-    elif target.startswith("f:link:"):
-        fid = int(target.split(":")[2])
+        br_parts = target.split(":")
+        if len(br_parts) == 5:
+            _, flt, sort_key, gid_s, page_s = br_parts
+            text, kb = await render_browse_page(
+                callback.from_user.id, flt, sort_key, int(gid_s), int(page_s), db
+            )
+            await safe_edit_or_send(
+                callback, text, kb, answer_text="Cancelled", also_ack=True
+            )
+            return
+    elif target.startswith("fsl:") or target.startswith("f:link:"):
+        if target.startswith("fsl:"):
+            sub_p = target.split(":", 2)
+            fid = int(sub_p[1])
+            back_ctx = sub_p[2] if len(sub_p) > 2 else None
+        else:
+            fid = int(target.split(":")[2])
+            back_ctx = None
         f = await db.get_file(fid)
         if f:
             from handlers.file_actions import _render_file_link_card
@@ -1310,31 +1389,79 @@ async def cb_fsm_cancel(
                 _render_file_link_card(
                     f, uname, unique_claims=claims, owner_global_ttl=owner_ttl
                 ),
-                build_file_link_keyboard(f, bot_username=uname),
+                build_file_link_keyboard(f, back_cb=back_ctx, bot_username=uname),
                 answer_text="Cancelled",
                 also_ack=True,
             )
             return
-    elif target.startswith("f:manage:"):
-        fid = int(target.split(":")[2])
+    elif target.startswith("fm:") or target.startswith("f:manage:"):
+        if target.startswith("fm:"):
+            sub_p = target.split(":", 2)
+            fid = int(sub_p[1])
+            back_ctx = sub_p[2] if len(sub_p) > 2 else None
+        else:
+            fid = int(target.split(":")[2])
+            back_ctx = None
         f = await db.get_file(fid)
         if f:
             await safe_edit_or_send(
                 callback,
                 build_file_card_text(f, uname, edit_mode=True),
-                build_file_manage_keyboard(f, bot_username=uname),
+                build_file_manage_keyboard(f, back_cb=back_ctx, bot_username=uname),
                 answer_text="Cancelled",
                 also_ack=True,
             )
             return
-    elif target.startswith("f:open:"):
-        fid = int(target.split(":")[2])
+    elif target.startswith("f:move:") or target.startswith("fmv:"):
+        if target.startswith("fmv:"):
+            sub_p = target.split(":", 2)
+            fid = int(sub_p[1])
+            back_ctx = f"br:{sub_p[2]}" if len(sub_p) > 2 and sub_p[2] else None
+        else:
+            fid = int(target.split(":")[2])
+            back_ctx = None
+        from handlers.file_actions import render_move_file_menu
+
+        rendered_mv = await render_move_file_menu(callback.from_user.id, fid, db, back_cb=back_ctx)
+        if rendered_mv:
+            await safe_edit_or_send(
+                callback,
+                rendered_mv[0],
+                rendered_mv[1],
+                answer_text="Cancelled",
+                also_ack=True,
+            )
+            return
+    elif target.startswith("f:open:") or target.startswith("fo:"):
+        if target.startswith("fo:"):
+            fo_parts = target.split(":")
+            fid = int(fo_parts[1])
+            back_ctx = f"br:{':'.join(fo_parts[2:6])}" if len(fo_parts) >= 6 else None
+        else:
+            fid = int(target.split(":")[2])
+            back_ctx = None
         f = await db.get_file(fid)
         if f:
             await safe_edit_or_send(
                 callback,
                 build_file_card_text(f, uname),
-                build_file_keyboard(f, bot_username=uname),
+                build_file_keyboard(f, back_cb=back_ctx, bot_username=uname),
+                answer_text="Cancelled",
+                also_ack=True,
+            )
+            return
+    elif target.startswith("grp:manage:"):
+        gid = int(target.split(":")[2])
+        from handlers.groups import render_single_group
+
+        rendered = await render_single_group(
+            callback.from_user.id, gid, db, bot, manage_mode=True, bot_username=uname
+        )
+        if rendered:
+            await safe_edit_or_send(
+                callback,
+                rendered[0],
+                rendered[1],
                 answer_text="Cancelled",
                 also_ack=True,
             )
@@ -1388,11 +1515,11 @@ async def cmd_bulk(message: Message, db: Database) -> None:
     enabled = await db.toggle_bulk_mode(message.from_user.id)
     if enabled:
         await message.answer(
-            "⚡ <b>Bulk Mode: ON</b>\n<blockquote>Drop multiple files for compact 1-line saves.</blockquote>",
+            "⚡ <b>Silent Bulk Mode: ON</b>\n<blockquote>Drop multiple files for compact 1-line confirmations.</blockquote>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(text="⬜ Bulk Off", callback_data="set:bulk"),
+                        InlineKeyboardButton(text="⚪ Turn Bulk OFF", callback_data="set:bulk"),
                         home_btn(),
                     ]
                 ]
@@ -1400,7 +1527,7 @@ async def cmd_bulk(message: Message, db: Database) -> None:
         )
     else:
         await message.answer(
-            "✅ <b>Bulk Mode: OFF</b>",
+            "✅ <b>Silent Bulk Mode: OFF</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[home_btn()]]),
         )
 
@@ -1445,9 +1572,12 @@ async def cmd_settings(message: Message, db: Database) -> None:
 
 
 @router.callback_query(F.data == "nav:settings")
-async def cb_nav_settings(callback: CallbackQuery, db: Database) -> None:
+async def cb_nav_settings(
+    callback: CallbackQuery, state: FSMContext, db: Database
+) -> None:
     if not callback.from_user:
         return
+    await state.clear()
     await db.ensure_user(
         callback.from_user.id,
         callback.from_user.username or "",
@@ -1461,6 +1591,11 @@ async def cb_nav_settings(callback: CallbackQuery, db: Database) -> None:
 async def cb_settings_bulk(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
+    await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     enabled = await db.toggle_bulk_mode(callback.from_user.id)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
     await safe_edit_or_send(
@@ -1476,6 +1611,11 @@ async def cb_settings_bulk(callback: CallbackQuery, db: Database) -> None:
 async def cb_settings_one_time(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
+    await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     enabled = await db.toggle_default_one_time(callback.from_user.id)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
     await safe_edit_or_send(
@@ -1497,7 +1637,11 @@ async def cb_settings_contact_prompt(
 ) -> None:
     if not callback.from_user:
         return
-    user = await db.get_user(callback.from_user.id)
+    user = await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     cur = (user or {}).get("support_contact") or ""
     resolved = await db.resolve_owner_contact_url(
         user["vault_id"], preferred_user_id=callback.from_user.id
@@ -1508,9 +1652,9 @@ async def cb_settings_contact_prompt(
     await state.set_state(SettingsStates.waiting_for_support_contact)
     await safe_edit_or_send(
         callback,
-        f"{breadcrumb('Vault', 'Settings', 'Support')}\n"
-        f"💬 <b>Support / Sales Contact</b> · {cur_lbl}\n"
-        f"<blockquote>Send your Telegram <code>@username</code> or <code>https://t.me/...</code> link shown on Trial Ended &amp; Auto-Delete notices (or <code>-</code> to reset to your own handle):</blockquote>",
+        f"{breadcrumb('🏠 Home', '⚙️ Settings', '💬 Contact')}\n"
+        f"💬 <b>Support / Owner Contact</b> · {cur_lbl}\n"
+        f"<blockquote>Send your Telegram <code>@username</code> or <code>https://t.me/...</code> link shown on Trial &amp; Auto-Delete cards (or send <code>-</code> to reset):</blockquote>",
         cancel_kb("nav:settings"),
         also_ack=True,
     )
@@ -1523,18 +1667,21 @@ async def fsm_save_support_contact(
     if not message.from_user or not message.text:
         return
     raw = message.text.strip()
+    if raw.startswith("/") and raw.lower().split()[0] in ("/cancel", "/start"):
+        await state.clear()
+        return
     try:
         saved_url = await db.set_support_contact(message.from_user.id, raw)
     except ValueError:
         await message.answer(
-            "⚠️ <b>Invalid Handle or Link</b>\n"
-            "<blockquote>Send a valid <code>@username</code> (e.g. <code>@MySupport</code>), a <code>https://t.me/...</code> URL, or <code>-</code> to clear:</blockquote>",
+            "⚠️ <b>Invalid Username or Link</b>\n"
+            "<blockquote>Send a valid <code>@username</code> (e.g. <code>@MySupport</code>), a <code>https://t.me/...</code> link, or <code>-</code> to clear:</blockquote>",
             reply_markup=cancel_kb("nav:settings"),
         )
         return
     await state.clear()
     text, kb = await _render_settings_panel(message.from_user.id, db)
-    badge = f"✅ <b>Support Contact Set:</b> <code>{esc(saved_url)}</code>" if saved_url else "✅ <b>Support Contact Reset</b>"
+    badge = f"✅ <b>Support Contact Saved:</b> <code>{esc(saved_url)}</code>" if saved_url else "✅ <b>Support Contact Reset</b>"
     await message.answer(
         f"{badge}\n\n{text}",
         reply_markup=kb,
@@ -1546,6 +1693,11 @@ async def fsm_save_support_contact(
 async def cb_settings_protect(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
+    await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     enabled = await db.toggle_protect_content(callback.from_user.id)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
     await safe_edit_or_send(
@@ -1565,13 +1717,18 @@ async def cb_settings_protect(callback: CallbackQuery, db: Database) -> None:
 async def cb_settings_ttl(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
+    await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     new_ttl = await db.cycle_auto_delete_ttl(callback.from_user.id)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
     await safe_edit_or_send(
         callback,
         text,
         kb,
-        answer_text=f"⏱ Auto-Delete: {format_ttl_short(new_ttl)}",
+        answer_text=f"💣 Auto-Delete: {format_ttl_short(new_ttl)}",
         also_ack=True,
     )
 
@@ -1580,7 +1737,11 @@ async def cb_settings_ttl(callback: CallbackQuery, db: Database) -> None:
 async def cb_settings_sort(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
-    user = await db.get_user(callback.from_user.id)
+    user = await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     nxt = next_sort_key(user.get("default_sort") or "new")
     await db.set_default_sort(callback.from_user.id, nxt)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
@@ -1597,10 +1758,15 @@ async def cb_settings_sort(callback: CallbackQuery, db: Database) -> None:
 async def cb_settings_clear_grp(callback: CallbackQuery, db: Database) -> None:
     if not callback.from_user:
         return
+    await db.ensure_user(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.full_name or "",
+    )
     await db.set_active_group(callback.from_user.id, None)
     text, kb = await _render_settings_panel(callback.from_user.id, db)
     await safe_edit_or_send(
-        callback, text, kb, answer_text="Target reset", also_ack=True
+        callback, text, kb, answer_text="Upload folder reset to Personal Vault", also_ack=True
     )
 
 
@@ -1610,12 +1776,6 @@ async def cb_settings_clear_grp(callback: CallbackQuery, db: Database) -> None:
 def _build_owner_approval_keyboard(
     short_type: str, item_id: int, visitor_uid: int
 ) -> InlineKeyboardMarkup:
-    """
-    2-column 1-tap Approval Card keyboard for the owner (`callback_data <= 64` bytes):
-    Row 1: [ ✅ 1 Day ] · [ ✅ 7 Days ]
-    Row 2: [ ✅ 30 Days ] · [ ♾️ Lifetime ]
-    Row 3: [ ❌ Reject ]
-    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1667,12 +1827,6 @@ async def cb_request_full_access(
     db: Database,
     bot: Bot,
 ) -> None:
-    """
-    Visitor taps `🔓 Request Full Access` (`req:<f|p>:<id>`):
-    - Bounded 10m TTLCache rate-limit per `(user_id, link_type, link_id)` to prevent owner spam.
-    - Sends a sleek 1-tap Approval Card to all linked accounts of the owner's `vault_id`.
-    - Confirms to the visitor with `💬 Contact Owner` CTA.
-    """
     if not callback.from_user:
         return
     parts = (callback.data or "").split(":")
@@ -1709,7 +1863,6 @@ async def cb_request_full_access(
         item_title = item.get("title") or "Shared Pack"
         kind_badge = f"🎒 Pack ({item['item_count']} files)"
 
-    # Owners never need to request access to their own vault content
     if (
         visitor["user_id"] == preferred_owner_uid
         or visitor["vault_id"] == owner_vault_id
@@ -1719,7 +1872,6 @@ async def cb_request_full_access(
         )
         return
 
-    # If visitor already holds an active Full Access Grant, let them know immediately
     existing_grant = await db.get_active_access_grant(
         link_type, item_id, visitor["user_id"]
     )
@@ -1728,7 +1880,6 @@ async def cb_request_full_access(
         await callback.answer(f"✅ You already have {badge}!", show_alert=True)
         return
 
-    # 10-minute bounded TTLCache rate-limit per (user_id, link_type, link_id)
     cooldown_rem = _check_access_request_cooldown(
         visitor["user_id"], link_type, item_id
     )
@@ -1759,13 +1910,12 @@ async def cb_request_full_access(
         f"🆔 <b>User ID:</b> <code>{visitor['user_id']}</code>\n"
         f"📦 <b>{kind_badge}:</b> <b>{esc(item_title[:48])}</b>"
         f"</blockquote>\n"
-        f"<i>Tap a duration below to grant full non-trial access in 1 tap:</i>"
+        f"<i>Tap a duration below to approve full access in 1 tap:</i>"
     )
     approval_kb = _build_owner_approval_keyboard(
         short_type, item_id, int(visitor["user_id"])
     )
 
-    # Deliver Approval Card to all linked owner accounts in `owner_vault_id` (ensuring preferred uploader/creator is included)
     owner_accounts = await db.get_linked_accounts(owner_vault_id)
     recipient_uids: list[int] = []
     if preferred_owner_uid:
@@ -1789,7 +1939,7 @@ async def cb_request_full_access(
 
     confirm_text = (
         "📩 <b>Full access request sent to the owner!</b>\n"
-        "<blockquote>You can also message them directly to complete your purchase.</blockquote>"
+        "<blockquote>You will receive an instant notification here once approved, or message the owner below:</blockquote>"
     )
     confirm_kb = build_contact_owner_kb(contact_url)
 
@@ -1809,13 +1959,6 @@ async def cb_owner_grant_or_reject_access(
     bot: Bot,
     bot_username: str = "KoshBox_Bot",
 ) -> None:
-    """
-    Owner taps an Approval Card action (`gr:<f|p>:<item_id>:<uid>:<days>`):
-    - `days` in `{1, 7, 30, 0}` -> grants persistent Full Access in `link_access_grants`
-      (`0` = Lifetime), cancels any pending trial auto-delete for that user + item, updates the
-      owner's card in-place, and DMs the visitor with an instant `📥 Open Unlocked Content` deep-link button!
-    - `days == -1` -> rejects the request, updates the owner's card, and politely notifies the visitor.
-    """
     if not callback.from_user:
         return
     parts = (callback.data or "").split(":")
@@ -1975,7 +2118,7 @@ async def cb_owner_grant_or_reject_access(
                 f"📦 <b>{esc(item_title[:48])}</b>\n"
                 f"✅ <b>Access:</b> {dur_lbl} · Zero Trial Timer"
                 f"</blockquote>\n"
-                f"<i>Tap below anytime to retrieve your unlocked content:</i>"
+                f"<i>Tap below anytime to open your unlocked content:</i>"
             ),
             reply_markup=visitor_kb,
             disable_web_page_preview=True,

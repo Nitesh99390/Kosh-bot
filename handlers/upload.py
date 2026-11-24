@@ -680,12 +680,12 @@ def _build_live_pack_status_card(
     append_pack_id: Optional[int] = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Builds the single consolidated live Pack Builder status message (zero spam!)."""
-    mode_lbl = "Add to Pack" if append_pack_id else "Pack Builder"
+    mode_lbl = "Add Files to Pack" if append_pack_id else "Pack Builder"
     cancel_target = f"pk:open:{append_pack_id}" if append_pack_id else "pk:list:0"
     finish_lbl = (
-        f"✓ Save {fids_count} to Pack"
+        f"✅ Save {fids_count} to Pack"
         if append_pack_id
-        else f"✓ Finish Pack ({fids_count})"
+        else f"✅ Finish Pack ({fids_count})"
     )
 
     recent_lines = [f"• {esc(t[:36])}" for t in recent_titles[-4:]]
@@ -696,10 +696,10 @@ def _build_live_pack_status_card(
     preview = "\n".join(recent_lines) if recent_lines else "<i>Waiting for files…</i>"
 
     text = (
-        f"{breadcrumb('Vault', 'Packs', mode_lbl)}\n"
+        f"{breadcrumb('🏠 Home', '🎒 Packs', mode_lbl)}\n"
         f"🎒 <b>{mode_lbl}</b> · <b>{fids_count}</b> queued <i>({format_size(total_size)})</i>\n"
         f"<blockquote>{preview}</blockquote>\n"
-        f"<i>Send more files or tap <b>{esc(finish_lbl)}</b> below.</i>"
+        f"<i>Send more files or tap <b>{esc(finish_lbl)}</b> below:</i>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -710,7 +710,7 @@ def _build_live_pack_status_card(
                     style="success",
                 ),
                 InlineKeyboardButton(
-                    text="✕ Cancel",
+                    text="✖️ Cancel",
                     callback_data=f"fsm:cancel:{cancel_target}",
                 ),
             ]

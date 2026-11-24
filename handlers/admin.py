@@ -21,7 +21,6 @@ from utils.formatters import (
     back_btn,
     breadcrumb,
     cancel_kb,
-    esc,
     format_size,
     home_btn,
     safe_edit_or_send,
@@ -40,12 +39,12 @@ async def _render_admin_panel(db: Database) -> tuple[str, InlineKeyboardMarkup]:
     cached_banners = await db.list_ui_assets()
     ban_badge = f" · 🚫 {stats['banned']} banned" if stats.get("banned") else ""
     text = (
-        f"{breadcrumb('System', 'Admin')}\n"
+        f"{breadcrumb('⚙️ System', '🛠️ Admin Console')}\n"
         f"🛠️ <b>Admin Console</b>\n"
         f"<blockquote>"
-        f"👤 <b>{stats['users']}</b> users <i>({stats['active_24h']} 24h{ban_badge})</i>  ·  🔐 <b>{stats['vaults']}</b> vaults\n"
-        f"📦 <b>{stats['files']}</b> files  ·  🎒 <b>{stats.get('packs', 0)}</b> packs  ·  📁 <b>{stats['groups']}</b> groups\n"
-        f"💾 <b>{format_size(stats['total_size'])}</b>  ·  🖼️ Banners: <b>{len(cached_banners)}/{len(BANNER_FILES)}</b>"
+        f"👤 <b>{stats['users']}</b> users <i>({stats['active_24h']} active 24h{ban_badge})</i>  •  🔐 <b>{stats['vaults']}</b> vaults\n"
+        f"📦 <b>{stats['files']}</b> files  •  🎒 <b>{stats.get('packs', 0)}</b> packs  •  📁 <b>{stats['groups']}</b> folders\n"
+        f"💾 <b>{format_size(stats['total_size'])}</b>  •  🖼️ Banners: <b>{len(cached_banners)}/{len(BANNER_FILES)}</b>"
         f"</blockquote>"
     )
     kb = InlineKeyboardMarkup(
@@ -126,6 +125,9 @@ async def fsm_admin_toggle_ban(
     ):
         return
     raw = message.text.strip()
+    if raw.startswith("/") and raw.lower().split()[0] in ("/cancel", "/start"):
+        await state.clear()
+        return
     if not raw.isdigit():
         await message.answer("⚠️ Send a numeric User ID.", reply_markup=cancel_kb("adm:refresh"))
         return
@@ -216,7 +218,7 @@ async def cmd_broadcast(
         return
     await state.set_state(AdminStates.waiting_for_broadcast)
     await message.answer(
-        "📣 <b>Broadcast</b>\n<blockquote>Send text or media to copy to all users:</blockquote>",
+        "📣 <b>Broadcast Message</b>\n<blockquote>Send text or media to copy to all users:</blockquote>",
         reply_markup=cancel_kb("adm:refresh"),
     )
 
@@ -231,7 +233,7 @@ async def cb_admin_broadcast(
     await state.set_state(AdminStates.waiting_for_broadcast)
     await safe_edit_or_send(
         callback,
-        "📣 <b>Broadcast</b>\n<blockquote>Send text or media to copy to all users:</blockquote>",
+        "📣 <b>Broadcast Message</b>\n<blockquote>Send text or media to copy to all users:</blockquote>",
         cancel_kb("adm:refresh"),
         also_ack=True,
     )
@@ -242,6 +244,9 @@ async def fsm_broadcast(
     message: Message, state: FSMContext, db: Database, bot: Bot, config: Config
 ) -> None:
     if not message.from_user or not _is_admin(message.from_user.id, config):
+        return
+    if message.text and message.text.strip().lower() in ("/cancel", "/start"):
+        await state.clear()
         return
     await state.clear()
     user_ids = await db.get_all_user_ids()
@@ -261,8 +266,8 @@ async def fsm_broadcast(
         await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
-        f"✅ <b>Broadcast Done</b> · Sent: <b>{sent}</b> · Skipped: <b>{failed}</b>",
+        f"✅ <b>Broadcast Complete</b> · Sent: <b>{sent}</b> · Skipped: <b>{failed}</b>",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[back_btn("adm:refresh", "◀ Admin"), home_btn()]]
+            inline_keyboard=[[back_btn("adm:refresh", "⬅️ Admin"), home_btn()]]
         ),
     )

@@ -181,7 +181,8 @@ def _to_inline_result(
     fid = f["file_id"]
     title = (f.get("title") or "Untitled")[:128]
     desc = _build_description(f)[:200]
-    caption = f.get("caption") or None
+    raw_cap = f.get("caption")
+    caption = esc(raw_cap)[:1020] if raw_cap else None
 
     if mtype == "audio":
         return InlineQueryResultCachedAudio(

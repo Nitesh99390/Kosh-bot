@@ -2263,6 +2263,7 @@ class Database:
         self,
         vault_id: int,
         *,
+        text_query: str = "",
         media_type: Optional[str] = None,
         group_id_filter: Optional[int] = None,
         only_favorites: bool = False,
@@ -2281,11 +2282,25 @@ class Database:
         if group_id_filter is not None:
             conditions.append("f.group_id = ?")
             params.append(group_id_filter)
-        where_sql = " AND ".join(conditions)
-        cur = await self.conn.execute(
-            f"SELECT COUNT(*) FROM files f WHERE {where_sql}", params
+
+        cleaned_text = text_query.strip()
+        if not cleaned_text:
+            where_sql = " AND ".join(conditions)
+            cur = await self.conn.execute(
+                f"SELECT COUNT(*) FROM files f WHERE {where_sql}", params
+            )
+            return int((await cur.fetchone())[0])
+
+        rows = await self.search_files(
+            vault_id,
+            text_query=cleaned_text,
+            media_type=media_type,
+            group_id_filter=group_id_filter,
+            only_favorites=only_favorites,
+            limit=500,
+            offset=0,
         )
-        return int((await cur.fetchone())[0])
+        return len(rows)
 
     async def search_files(
         self,

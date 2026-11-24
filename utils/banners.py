@@ -16,14 +16,13 @@ from aiogram.types import (
 
 from config import Config
 from database import Database
-from utils.formatters import safe_edit_or_send, safe_gather
+from utils.formatters import downgrade_reply_markup, safe_edit_or_send, safe_gather
 
 logger = logging.getLogger("koshbox.banners")
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BANNERS_DIR = os.path.join(BASE_DIR, "assets", "banners")
 
-# Registry of custom KoshBox 3D illustration banners (PostBot-style hero cards)
 BANNER_FILES: dict[str, str] = {
     "welcome": os.path.join(BANNERS_DIR, "welcome.jpg"),
     "upload": os.path.join(BANNERS_DIR, "upload.jpg"),
@@ -36,9 +35,23 @@ BANNER_LABELS: dict[str, str] = {
     "guide": "🔍 KoshBox Inline Search & Sync Guide Banner",
 }
 
-# Per-key asyncio locks + process-lifetime SHA-256 cache so banners never re-hash disk files per click
 _ASSET_LOCKS: dict[str, asyncio.Lock] = {}
 _LOCAL_SHA_CACHE: dict[str, tuple[float, str]] = {}
+
+_MARKUP_ERR_KEYS = (
+    "reply_markup",
+    "style",
+    "copy_text",
+    "button",
+    "inline_keyboard",
+    "can't parse inline keyboard",
+    "button_type_invalid",
+)
+
+
+def _is_markup_err(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(k in s for k in _MARKUP_ERR_KEYS)
 
 
 def _get_lock(asset_key: str) -> asyncio.Lock:
@@ -77,13 +90,7 @@ async def get_or_upload_banner_file_id(
 ) -> Optional[str]:
     """
     Returns the cached Telegram `file_id` for a KoshBox banner.
-
-    CRITICAL ARCHITECTURE:
-    - Checks SQLite `ui_assets` first. If cached and SHA-256 matches the local file,
-      returns the `file_id` immediately with ZERO disk/network upload from the server.
-    - If not cached yet (first run or updated artwork), uploads ONCE from the server
-      into `config.dump_channel_id`, stores `file_id` + `dump_message_id` + `sha256`
-      in SQLite, and reuses that `file_id` forever.
+    Checks SQLite `ui_assets` first; uploads ONCE to `config.dump_channel_id` if uncached.
     """
     path = BANNER_FILES.get(asset_key)
     if not path or not os.path.isfile(path):
@@ -121,7 +128,6 @@ async def get_or_upload_banner_file_id(
                 config.dump_channel_id,
                 exc,
             )
-            # Fall back to any previously cached file_id if available
             fallback = await db.get_ui_asset(asset_key)
             return fallback["file_id"] if fallback else None
 
@@ -152,11 +158,6 @@ async def warmup_banners_in_dump_channel(
     *,
     force_reupload: bool = False,
 ) -> dict[str, bool]:
-    """
-    Ensures all UI banner illustrations are uploaded ONCE to the Dump Channel
-    at bot startup (or via Admin Console sync), so user interactions are 100% instant
-    using cached Telegram `file_id`s.
-    """
     status: dict[str, bool] = {}
     for key in BANNER_FILES:
         fid = await get_or_upload_banner_file_id(
@@ -164,6 +165,43 @@ async def warmup_banners_in_dump_channel(
         )
         status[key] = bool(fid)
     return status
+
+
+async def _try_answer_photo(
+    message: Message,
+    photo_id: str,
+    caption: str,
+    reply_markup: Optional[InlineKeyboardMarkup],
+    effect_kw: dict,
+) -> Optional[Message]:
+    try:
+        return await message.answer_photo(
+            photo=photo_id,
+            caption=caption,
+            reply_markup=reply_markup,
+            **effect_kw,
+        )
+    except TypeError:
+        return await message.answer_photo(
+            photo=photo_id,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+    except TelegramBadRequest as exc:
+        if effect_kw and "effect" in str(exc).lower():
+            return await _try_answer_photo(message, photo_id, caption, reply_markup, {})
+        if reply_markup is not None and _is_markup_err(exc):
+            plain_rm = downgrade_reply_markup(reply_markup, drop_copy_text=False)
+            try:
+                return await message.answer_photo(
+                    photo=photo_id, caption=caption, reply_markup=plain_rm
+                )
+            except TelegramBadRequest:
+                safe_rm = downgrade_reply_markup(reply_markup, drop_copy_text=True)
+                return await message.answer_photo(
+                    photo=photo_id, caption=caption, reply_markup=safe_rm
+                )
+        raise
 
 
 async def send_banner_message(
@@ -178,36 +216,17 @@ async def send_banner_message(
     message_effect_id: Optional[str] = None,
 ) -> Message:
     """
-    Sends a PostBot-style visual card (cached photo from Dump Channel + HTML caption + inline keyboard).
-    Gracefully falls back to clean HTML text if Dump Channel isn't reachable yet.
-    Supports optional Bot API 9.4 `message_effect_id` full-screen celebration effects!
+    Sends a visual card (cached photo from Dump Channel + HTML caption + inline keyboard).
+    Gracefully falls back to clean HTML text or downgraded button styles if needed.
     """
     effect_kw = {"message_effect_id": message_effect_id} if message_effect_id else {}
     file_id = await get_or_upload_banner_file_id(asset_key, bot, db, config)
-    if file_id:
+    if file_id and len(caption) <= 1024:
         try:
-            return await message.answer_photo(
-                photo=file_id,
-                caption=caption,
-                reply_markup=reply_markup,
-                **effect_kw,
-            )
-        except TypeError:
-            return await message.answer_photo(
-                photo=file_id,
-                caption=caption,
-                reply_markup=reply_markup,
-            )
+            res = await _try_answer_photo(message, file_id, caption, reply_markup, effect_kw)
+            if res:
+                return res
         except TelegramBadRequest as exc:
-            if message_effect_id and "effect" in str(exc).lower():
-                try:
-                    return await message.answer_photo(
-                        photo=file_id,
-                        caption=caption,
-                        reply_markup=reply_markup,
-                    )
-                except Exception:
-                    pass
             logger.warning(
                 "Cached banner file_id invalid for '%s' (%s); refreshing once from Dump Channel.",
                 asset_key,
@@ -218,11 +237,9 @@ async def send_banner_message(
             )
             if fresh_id:
                 try:
-                    return await message.answer_photo(
-                        photo=fresh_id,
-                        caption=caption,
-                        reply_markup=reply_markup,
-                    )
+                    res = await _try_answer_photo(message, fresh_id, caption, reply_markup, {})
+                    if res:
+                        return res
                 except Exception:
                     pass
         except Exception as exc:
@@ -235,7 +252,14 @@ async def send_banner_message(
             disable_web_page_preview=True,
             **effect_kw,
         )
-    except (TypeError, TelegramBadRequest):
+    except (TypeError, TelegramBadRequest) as exc:
+        if reply_markup is not None and isinstance(exc, TelegramBadRequest) and _is_markup_err(exc):
+            safe_rm = downgrade_reply_markup(reply_markup, drop_copy_text=True)
+            return await message.answer(
+                caption,
+                reply_markup=safe_rm,
+                disable_web_page_preview=True,
+            )
         return await message.answer(
             caption,
             reply_markup=reply_markup,
@@ -257,10 +281,7 @@ async def edit_or_send_banner(
     also_ack: bool = False,
 ) -> None:
     """
-    Smoothly transitions an existing callback panel to a PostBot-style banner card:
-    - If the current message already displays the SAME banner image (matched by `file_id` or `file_unique_id`),
-      calls `edit_caption` instead of `edit_media` to avoid Telegram server-side media re-processing!
-    - When `also_ack=True`, dispatches `callback.answer()` concurrently via `asyncio.gather` to save 1 full RTT.
+    Smoothly transitions an existing callback panel to a hero banner card with full markup fallback.
     """
     if not callback.message:
         if also_ack:
@@ -271,7 +292,7 @@ async def edit_or_send_banner(
         return
 
     file_id = await get_or_upload_banner_file_id(asset_key, bot, db, config)
-    if not file_id:
+    if not file_id or len(caption) > 1024:
         await safe_edit_or_send(
             callback,
             caption,
@@ -295,7 +316,7 @@ async def edit_or_send_banner(
                 for p in photos
             )
             try:
-                if same_photo and len(caption) <= 1024:
+                if same_photo:
                     await callback.message.edit_caption(
                         caption=caption,
                         reply_markup=reply_markup,
@@ -309,10 +330,24 @@ async def edit_or_send_banner(
             except TelegramBadRequest as exc:
                 if "message is not modified" in str(exc).lower():
                     return
+                if reply_markup is not None and _is_markup_err(exc):
+                    plain_rm = downgrade_reply_markup(reply_markup, drop_copy_text=True)
+                    try:
+                        if same_photo:
+                            await callback.message.edit_caption(
+                                caption=caption, reply_markup=plain_rm
+                            )
+                        else:
+                            await callback.message.edit_media(
+                                media=InputMediaPhoto(media=file_id, caption=caption),
+                                reply_markup=plain_rm,
+                            )
+                        return
+                    except Exception:
+                        pass
             except Exception as exc:
                 logger.debug("edit_media/edit_caption fallback: %s", exc)
 
-        # Transitioning from a text-only view back to a hero banner card
         sent = await send_banner_message(
             callback.message, asset_key, caption, reply_markup, bot, db, config
         )

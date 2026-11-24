@@ -514,12 +514,12 @@ async def run_tests() -> None:
         assert len(br_kb.inline_keyboard) == 4
 
         flt_txt, flt_kb = file_actions.render_filter_sort_drawer("audio", "top", 0, 0)
-        assert "Filter & Sort" in flt_txt
+        assert "Filter &amp; Sort" in flt_txt
         assert len(flt_kb.inline_keyboard) == 6
 
         grp_txt, grp_kb = await groups.render_groups_panel(1001, db)
-        assert "Folders & Groups" in grp_txt
-        assert len(grp_kb.inline_keyboard) == 2
+        assert "Folders" in grp_txt and "Shared Groups" in grp_txt
+        assert len(grp_kb.inline_keyboard) == 3
 
         sgrp_m = await groups.render_single_group(
             1001, shared_grp["id"], db, dummy_bot, manage_mode=True  # type: ignore[arg-type]
@@ -607,7 +607,8 @@ async def run_tests() -> None:
         assert format_expiry_badge(None) == "Never"
         assert len(progress_bar(0.5, 8)) == 8
         assert next_sort_key("new") == "top"
-        assert toggle_label(True, "Bulk") == "✅ Bulk"
+        assert toggle_label(True, "Bulk") == "🟢 Bulk: ON"
+        assert toggle_label(False, "Bulk") == "⚪ Bulk: OFF"
         assert "Vault › Files" in breadcrumb("Vault", "Files")
         assert copy_btn("Copy", "hello").copy_text.text == "hello"
         assert "t.me/share/url" in (share_url_btn("Share", "https://t.me/test").url or "")
@@ -2302,6 +2303,191 @@ async def run_tests() -> None:
             "🎧 Abyss World — Part 28 of 62",
             "🎧 Abyss World — Part 62 of 62",
         ]
+
+        # 35. UI/UX Redesign & Bug-Fix Regression Suite:
+        #     (a) Button style/copy_text automatic fallback (`downgrade_reply_markup` + `safe_edit_or_send`)
+        #     (b) Browse context (`back_cb`) preserved across File Link security toggles & Move Folder!
+        #     (c) Progressive Disclosure Pack Card (`sec_mode=False` <=5 rows vs `sec_mode=True` Link Locks drawer)
+        #     (d) Raw `<` and `&` in file captions safely HTML-escaped in `send_stored_media` & Inline Mode
+        #     (e) `➕ New Folder` inside `📁 Move Folder` (`grp:new_for_file:<fid>`) creates folder AND moves file!
+        #     (f) `pk:new` from a photo banner card replaces photo cleanly and stores live `pack_status_msg_id`
+        #     (g) Cold-start callback safety (user NOT in `users` table yet taps callback -> zero NoneType crash)
+        #     (h) Accurate `count_files(text_query=...)` search total count + Sticker/Round filters in Filter Drawer
+        from utils.formatters import downgrade_reply_markup
+
+        # (35a) Automatic fallback when Telegram client/API rejects `style` or `copy_text`
+        sample_kb = build_file_link_keyboard(
+            await db.get_file(own_file["id"]),
+            back_cb="br:doc:size:0:2",
+            bot_username="KoshBox_Bot",
+        )
+        downgraded_style_only = downgrade_reply_markup(sample_kb, drop_copy_text=False)
+        assert downgraded_style_only is not None
+        assert all(
+            b.style is None for r in downgraded_style_only.inline_keyboard for b in r
+        )
+        downgraded_full = downgrade_reply_markup(sample_kb, drop_copy_text=True)
+        assert downgraded_full is not None
+        assert all(
+            b.style is None and b.copy_text is None
+            for r in downgraded_full.inline_keyboard
+            for b in r
+        )
+
+        # Simulate a Telegram server rejecting `style` on first `edit_text` attempt -> succeeds automatically on fallback!
+        from aiogram.exceptions import TelegramBadRequest
+
+        fallback_attempts = 0
+
+        async def _flaky_style_edit(txt, reply_markup=None, disable_web_page_preview=False):
+            nonlocal fallback_attempts
+            fallback_attempts += 1
+            if reply_markup and any(
+                b.style is not None for r in reply_markup.inline_keyboard for b in r
+            ):
+                raise TelegramBadRequest(
+                    method=None, message="Bad Request: can't parse inline keyboard button: invalid button style"  # type: ignore[arg-type]
+                )
+            return SimpleNamespace(message_id=77111)
+
+        flaky_cb = SimpleNamespace(
+            data="test",
+            answer=lambda text=None, show_alert=False: asyncio.sleep(0),
+            message=SimpleNamespace(
+                photo=None,
+                text="Old",
+                edit_text=_flaky_style_edit,
+            ),
+        )
+        await safe_edit_or_send(flaky_cb, "Updated cleanly", sample_kb, also_ack=True)  # type: ignore[arg-type]
+        assert fallback_attempts == 2, "safe_edit_or_send must retry automatically without button styles!"
+
+        # (35b) Context preservation (`br:doc:size:0:2`) across File Link toggles (`f:1x`, `f:adel`, `f:prot`, etc.)
+        ctx_cb, _, ctx_edits, _ = _make_cb(
+            9501, "owner_main", "Owner Main", f"f:1x:{own_file['id']}:doc:size:0:2"
+        )
+        await file_actions.cb_file_toggle_one_time(
+            ctx_cb, db, bot_username="KoshBox_Bot"  # type: ignore[arg-type]
+        )
+        assert len(ctx_edits) == 1
+        returned_link_kb = ctx_edits[0][1]
+        back_to_file_btn = returned_link_kb.inline_keyboard[-1][-1]
+        assert back_to_file_btn.callback_data == f"fo:{own_file['id']}:doc:size:0:2", (
+            f"Expected browse context preserved in Back button, got {back_to_file_btn.callback_data}"
+        )
+
+        # (35c) Progressive Disclosure Pack Detail: Primary view <= 5 rows; `pk:sec:<pid>` opens full Link Locks drawer
+        p_main = await packs.render_pack_detail(
+            9501, own_pack["id"], db, dummy_bot, bot_username="KoshBox_Bot", sec_mode=False  # type: ignore[arg-type]
+        )
+        assert p_main is not None
+        assert len(p_main[1].inline_keyboard) == 5, "Primary pack card must stay clean & uncluttered (5 rows)!"
+        assert any(
+            b.callback_data == f"pk:sec:{own_pack['id']}"
+            for r in p_main[1].inline_keyboard
+            for b in r
+        )
+
+        sec_cb_obj, _, sec_edits, _ = _make_cb(
+            9501, "owner_main", "Owner Main", f"pk:sec:{own_pack['id']}"
+        )
+        await packs.cb_pack_security_drawer(
+            sec_cb_obj, db, dummy_bot, bot_username="KoshBox_Bot"  # type: ignore[arg-type]
+        )
+        assert len(sec_edits) == 1
+        assert "Pack Link &amp; Security" in sec_edits[0][0]
+        assert len(sec_edits[0][1].inline_keyboard) == 6
+        for r in sec_edits[0][1].inline_keyboard:
+            assert len(r) <= 2
+            for b in r:
+                if b.callback_data:
+                    assert len(b.callback_data.encode("utf-8")) <= 64
+
+        # (35d) HTML-safety on raw `<` and `&` in file captions (`send_stored_media` + Inline Mode)
+        html_unsafe_file = await db.add_file(
+            vault_id=owner_main["vault_id"],
+            uploader_user_id=9501,
+            group_id=None,
+            media_type="document",
+            file_id="HTML_DOC_1",
+            file_unique_id="HTML_UNIQ_1",
+            dump_message_id=95999,
+            title="C++ <Templates> & Pointers.pdf",
+            caption="Use vector<int> & map<string, int> safely <3",
+            file_size=120_000,
+        )
+        dummy_bot.sent_media.clear()
+        sent_safe = await send_stored_media(
+            dummy_bot, 9501, html_unsafe_file  # type: ignore[arg-type]
+        )
+        assert sent_safe is not None
+        sent_cap = dummy_bot.sent_media[-1]["caption"]
+        assert "&lt;int&gt;" in sent_cap and "&amp;" in sent_cap and "<int>" not in sent_cap
+        inline_item = inline._to_inline_result(html_unsafe_file, "KoshBox_Bot")
+        assert inline_item is not None and "&lt;int&gt;" in (inline_item.caption or "")
+
+        # (35e) `➕ New Folder` inside `📁 Move Folder` (`grp:new_for_file:<fid>`) creates folder AND moves file!
+        mv_fsm = _DummyFSM(None)
+        new_f_cb, _, new_f_edits, _ = _make_cb(
+            9501, "owner_main", "Owner Main", f"grp:new_for_file:{html_unsafe_file['id']}"
+        )
+        await groups.cb_new_personal_for_file(new_f_cb, mv_fsm)  # type: ignore[arg-type]
+        assert (await mv_fsm.get_data()).get("move_file_id_after_create") == html_unsafe_file["id"]
+
+        mv_replies: list[tuple[str, object]] = []
+        folder_name_msg = SimpleNamespace(
+            from_user=SimpleNamespace(id=9501, username="owner_main", full_name="Owner Main"),
+            text="C++ Study Vault",
+            answer=lambda txt, reply_markup=None, disable_web_page_preview=False: (
+                mv_replies.append((txt, reply_markup)) or asyncio.sleep(0)
+            ),
+        )
+        await groups.fsm_create_personal(
+            folder_name_msg, mv_fsm, db, dummy_bot, bot_username="KoshBox_Bot"  # type: ignore[arg-type]
+        )
+        moved_f = await db.get_file(html_unsafe_file["id"])
+        assert moved_f is not None and moved_f["group_name"] == "C++ Study Vault"
+        assert len(mv_replies) == 1 and "Moved File" in mv_replies[0][0]
+
+        # (35f) `pk:new` from a photo banner card deletes photo & tracks the NEW text card's `pack_status_msg_id`
+        pk_new_fsm = _DummyFSM(None)
+        deleted_photo_flag = []
+        photo_cb = SimpleNamespace(
+            data="pk:new",
+            from_user=SimpleNamespace(id=9501, username="owner_main", full_name="Owner Main"),
+            answer=lambda text=None, show_alert=False: asyncio.sleep(0),
+            message=SimpleNamespace(
+                message_id=44001,
+                photo=[SimpleNamespace(file_id="BANNER_PHOTO")],
+                text=None,
+                answer=lambda txt, reply_markup=None: asyncio.sleep(0, result=SimpleNamespace(message_id=44099)),
+                delete=lambda: (deleted_photo_flag.append(True) or asyncio.sleep(0)),
+            ),
+        )
+        await packs.cb_pack_new(photo_cb, pk_new_fsm)  # type: ignore[arg-type]
+        assert deleted_photo_flag == [True]
+        assert (await pk_new_fsm.get_data()).get("pack_status_msg_id") == 44099
+
+        # (35g) Cold-start callback safety: brand-new user (never ran /start) taps `nav:packs`, `br:all:def:0:0`, `nav:settings`
+        cold_uid = 777123
+        assert await db.get_user(cold_uid) is None
+        cold_cb1, _, cold_edits1, _ = _make_cb(cold_uid, "brand_new", "Brand New", "br:all:def:0:0")
+        await file_actions.cb_browse_modern(cold_cb1, db)  # type: ignore[arg-type]
+        assert len(cold_edits1) == 1 and await db.get_user(cold_uid) is not None
+
+        # (35h) Filter drawer includes Sticker & Round + Upload Hub (`nav:upload`) renders cleanly
+        _, full_flt_kb = file_actions.render_filter_sort_drawer("sticker", "new", 0, 0)
+        flt_texts = [b.text for r in full_flt_kb.inline_keyboard for b in r]
+        assert any("Stickers" in t for t in flt_texts) and any("Rounds" in t for t in flt_texts)
+
+        up_hub_txt, up_hub_kb = start_help.render_upload_hub_card()
+        assert "Upload &amp; Bundle Files" in up_hub_txt
+        assert len(up_hub_kb.inline_keyboard) == 2
+
+        # Clean up any lingering background auto-delete tasks before closing loop
+        from utils.formatters import _AUTO_DELETE_TASKS
+        for t in list(_AUTO_DELETE_TASKS):
+            t.cancel()
 
         await db.close()
         print("ALL PRO FEATURES, TRIAL LOCKS, BATCH APIS, BOT API 9.4 UX & ZERO-LEAK TESTS PASSED!")

@@ -70,6 +70,16 @@ DIVIDER = "──────────────────────"
 
 _AUTO_DELETE_TASKS: set[asyncio.Task] = set()
 
+_MARKUP_FALLBACK_KEYWORDS = (
+    "reply_markup",
+    "style",
+    "copy_text",
+    "button",
+    "inline_keyboard",
+    "can't parse inline keyboard",
+    "button_type_invalid",
+)
+
 
 async def _await(awaitable: Awaitable[Any]) -> Any:
     """Wraps any awaitable (including unhashable aiogram 3 TelegramMethod objects) into a real coroutine."""
@@ -86,18 +96,60 @@ async def safe_gather(*tasks: Awaitable[Any]) -> list[Any]:
     return await asyncio.gather(*(_await(c) for c in tasks), return_exceptions=True)
 
 
+def downgrade_reply_markup(
+    markup: Optional[InlineKeyboardMarkup],
+    *,
+    drop_copy_text: bool = False,
+) -> Optional[InlineKeyboardMarkup]:
+    """
+    Produces a universally compatible `InlineKeyboardMarkup` fallback when an older Telegram
+    client, custom Bot API server, or restricted chat rejects `style` or `copy_text`:
+    - Strips `style` and `icon_custom_emoji_id`
+    - Optionally converts `copy_text` buttons cleanly into `url` (if HTTP/t.me) or `callback_data="noop"`
+    """
+    if markup is None or not getattr(markup, "inline_keyboard", None):
+        return markup
+
+    new_rows: list[list[InlineKeyboardButton]] = []
+    for row in markup.inline_keyboard:
+        new_row: list[InlineKeyboardButton] = []
+        for btn in row:
+            data = btn.model_dump(exclude_none=True)
+            data.pop("style", None)
+            data.pop("icon_custom_emoji_id", None)
+            if drop_copy_text and "copy_text" in data:
+                ct = data.pop("copy_text")
+                raw_val = ct.get("text", "") if isinstance(ct, dict) else getattr(ct, "text", "")
+                if isinstance(raw_val, str) and raw_val.startswith(("https://", "http://")):
+                    data["url"] = raw_val
+                else:
+                    data["callback_data"] = "noop"
+            new_row.append(InlineKeyboardButton(**data))
+        if new_row:
+            new_rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=new_rows)
+
+
+def _is_markup_bad_request(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in _MARKUP_FALLBACK_KEYWORDS)
+
+
 def esc(text: Optional[str]) -> str:
     return html.escape(text or "")
 
 
 def breadcrumb(*parts: str) -> str:
-    """Subtle compact breadcrumb trail (e.g. Vault › Files)."""
-    return f"<i>{' › '.join(parts)}</i>"
+    """Clean, readable breadcrumb trail (e.g. 🏠 Home › 📦 My Files)."""
+    clean = [p for p in parts if p]
+    return f"<i>{' › '.join(clean)}</i>"
 
 
 def toggle_label(enabled: bool, label: str) -> str:
-    """Native-style crisp toggle indicator."""
-    return f"{'✅' if enabled else '⬜'} {label}"
+    """Simple, crystal-clear ON/OFF toggle indicator that anyone understands immediately."""
+    state_txt = "ON" if enabled else "OFF"
+    dot = "🟢" if enabled else "⚪"
+    return f"{dot} {label}: {state_txt}"
 
 
 def format_ttl_short(seconds: Optional[int]) -> str:
@@ -131,14 +183,16 @@ def format_max_views_badge(views: int, max_views: int) -> str:
     cur = max(0, int(views or 0))
     lim = max(0, int(max_views or 0))
     if lim <= 0:
-        return f"👁 {cur}×"
+        return f"👁 {cur} opens"
     return f"👁 {cur}/{lim}"
 
 
 async def tg_retry_call(coro_factory, *args, max_retries: int = 4, **kwargs):
     """
-    Executes a Telegram Bot API coroutine with automatic FloodWait (`TelegramRetryAfter`)
-    backoff so 100+ file bursts or pack deliveries never crash or drop files.
+    Executes a Telegram Bot API coroutine with:
+    1. Automatic FloodWait (`TelegramRetryAfter`) backoff so 100+ file bursts never drop files.
+    2. Automatic `reply_markup` style/CopyText downgrade fallback if a Bot API proxy or client
+       rejects Bot API 9.4 button styles.
     """
     for attempt in range(max_retries):
         try:
@@ -148,6 +202,16 @@ async def tg_retry_call(coro_factory, *args, max_retries: int = 4, **kwargs):
             if attempt + 1 >= max_retries:
                 raise
             await asyncio.sleep(wait_s)
+        except TelegramBadRequest as exc:
+            rm = kwargs.get("reply_markup")
+            if rm is not None and _is_markup_bad_request(exc):
+                plain_rm = downgrade_reply_markup(rm, drop_copy_text=False)
+                try:
+                    return await coro_factory(*args, **{**kwargs, "reply_markup": plain_rm})
+                except TelegramBadRequest:
+                    safe_rm = downgrade_reply_markup(rm, drop_copy_text=True)
+                    return await coro_factory(*args, **{**kwargs, "reply_markup": safe_rm})
+            raise
     return None
 
 
@@ -204,13 +268,13 @@ def format_date(ts: Optional[int]) -> str:
         return ""
     diff = max(0, int(time.time()) - int(ts))
     if diff < 60:
-        return "now"
+        return "Just now"
     if diff < 3600:
-        return f"{diff // 60}m"
+        return f"{diff // 60}m ago"
     if diff < 86400:
-        return f"{diff // 3600}h"
+        return f"{diff // 3600}h ago"
     if diff < 86400 * 7:
-        return f"{diff // 86400}d"
+        return f"{diff // 86400}d ago"
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d")
 
 
@@ -222,7 +286,7 @@ def progress_bar(ratio: float, width: int = 8) -> str:
 def cancel_kb(back_callback: str = "nav:home") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀ Cancel", callback_data=f"fsm:cancel:{back_callback}")]
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data=f"fsm:cancel:{back_callback}")]
         ]
     )
 
@@ -231,7 +295,7 @@ def home_btn(label: str = "🏠 Home") -> InlineKeyboardButton:
     return InlineKeyboardButton(text=label, callback_data="nav:home")
 
 
-def back_btn(callback_data: str, label: str = "◀ Back") -> InlineKeyboardButton:
+def back_btn(callback_data: str, label: str = "⬅️ Back") -> InlineKeyboardButton:
     return InlineKeyboardButton(text=label, callback_data=callback_data)
 
 
@@ -268,7 +332,7 @@ def build_contact_owner_kb(
     if cta_row:
         rows.append(cta_row)
     if include_home:
-        rows.append([home_btn("🏠 Vault")])
+        rows.append([home_btn("🏠 Home")])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
@@ -279,14 +343,13 @@ def build_trial_locked_card(
     request_access_cb: Optional[str] = None,
 ) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     """
-    Sleek, respectful Repeat-Open card shown when a visitor re-opens a 1-Time Per-User Trial link
-    (sends ZERO files and offers 1-tap `🔓 Request Full Access` + `💬 Contact Owner`).
+    Sleek, easy-to-understand Repeat-Open card shown when a visitor re-opens a 1-Time Per-User Trial link.
     """
-    sub = f" · <i>{esc(title[:32])}</i>" if title else ""
+    sub = f"\n📄 <b>{esc(title[:40])}</b>" if title else ""
     text = (
         f"🔒 <b>Trial Access Ended</b>{sub}\n"
-        f"<blockquote>You've already used your one-time trial for this content. "
-        f"Tap below to request full access or message the owner directly.</blockquote>"
+        f"<blockquote>You already used your free preview for this link.\n"
+        f"Tap below to request full access or message the owner.</blockquote>"
     )
     return text, build_contact_owner_kb(
         contact_url, request_access_cb=request_access_cb
@@ -299,8 +362,8 @@ def build_trial_expiry_notice_text(title: str = "", ttl_seconds: int = 0) -> str
     label = f" for <b>{esc(title[:36])}</b>" if title else ""
     return (
         f"⏱ <b>Trial Session Ended</b>\n"
-        f"<blockquote>Your preview{label}{dur} has been cleared from chat. "
-        f"Tap below to request full access or contact the owner.</blockquote>"
+        f"<blockquote>Your preview{label}{dur} was cleared automatically.\n"
+        f"Tap below for permanent full access or to contact the owner.</blockquote>"
     )
 
 
@@ -338,7 +401,6 @@ async def send_with_effect(
                 sender_coro, *args, message_effect_id=message_effect_id, **kwargs
             )
         except TypeError:
-            # Dummy/test bot or older method signature without message_effect_id
             pass
         except TelegramBadRequest as exc:
             err_l = str(exc).lower()
@@ -371,7 +433,6 @@ async def batch_delete_chat_messages(
                 continue
             except Exception:
                 pass
-        # Single message or fallback path
         for mid in chunk:
             try:
                 await bot.delete_message(chat_id=chat_id, message_id=mid)
@@ -400,7 +461,6 @@ async def execute_due_scheduled_deletes(bot: Bot, db: Any, limit: int = 50) -> i
         ltype = (job.get("link_type") or "").strip()
         lid = int(job.get("link_id") or 0)
 
-        # Safety guard: if visitor received a Full Access Grant before timer fired, skip trial wipe & notice
         if ltype in ("file", "pack") and lid > 0 and hasattr(db, "has_active_access_grant"):
             try:
                 if await db.has_active_access_grant(ltype, lid, chat_id):
@@ -533,6 +593,25 @@ def schedule_auto_delete(
     task.add_done_callback(_AUTO_DELETE_TASKS.discard)
 
 
+async def _call_with_markup_fallback(method, *args, reply_markup: Optional[InlineKeyboardMarkup] = None, **kwargs):
+    """Calls a message edit/send helper with automatic button-style downgrade if rejected."""
+    try:
+        return await method(*args, reply_markup=reply_markup, **kwargs)
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return None
+        if reply_markup is not None and _is_markup_bad_request(exc):
+            plain_rm = downgrade_reply_markup(reply_markup, drop_copy_text=False)
+            try:
+                return await method(*args, reply_markup=plain_rm, **kwargs)
+            except TelegramBadRequest as exc2:
+                if "message is not modified" in str(exc2).lower():
+                    return None
+                safe_rm = downgrade_reply_markup(reply_markup, drop_copy_text=True)
+                return await method(*args, reply_markup=safe_rm, **kwargs)
+        raise
+
+
 async def safe_edit_or_send(
     callback: CallbackQuery,
     text: str,
@@ -543,11 +622,11 @@ async def safe_edit_or_send(
     also_ack: bool = False,
 ) -> None:
     """
-    Smoothly edit the existing panel message in-place:
-    - Photo banner card -> edits caption seamlessly if <= 1024 chars
+    Smoothly edits the existing panel message in-place without flickers or crashes:
     - Text card -> edits text in-place
-    - When `also_ack=True`, executes `callback.answer(...)` concurrently via `asyncio.gather`
-      so button spinner clears immediately and saves 1 full RTT (~145ms).
+    - Photo banner card -> cleanly transitions to text card when opening sub-menus
+      (or edits caption if specifically staying on a photo card)
+    - Automatically downgrades `style` / `copy_text` if rejected by client/server.
     """
     if not callback.message:
         if also_ack:
@@ -561,7 +640,8 @@ async def safe_edit_or_send(
         assert callback.message is not None
         if getattr(callback.message, "photo", None) and len(text) <= 1024:
             try:
-                await callback.message.edit_caption(
+                await _call_with_markup_fallback(
+                    callback.message.edit_caption,
                     caption=text,
                     reply_markup=reply_markup,
                 )
@@ -569,9 +649,13 @@ async def safe_edit_or_send(
             except TelegramBadRequest as exc:
                 if "message is not modified" in str(exc).lower():
                     return
-        if callback.message.text:
+            except Exception:
+                pass
+
+        if getattr(callback.message, "text", None):
             try:
-                await callback.message.edit_text(
+                await _call_with_markup_fallback(
+                    callback.message.edit_text,
                     text,
                     reply_markup=reply_markup,
                     disable_web_page_preview=True,
@@ -580,7 +664,11 @@ async def safe_edit_or_send(
             except TelegramBadRequest as exc:
                 if "message is not modified" in str(exc).lower():
                     return
-        sent = await callback.message.answer(
+            except Exception:
+                pass
+
+        sent = await _call_with_markup_fallback(
+            callback.message.answer,
             text,
             reply_markup=reply_markup,
             disable_web_page_preview=True,
@@ -619,18 +707,23 @@ async def send_stored_media(
 ) -> Optional[Message]:
     """
     Delivers any archived vault item into a chat.
-    Supports `protect_content` (no forward/save), Bot API 9.4 `message_effect_id`,
-    inline CTA `reply_markup`, and restart-safe `scheduled_deletes` timer + post-expiry notice!
+    Safely escapes raw user captions so `<` or `&` in filenames/captions NEVER break HTML parse_mode!
     """
-    caption = (
-        custom_caption
-        if custom_caption is not None
-        else (file_row.get("caption") or f"📦 <b>{esc(file_row['title'])}</b>")
-    )
+    if custom_caption is not None:
+        caption = custom_caption
+    elif file_row.get("caption"):
+        caption = esc(file_row["caption"])
+    else:
+        caption = f"📦 <b>{esc(file_row['title'])}</b>"
+
     if extra_note and file_row["media_type"] not in ("sticker", "video_note"):
-        caption = f"{caption}\n<i>{extra_note}</i>"
+        caption = f"{caption}\n<i>{esc(extra_note)}</i>"
     if auto_delete_ttl > 0 and file_row["media_type"] not in ("sticker", "video_note"):
         caption = f"{caption}\n<i>⏱ Auto-deletes in {format_ttl_short(auto_delete_ttl)}</i>"
+
+    # Guard against Telegram's 1024-character media caption limit
+    if len(caption) > 1020:
+        caption = caption[:1015] + "…"
 
     mtype = file_row["media_type"]
     fid = file_row["file_id"]
@@ -708,8 +801,8 @@ def build_file_card_text(
     edit_mode: bool = False,
 ) -> str:
     """
-    Ultra-crisp, compact File Card (Linear / Raycast style):
-    Zero fluff, 1-line metadata, compact blockquote summary.
+    Simple, scannable File Card:
+    Clear title, clean metadata line, organized folder/tag box, and clear link status if shared.
     """
     icon = MEDIA_ICONS.get(file_row["media_type"], "📦")
     fav_badge = " ⭐" if file_row.get("is_favorite") else ""
@@ -718,7 +811,7 @@ def build_file_card_text(
     if header_badge:
         lines.append(header_badge)
     else:
-        lines.append(breadcrumb("Vault", "Edit" if edit_mode else "File"))
+        lines.append(breadcrumb("🏠 Home", "📦 Files", "✏️ Edit" if edit_mode else "Details"))
 
     lines.append(f"{icon} <b>{esc(file_row['title'])}</b>{fav_badge}")
 
@@ -731,18 +824,18 @@ def build_file_card_text(
         meta_parts.append(format_size(file_row["file_size"]))
     if file_row.get("created_at"):
         meta_parts.append(format_date(file_row["created_at"]))
-    lines.append(f"<i>{' · '.join(meta_parts)}</i>")
+    lines.append(f"<i>{'  •  '.join(meta_parts)}</i>")
 
     info_lines: list[str] = []
-    folder = file_row.get("group_name") or "Personal"
+    folder = file_row.get("group_name") or "Personal Vault"
     uses = file_row.get("use_count") or 0
-    row1 = f"📁 {esc(folder)}"
+    row1 = f"📁 <b>Folder:</b> {esc(folder)}"
     if uses > 0:
-        row1 += f"  ·  📈 {uses}×"
+        row1 += f"  •  📤 {uses}× sent"
     info_lines.append(row1)
 
     if file_row.get("tags"):
-        info_lines.append(f"🏷️ <code>{esc(file_row['tags'])}</code>")
+        info_lines.append(f"🏷️ <b>Tags:</b> <code>{esc(file_row['tags'])}</code>")
 
     if file_row.get("caption"):
         cap = file_row["caption"].strip()
@@ -771,11 +864,17 @@ def build_file_card_text(
         if int(file_row.get("auto_delete_ttl") or 0) > 0:
             sec_badges.append(f"💣 {format_ttl_short(int(file_row['auto_delete_ttl']))}")
         if file_row.get("share_expires_at"):
-            sec_badges.append(f"⏳ Link: {format_expiry_badge(file_row['share_expires_at'])}")
-        sec_str = f" <i>({' · '.join(sec_badges)})</i>" if sec_badges else ""
-        lines.append(f"🔗 <code>{share_url}</code>{sec_str}")
+            sec_badges.append(f"⏳ {format_expiry_badge(file_row['share_expires_at'])}")
+        lines.append(f"🔗 <b>Share Link</b> <i>({' · '.join(sec_badges)})</i>\n<code>{share_url}</code>")
 
     return "\n".join(lines)
+
+
+def _encode_ctx(back_cb: Optional[str]) -> str:
+    """Extracts compact `<flt>:<sort>:<gid>:<page>` context if `back_cb` is a `br:...` callback."""
+    if back_cb and back_cb.startswith("br:") and len(back_cb.split(":")) == 5:
+        return back_cb[3:]
+    return ""
 
 
 def build_file_keyboard(
@@ -784,10 +883,12 @@ def build_file_keyboard(
     bot_username: str = "",
 ) -> InlineKeyboardMarkup:
     """
-    Crisp 3-row primary File Detail keyboard:
-    Row 1: [📥 Get] [📤 Send]
-    Row 2: [⭐ Star] [🔗 Share] [🛠️ Edit]
-    Row 3: [📋 Copy Link] (if shared) or [◀ Back] [🏠 Home]
+    Clean, balanced, beginner-friendly File Detail keyboard (strict 2-button symmetric grid):
+    - Row 1: [📥 Get Here] [📤 Send to Chat]
+    - Row 2: [🔗 Share Link] [⭐ Star / Unstar]
+    - Row 3 (if link active): [📋 Copy Link] [↗️ Forward Link]
+    - Row 4: [✏️ Edit Details] [📁 Move Folder]
+    - Row 5: [⬅️ Back] [🏠 Home]
     """
     fid = file_row["id"]
     is_trashed = bool(file_row.get("is_trashed"))
@@ -797,53 +898,40 @@ def build_file_keyboard(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="♻️ Restore",
+                        text="♻️ Restore File",
                         callback_data=f"f:restore:{fid}",
                         style="success",
                     ),
                     InlineKeyboardButton(
-                        text="💥 Purge",
+                        text="🗑️ Delete Forever",
                         callback_data=f"f:purge:{fid}",
                         style="danger",
                     ),
                 ],
-                [back_btn("trash:0", "◀ Trash"), home_btn()],
+                [back_btn("trash:0", "⬅️ Trash"), home_btn()],
             ]
         )
 
-    fav_label = "⭐ Starred" if file_row.get("is_favorite") else "☆ Star"
+    fav_label = "⭐ Starred" if file_row.get("is_favorite") else "☆ Star File"
     inline_query = (file_row.get("title") or "")[:30]
-    manage_cb = f"fm:{fid}:{back_cb}" if back_cb else f"f:manage:{fid}"
-    share_cb = f"fsl:{fid}:{back_cb}" if back_cb else f"f:link:{fid}"
+    ctx = _encode_ctx(back_cb)
+    manage_cb = f"fm:{fid}:br:{ctx}" if ctx else f"f:manage:{fid}"
+    share_cb = f"fsl:{fid}:br:{ctx}" if ctx else f"f:link:{fid}"
+    move_cb = f"fmv:{fid}:{ctx}" if ctx else f"f:move:{fid}"
+    fav_cb = f"ffav:{fid}:br:{ctx}" if ctx else f"f:fav:{fid}"
+    link_btn_lbl = "🔗 Link Settings" if file_row.get("share_token") else "🔗 Create Link"
 
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text="📥 Get",
+                text="📥 Get File",
                 callback_data=f"f:get:{fid}",
                 style="primary",
             ),
             InlineKeyboardButton(
-                text="📤 Send",
+                text="📤 Send in Chat",
                 switch_inline_query=inline_query,
             ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="🔗 Link",
-                callback_data=share_cb,
-            ),
-            InlineKeyboardButton(
-                text=fav_label,
-                callback_data=f"ffav:{fid}:{back_cb}" if back_cb else f"f:fav:{fid}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="🛠️ Edit",
-                callback_data=manage_cb,
-            ),
-            InlineKeyboardButton(text="📁 Folder", callback_data=f"f:move:{fid}"),
         ],
     ]
 
@@ -851,19 +939,45 @@ def build_file_keyboard(
         share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
         rows.append(
             [
-                copy_btn("📋 Copy Link", share_url),
-                share_url_btn("↗️ Share", share_url, file_row.get("title", "")),
+                copy_btn("📋 Copy Link", share_url, style="success"),
+                share_url_btn("↗️ Share Link", share_url, file_row.get("title", "")),
             ]
         )
 
-    nav_row: list[InlineKeyboardButton] = []
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text=link_btn_lbl,
+                    callback_data=share_cb,
+                ),
+                InlineKeyboardButton(
+                    text=fav_label,
+                    callback_data=fav_cb,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Edit Info",
+                    callback_data=manage_cb,
+                ),
+                InlineKeyboardButton(
+                    text="📁 Move Folder",
+                    callback_data=move_cb,
+                ),
+            ],
+        ]
+    )
+
     if back_cb:
-        nav_row.append(back_btn(back_cb, "◀ Files"))
-        nav_row.append(home_btn())
+        rows.append([back_btn(back_cb, "⬅️ Back"), home_btn()])
     else:
-        nav_row.append(InlineKeyboardButton(text="📦 Files", callback_data="br:all:def:0:0"))
-        nav_row.append(home_btn())
-    rows.append(nav_row)
+        rows.append(
+            [
+                InlineKeyboardButton(text="📦 My Files", callback_data="br:all:def:0:0"),
+                home_btn(),
+            ]
+        )
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -874,40 +988,33 @@ def build_file_manage_keyboard(
     bot_username: str = "",
 ) -> InlineKeyboardMarkup:
     """
-    Crisp Edit & Security Drawer (Progressive Disclosure Level 2).
+    Clean File Edit Drawer — keeps `back_cb` context intact across Rename, Tags, Caption, Move & Trash!
     """
     fid = file_row["id"]
-    return_to_card = (
-        f"fo:{fid}:{back_cb[3:]}"
-        if (back_cb and back_cb.startswith("br:"))
-        else f"f:open:{fid}"
-    )
-    share_cb = f"fsl:{fid}:{back_cb}" if back_cb else f"f:link:{fid}"
+    ctx = _encode_ctx(back_cb)
+    return_to_card = f"fo:{fid}:{ctx}" if ctx else f"f:open:{fid}"
+    share_cb = f"fsl:{fid}:br:{ctx}" if ctx else f"f:link:{fid}"
+    move_cb = f"fmv:{fid}:{ctx}" if ctx else f"f:move:{fid}"
 
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(text="✏️ Rename", callback_data=f"f:rename:{fid}"),
-            InlineKeyboardButton(text="📁 Folder", callback_data=f"f:move:{fid}"),
+            InlineKeyboardButton(text="📁 Move Folder", callback_data=move_cb),
         ],
         [
-            InlineKeyboardButton(text="🏷️ Tags", callback_data=f"f:tags:{fid}"),
-            InlineKeyboardButton(text="💬 Caption", callback_data=f"f:cap:{fid}"),
+            InlineKeyboardButton(text="🏷️ Edit Tags", callback_data=f"f:tags:{fid}"),
+            InlineKeyboardButton(text="💬 Edit Caption", callback_data=f"f:cap:{fid}"),
         ],
         [
-            InlineKeyboardButton(text="🔗 Link & Security", callback_data=share_cb),
+            InlineKeyboardButton(text="🔗 Share & Locks", callback_data=share_cb),
             InlineKeyboardButton(
-                text="🗑️ Trash",
+                text="🗑️ Move to Trash",
                 callback_data=f"f:trash:{fid}",
                 style="danger",
             ),
         ],
+        [back_btn(return_to_card, "⬅️ Back to File"), home_btn()],
     ]
-
-    if file_row.get("share_token") and bot_username:
-        share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
-        rows.insert(2, [copy_btn("📋 Copy Share Link", share_url, style="primary")])
-
-    rows.append([back_btn(return_to_card, "◀ File")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -917,18 +1024,13 @@ def build_file_link_keyboard(
     bot_username: str = "",
 ) -> InlineKeyboardMarkup:
     """
-    Advanced Share Link Security Panel (GitHub FileStore Pro style):
-    - 1-Tap Public Link creation / revocation
-    - PIN Lock (Password protected link)
-    - Content Protection (Disable Forward / Save)
-    - Expiry Timer (Never / 1h / 24h / 7d)
+    Clean, easy-to-understand File Share Link & Security Panel:
+    Preserves `back_cb` context across all toggles so the Back button never forgets the user's folder/page!
     """
     fid = file_row["id"]
-    return_to_card = (
-        f"fo:{fid}:{back_cb[3:]}"
-        if (back_cb and back_cb.startswith("br:"))
-        else f"f:open:{fid}"
-    )
+    ctx = _encode_ctx(back_cb)
+    ctx_suffix = f":{ctx}" if ctx else ""
+    return_to_card = f"fo:{fid}:{ctx}" if ctx else f"f:open:{fid}"
     has_link = bool(file_row.get("share_token"))
 
     if not has_link:
@@ -936,19 +1038,19 @@ def build_file_link_keyboard(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⚡ Create Share Link",
-                        callback_data=f"fsh:{fid}:{back_cb}" if back_cb else f"f:share:{fid}",
+                        text="🔗 Create Share Link",
+                        callback_data=f"fsh:{fid}:br:{ctx}" if ctx else f"f:share:{fid}",
                         style="primary",
                     )
                 ],
-                [back_btn(return_to_card, "◀ Back")],
+                [back_btn(return_to_card, "⬅️ Back to File"), home_btn()],
             ]
         )
 
     share_url = f"https://t.me/{bot_username}?start=file_{file_row['share_token']}"
     one_time_on = bool(file_row.get("share_one_time"))
     one_time_lbl = f"👤 1×/User: {'ON' if one_time_on else 'OFF'}"
-    pin_lbl = "🔑 PIN: ON" if file_row.get("share_pin_hash") else "🔑 Set PIN"
+    pin_lbl = "🔑 PIN: ON" if file_row.get("share_pin_hash") else "🔑 PIN: OFF"
     prot_lbl = toggle_label(bool(file_row.get("protect_share")), "No-Fwd")
     adel_val = int(file_row.get("auto_delete_ttl") or 0)
     adel_lbl = f"💣 Auto-Del: {format_ttl_short(adel_val)}"
@@ -957,7 +1059,7 @@ def build_file_link_keyboard(
     cur_v = int(file_row.get("share_views") or 0)
     limit_lbl = f"👁 Limit: {cur_v}/{max_v}" if max_v > 0 else "👁 Limit: ∞"
     paused = bool(file_row.get("share_paused"))
-    pause_lbl = "▶️ Resume" if paused else "⏸ Pause"
+    pause_lbl = "▶️ Resume Link" if paused else "⏸ Pause Link"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -968,34 +1070,52 @@ def build_file_link_keyboard(
             [
                 InlineKeyboardButton(
                     text=one_time_lbl,
-                    callback_data=f"f:1x:{fid}",
+                    callback_data=f"f:1x:{fid}{ctx_suffix}",
                     style="success" if one_time_on else None,
                 ),
-                InlineKeyboardButton(text=prot_lbl, callback_data=f"f:prot:{fid}"),
+                InlineKeyboardButton(
+                    text=prot_lbl,
+                    callback_data=f"f:prot:{fid}{ctx_suffix}",
+                ),
             ],
             [
                 InlineKeyboardButton(
                     text=adel_lbl,
-                    callback_data=f"f:adel:{fid}",
+                    callback_data=f"f:adel:{fid}{ctx_suffix}",
                     style="success" if adel_val > 0 else None,
                 ),
-                InlineKeyboardButton(text=exp_lbl, callback_data=f"f:exp:{fid}"),
-            ],
-            [
-                InlineKeyboardButton(text=pin_lbl, callback_data=f"f:pin:{fid}"),
-                InlineKeyboardButton(text=limit_lbl, callback_data=f"f:maxv:{fid}"),
-            ],
-            [
-                InlineKeyboardButton(text=pause_lbl, callback_data=f"f:pause:{fid}"),
-                InlineKeyboardButton(text="🔄 Reset", callback_data=f"f:regen:{fid}"),
+                InlineKeyboardButton(
+                    text=exp_lbl,
+                    callback_data=f"f:exp:{fid}{ctx_suffix}",
+                ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🚫 Revoke",
-                    callback_data=f"fsh:{fid}:{back_cb}" if back_cb else f"f:share:{fid}",
+                    text=pin_lbl,
+                    callback_data=f"f:pin:{fid}{ctx_suffix}",
+                ),
+                InlineKeyboardButton(
+                    text=limit_lbl,
+                    callback_data=f"f:maxv:{fid}{ctx_suffix}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=pause_lbl,
+                    callback_data=f"f:pause:{fid}{ctx_suffix}",
+                ),
+                InlineKeyboardButton(
+                    text="🔄 New Link",
+                    callback_data=f"f:regen:{fid}{ctx_suffix}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚫 Disable Link",
+                    callback_data=f"fsh:{fid}:br:{ctx}" if ctx else f"f:share:{fid}",
                     style="danger",
                 ),
-                back_btn(return_to_card, "◀ File"),
+                back_btn(return_to_card, "⬅️ File"),
             ],
         ]
     )
@@ -1003,9 +1123,9 @@ def build_file_link_keyboard(
 
 def build_upload_quick_keyboard(file_row: dict[str, Any]) -> InlineKeyboardMarkup:
     """
-    Ultra-short 2-row receipt keyboard shown right after uploading a file (max 2 btns/row for 360px):
-    Row 1: [📤 Send] [🔗 Link]
-    Row 2: [🛠️ Edit] [📁 Folder]
+    Clean 2-row receipt keyboard shown right after uploading a single file:
+    Row 1: [🔗 Create Share Link] [📤 Send in Chat]
+    Row 2: [✏️ Edit Info] [📁 Move Folder]
     """
     fid = file_row["id"]
     inline_query = (file_row.get("title") or "")[:30]
@@ -1013,21 +1133,24 @@ def build_upload_quick_keyboard(file_row: dict[str, Any]) -> InlineKeyboardMarku
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📤 Send",
-                    switch_inline_query=inline_query,
+                    text="🔗 Share Link",
+                    callback_data=f"f:link:{fid}",
                     style="primary",
                 ),
                 InlineKeyboardButton(
-                    text="🔗 Link",
-                    callback_data=f"f:link:{fid}",
+                    text="📤 Send in Chat",
+                    switch_inline_query=inline_query,
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🛠️ Edit",
+                    text="✏️ Edit Info",
                     callback_data=f"f:manage:{fid}",
                 ),
-                InlineKeyboardButton(text="📁 Folder", callback_data=f"f:move:{fid}"),
+                InlineKeyboardButton(
+                    text="📁 Move Folder",
+                    callback_data=f"f:move:{fid}",
+                ),
             ],
         ]
     )

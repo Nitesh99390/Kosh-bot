@@ -52,12 +52,14 @@ class IPv4AiohttpSession(AiohttpSession):
 async def _set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Vault Dashboard"),
-            BotCommand(command="files", description="Browse & filter files"),
-            BotCommand(command="packs", description="Multi-file Pack Links"),
-            BotCommand(command="batch", description="Bundle files into 1 link"),
-            BotCommand(command="groups", description="Folders & Shared Spaces"),
-            BotCommand(command="settings", description="Security, Auto-Delete & Sync"),
+            BotCommand(command="start", description="🏠 Home Dashboard"),
+            BotCommand(command="files", description="📦 My Saved Files"),
+            BotCommand(command="packs", description="🎒 File Packs & Bundles"),
+            BotCommand(command="groups", description="📁 Folders & Shared Groups"),
+            BotCommand(command="upload", description="📤 Upload & Auto-Pack"),
+            BotCommand(command="search", description="🔎 Search Files & Tags"),
+            BotCommand(command="settings", description="⚙️ Settings & Link Security"),
+            BotCommand(command="help", description="📖 Quick Guide & Commands"),
         ]
     )
 
